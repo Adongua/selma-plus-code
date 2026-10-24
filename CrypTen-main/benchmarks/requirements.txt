@@ -1,0 +1,10 @@
+torch == 1.8.1
+torchvision == 0.9.1
+omegaconf == 2.0.6
+onnx == 1.10.0
+pandas == 1.2.2
+pyyaml == 5.3.1
+tensorboard
+future
+scipy == 1.6.0
+numpy == 1.19.5
