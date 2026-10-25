@@ -1,0 +1,4 @@
+# CPU operator validation profile; tested with Python 3.12.
+# For Linux CPU-only wheels, install the matching torch CPU build first.
+torch==2.5.1
+numpy==2.2.6

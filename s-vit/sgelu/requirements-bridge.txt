@@ -1,0 +1,6 @@
+# Imports needed by this repository's CrypTen; not the complete MPCViT stack.
+-r requirements.txt
+omegaconf==2.3.0
+PyYAML==6.0.3
+onnx==1.17.0
+tensorboard==2.18.0
