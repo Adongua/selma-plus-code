@@ -21,11 +21,13 @@ from .sgelu import MU0, error_metrics, g2
 def measure(base, fn):
     dist.barrier()
     torch.cuda.synchronize(base.device)
+    sent_before, phases_before = base.sent_bytes, base.phases
     started = time.perf_counter()
     result = fn()
     torch.cuda.synchronize(base.device)
     seconds = time.perf_counter() - started
-    metrics = torch.tensor([seconds, base.sent_bytes, base.phases],
+    metrics = torch.tensor([seconds, base.sent_bytes - sent_before,
+                            base.phases - phases_before],
                            dtype=torch.float64, device=base.device)
     gathered = [torch.empty_like(metrics) for _ in range(3)]
     dist.all_gather(gathered, metrics)
