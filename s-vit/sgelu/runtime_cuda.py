@@ -36,13 +36,17 @@ class CudaRing3:
     def exchange(self, tensors):
         sends = [x.contiguous() for x in tensors]
         received = [torch.empty_like(x, device=self.device) for x in sends]
-        requests = []
+        operations = []
         for x, y in zip(sends, received):
             if x.device != self.device:
                 raise ValueError(f"CUDA tensor on {self.device} required")
-            requests.append(dist.isend(x, (self.rank + 1) % 3))
-            requests.append(dist.irecv(y, (self.rank - 1) % 3))
+            # NCCL may deadlock while lazily creating peer communicators if
+            # every rank issues send/recv calls in a different order.  Submit
+            # the complete ring exchange as one batch instead.
+            operations.append(dist.P2POp(dist.isend, x, (self.rank + 1) % 3))
+            operations.append(dist.P2POp(dist.irecv, y, (self.rank - 1) % 3))
             self.sent_bytes += x.numel() * x.element_size()
+        requests = dist.batch_isend_irecv(operations)
         for request in requests:
             request.wait()
         self.phases += 1
