@@ -12,7 +12,6 @@ from dataclasses import dataclass
 import torch
 
 from .sgelu import validate_mu
-from .runtime import random_word
 from .wide import add96, sub96, to_limbs, limbs_from_uint64, isqrt_from_limbs
 
 INPUT_FRAC = 17
@@ -23,7 +22,7 @@ INVERSE_SHIFT = PUBLIC_RECIPROCAL_FRAC - VALUE_FRAC // 2 - INVERSE_FRAC
 
 
 def joint_random_bits(base, shape, count):
-    local = random_word(tuple(shape), device=base.device)
+    local = base.random_word(tuple(shape))
     bits = (local.unsqueeze(-1) >> torch.arange(count, device=local.device)) & 1
     parts = [base.private(bits, owner) for owner in range(3)]
     result = parts[0] + parts[1] - 2 * base.mul(parts[0], parts[1])
@@ -67,7 +66,7 @@ def extension_material(base, wide, shape):
                                     device=base.device))
     mask96 = wide.public(to_limbs(1 << 62, device=base.device).expand(shape + (4,)))
     for owner in range(3):
-        local = random_word(shape, device=base.device) & ((1 << 60) - 1)
+        local = base.random_word(shape) & ((1 << 60) - 1)
         mask64 = mask64 + base.private(local, owner)
         mask96 = add96(mask96, wide.private(limbs_from_uint64(local), owner))
     return mask64, mask96, wide.public(

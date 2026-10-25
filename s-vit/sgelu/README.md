@@ -82,9 +82,10 @@ CUDA_VISIBLE_DEVICES=0,1,2 python -m sgelu.benchmark_cuda \
   --count 17 --batch 1 --repeats 1 --output ../tmp/sgelu-cuda-smoke
 ```
 
-这是 CPU/Gloo 原型的工程移植，仍带有 Ruler 打开步骤的隐私限制。公开 96-bit
-整数平方根暂时回到 CPU 计算；CrypTen-erf、Quad 和 Fourier 的 GPU baseline
-尚未纳入该入口。
+这是 CPU/Gloo 原型的工程移植，仍带有 Ruler 打开步骤的隐私限制。CUDA v2 的
+公开 96-bit 整数平方根、精确修正与随机词展开均留在 GPU；初始化时仅交换一次随机
+种子。GPU 随机词使用 PyTorch Philox，仅用于性能实验，不是经审查的密码学 PRG。
+CrypTen-erf、Quad 和 Fourier 的 GPU baseline 尚未纳入该入口。
 
 `validate` 默认运行 10,000 个三方原语样本、257 个合成激活、1 次预热和 3 次正式重复。
 测试模块另行核验 10,000 对 96-bit 算术和 10,000 个随机公开整数根，并覆盖边界。

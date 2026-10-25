@@ -84,9 +84,6 @@ def _square_gt(root, y_high, y_low):
 def isqrt_from_limbs(opened):
     if opened.dtype != torch.int64 or opened.shape[-1] != 4:
         raise ValueError("expected int64 tensor with four limbs")
-    device = opened.device
-    if device.type != "cpu":
-        opened = opened.cpu()
     if torch.any(opened < 0) or torch.any(opened > LIMB_MASK) or torch.any(opened[..., 3] >= (1 << 12)):
         raise ValueError("public isqrt requires canonical 0 <= Y < 2**84")
     low = opened[..., 0] + (opened[..., 1] << 24)
@@ -100,4 +97,4 @@ def isqrt_from_limbs(opened):
         root += (~_square_gt(root + 1, y_high, y_low)).long()
     if torch.any(_square_gt(root, y_high, y_low)) or torch.any(~_square_gt(root + 1, y_high, y_low)):
         raise ArithmeticError("integer square-root correction failed")
-    return root.to(device)
+    return root

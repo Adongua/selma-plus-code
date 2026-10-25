@@ -53,7 +53,8 @@ CUDA_VISIBLE_DEVICES=0,1,2 python -m slayernorm.benchmark_cuda \
   --repeats 1 --output ../tmp/slayernorm-cuda-smoke
 ```
 
-该入口只测自研 sLayerNorm 方法。公开平方根暂时回到 CPU 计算，因此 GPU 结果首先用于
-功能验证，之后再单独优化这一数据搬运点；CrypTen GPU baseline 尚未纳入同一入口。
+该入口只测自研 sLayerNorm 方法。CUDA v2 的公开平方根、整数修正和随机词展开均留在
+GPU；PyTorch Philox 仅用于性能实验，不是经审查的密码学 PRG。CrypTen GPU baseline
+尚未纳入同一入口。
 
 所有阶段的原始数据写入 `comparison.json`；自动生成 `summary.md`。普通 normal/uniform 输入最大绝对误差要求不超过 0.005，否则测试退出失败；边界输入如实记录是否达到该阈值。

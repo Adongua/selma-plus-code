@@ -60,6 +60,10 @@ class Ring3:
         self.phases = 0
         self.zeros = PairwiseZeroSharing(self, b"selma-plus/ring64/v1")
 
+    def random_word(self, shape):
+        """Return local cryptographic random words on this runtime's device."""
+        return random_word(tuple(shape), device=self.device)
+
     def exchange(self, tensors):
         sends = [x.contiguous() for x in tensors]
         received = [torch.empty_like(x) for x in sends]

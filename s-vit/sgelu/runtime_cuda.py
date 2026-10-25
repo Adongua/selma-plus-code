@@ -3,16 +3,55 @@
 This module is intentionally separate from :mod:`sgelu.runtime`.  It expects
 one process per GPU, exactly three processes, and an initialized NCCL process
 group.  It is an engineering port of the CPU/Gloo prototype; it does not add
-new security guarantees.  Public 96-bit square roots temporarily move the
-already-opened value to CPU because the reference integer square-root routine
-is CPU based.
+new security guarantees.  Arithmetic, random-word expansion and public 96-bit
+square roots stay on CUDA after one-time seed setup.
 """
+
+import hashlib
+import secrets
 
 import torch
 import torch.distributed as dist
 
-from .runtime import PairwiseZeroSharing
 from .wide import add96, sub96, mul96, normalize96, pack_wire, unpack_wire, LIMB_MASK
+
+
+def _seed_from_bytes(seed, domain):
+    digest = hashlib.blake2b(seed + domain, digest_size=8).digest()
+    return int.from_bytes(digest, "little") & ((1 << 63) - 1)
+
+
+def _cuda_words(shape, generator, device):
+    """Uniform words in Z/(2**64) generated without a host tensor transfer."""
+    parts = torch.randint(0, 1 << 32, (2,) + tuple(shape), dtype=torch.int64,
+                          device=device, generator=generator)
+    return parts[0] | (parts[1] << 32)
+
+
+class CudaPairwiseZeroSharing:
+    """Matching edge streams expanded by CUDA Philox.
+
+    PyTorch's Philox generator is useful for GPU performance experiments but
+    is not claimed to be a cryptographic PRG.  The surrounding Ruler protocol
+    is already marked not-security-validated; production MPC requires a
+    reviewed GPU CSPRNG instead.
+    """
+
+    def __init__(self, runtime, domain):
+        self.runtime = runtime
+        seed = torch.tensor(list(secrets.token_bytes(32)), dtype=torch.uint8,
+                            device=runtime.device)
+        predecessor, = runtime.exchange([seed])
+        own_bytes = bytes(seed.cpu().tolist())
+        pred_bytes = bytes(predecessor.cpu().tolist())
+        self.own = torch.Generator(device=runtime.device)
+        self.pred = torch.Generator(device=runtime.device)
+        self.own.manual_seed(_seed_from_bytes(own_bytes, domain))
+        self.pred.manual_seed(_seed_from_bytes(pred_bytes, domain))
+
+    def draw(self, shape):
+        return (_cuda_words(shape, self.own, self.runtime.device),
+                _cuda_words(shape, self.pred, self.runtime.device))
 
 
 class CudaRing3:
@@ -31,7 +70,15 @@ class CudaRing3:
         self.device = torch.device(device or f"cuda:{torch.cuda.current_device()}")
         self.sent_bytes = 0
         self.phases = 0
-        self.zeros = PairwiseZeroSharing(self, b"selma-plus/ring64/cuda-v1")
+        local_seed = secrets.token_bytes(32)
+        self.local_generator = torch.Generator(device=self.device)
+        self.local_generator.manual_seed(
+            _seed_from_bytes(local_seed, b"selma-plus/local/cuda-v2")
+        )
+        self.zeros = CudaPairwiseZeroSharing(self, b"selma-plus/ring64/cuda-v2")
+
+    def random_word(self, shape):
+        return _cuda_words(tuple(shape), self.local_generator, self.device)
 
     def exchange(self, tensors):
         sends = [x.contiguous() for x in tensors]
@@ -87,7 +134,7 @@ class CudaRing3Wide:
     def __init__(self, base):
         self.base = base
         self.rank = base.rank
-        self.zeros = PairwiseZeroSharing(base, b"selma-plus/ring96/cuda-v1")
+        self.zeros = CudaPairwiseZeroSharing(base, b"selma-plus/ring96/cuda-v2")
 
     def exchange(self, tensors):
         return [unpack_wire(x) for x in self.base.exchange([pack_wire(x) for x in tensors])]

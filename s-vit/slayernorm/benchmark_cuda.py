@@ -28,19 +28,19 @@ from .protocol import METHODS, Profile, prepare, layernorm
 
 
 def fixture(shape, distribution, seed, device):
-    rng = torch.Generator(device=device).manual_seed(seed)
+    # Match the CPU benchmark's exact synthetic fixture.  Host-to-device copy
+    # happens before any measured MPC phase.
+    rng = torch.Generator().manual_seed(seed)
     if distribution == "normal":
-        x = torch.randn(shape, generator=rng, dtype=torch.float64,
-                        device=device).clamp(-4, 4)
+        x = torch.randn(shape, generator=rng, dtype=torch.float64).clamp(-4, 4)
     elif distribution == "uniform":
-        x = torch.rand(shape, generator=rng, dtype=torch.float64,
-                       device=device) * 8 - 4
+        x = torch.rand(shape, generator=rng, dtype=torch.float64) * 8 - 4
     else:
-        x = torch.full(shape, 1.25, dtype=torch.float64, device=device)
-    gamma = torch.linspace(.75, 1.25, shape[-1], dtype=torch.float64, device=device)
-    beta = torch.linspace(-.1, .1, shape[-1], dtype=torch.float64, device=device)
+        x = torch.full(shape, 1.25, dtype=torch.float64)
+    gamma = torch.linspace(.75, 1.25, shape[-1], dtype=torch.float64)
+    beta = torch.linspace(-.1, .1, shape[-1], dtype=torch.float64)
     encode = lambda v: (v * 2**17).round().long()
-    return tuple(encode(v) for v in (x, gamma, beta))
+    return tuple(encode(v).to(device) for v in (x, gamma, beta))
 
 
 def measure(base, fn):
@@ -111,9 +111,12 @@ def worker(rank, rendezvous, options):
                 "devices": [f"cuda:{i}" for i in range(3)],
                 "python": platform.python_version(), "torch": torch.__version__,
                 "platform": platform.platform(), "repeats": options["repeats"],
+                "cuda_hot_path": {"public_isqrt": "CUDA float64 seed plus exact integer correction",
+                                  "random_expansion": "CUDA Philox",
+                                  "host_tensor_roundtrip": False},
                 "records": records,
                 "communication": "sum of NCCL point-to-point sent payload bytes across three parties",
-                "security": "same experimental Ruler limitations as the CPU implementation",
+                "security": "Ruler remains not security validated; CUDA Philox is a benchmark PRG, not a reviewed CSPRNG",
             }
             (output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps({"report": str(output / "comparison.json"),
