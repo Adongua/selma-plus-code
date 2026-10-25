@@ -1,4 +1,4 @@
-"""96-bit integers: four little-endian 24-bit limbs, CPU int64 storage.
+"""96-bit integers: four little-endian 24-bit limbs, int64 storage on CPU/GPU.
 
 The public square root accepts ONLY nonnegative opened values below 2**84.
 Never pass a single secret share to isqrt_from_limbs.
@@ -12,9 +12,10 @@ LIMB_MASK = (1 << LIMB_BITS) - 1
 RING_BITS = 96
 
 
-def to_limbs(value):
+def to_limbs(value, device=None):
     value %= 1 << RING_BITS
-    return torch.tensor([(value >> (24 * i)) & LIMB_MASK for i in range(4)], dtype=torch.int64)
+    return torch.tensor([(value >> (24 * i)) & LIMB_MASK for i in range(4)],
+                        dtype=torch.int64, device=device)
 
 
 def limbs_from_int64(x):
@@ -81,8 +82,11 @@ def _square_gt(root, y_high, y_low):
 
 
 def isqrt_from_limbs(opened):
-    if opened.dtype != torch.int64 or opened.device.type != "cpu" or opened.shape[-1] != 4:
-        raise ValueError("expected CPU int64 tensor with four limbs")
+    if opened.dtype != torch.int64 or opened.shape[-1] != 4:
+        raise ValueError("expected int64 tensor with four limbs")
+    device = opened.device
+    if device.type != "cpu":
+        opened = opened.cpu()
     if torch.any(opened < 0) or torch.any(opened > LIMB_MASK) or torch.any(opened[..., 3] >= (1 << 12)):
         raise ValueError("public isqrt requires canonical 0 <= Y < 2**84")
     low = opened[..., 0] + (opened[..., 1] << 24)
@@ -96,4 +100,4 @@ def isqrt_from_limbs(opened):
         root += (~_square_gt(root + 1, y_high, y_low)).long()
     if torch.any(_square_gt(root, y_high, y_low)) or torch.any(~_square_gt(root + 1, y_high, y_low)):
         raise ArithmeticError("integer square-root correction failed")
-    return root
+    return root.to(device)

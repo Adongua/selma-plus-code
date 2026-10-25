@@ -16,16 +16,18 @@ import torch.distributed as dist
 from .wide import add96, sub96, mul96, normalize96, pack_wire, unpack_wire, LIMB_MASK
 
 
-def random_word(shape):
+def random_word(shape, device="cpu"):
     raw = secrets.token_bytes(math.prod(shape) * 8)
-    return torch.from_numpy(np.frombuffer(raw, dtype="<i8").copy()).reshape(shape)
+    return torch.from_numpy(np.frombuffer(raw, dtype="<i8").copy()).reshape(shape).to(device)
 
 
 class PairwiseZeroSharing:
     """Independent cryptographic XOF streams on the two incident ring edges."""
 
     def __init__(self, runtime, domain):
-        seed = torch.tensor(list(secrets.token_bytes(32)), dtype=torch.uint8)
+        self.runtime = runtime
+        seed = torch.tensor(list(secrets.token_bytes(32)), dtype=torch.uint8,
+                            device=runtime.device)
         predecessor, = runtime.exchange([seed])
         self.own = bytes(seed.tolist())
         self.pred = bytes(predecessor.tolist())
@@ -39,7 +41,9 @@ class PairwiseZeroSharing:
 
         def stream(seed):
             raw = hashlib.shake_256(seed + context).digest(count)
-            return torch.from_numpy(np.frombuffer(raw, dtype="<i8").copy()).reshape(shape)
+            return torch.from_numpy(np.frombuffer(raw, dtype="<i8").copy()).reshape(shape).to(
+                self.runtime.device
+            )
 
         return stream(self.own), stream(self.pred)
 
@@ -51,6 +55,7 @@ class Ring3:
         if dist.get_backend() != "gloo":
             raise ValueError("this reference runtime requires CPU/Gloo")
         self.rank = dist.get_rank()
+        self.device = torch.device("cpu")
         self.sent_bytes = 0
         self.phases = 0
         self.zeros = PairwiseZeroSharing(self, b"selma-plus/ring64/v1")

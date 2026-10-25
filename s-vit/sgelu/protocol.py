@@ -23,8 +23,8 @@ INVERSE_SHIFT = PUBLIC_RECIPROCAL_FRAC - VALUE_FRAC // 2 - INVERSE_FRAC
 
 
 def joint_random_bits(base, shape, count):
-    local = random_word(tuple(shape))
-    bits = (local.unsqueeze(-1) >> torch.arange(count)) & 1
+    local = random_word(tuple(shape), device=base.device)
+    bits = (local.unsqueeze(-1) >> torch.arange(count, device=local.device)) & 1
     parts = [base.private(bits, owner) for owner in range(3)]
     result = parts[0] + parts[1] - 2 * base.mul(parts[0], parts[1])
     result = result + parts[2] - 2 * base.mul(result, parts[2])
@@ -35,7 +35,9 @@ def prob_trunc_material(base, shape, shift):
     if not 1 <= shift <= 62:
         raise ValueError("truncation shift must be in [1,62]")
     bits = joint_random_bits(base, shape, 64)
-    weights = torch.ones(64, dtype=torch.int64) << torch.arange(64)
+    weights = torch.ones(64, dtype=torch.int64, device=bits.device) << torch.arange(
+        64, device=bits.device
+    )
     return ((bits * weights).sum(-1),
             (bits[..., shift:] * weights[:64-shift]).sum(-1), bits[..., 63])
 
@@ -53,7 +55,7 @@ def prob_trunc(base, value, shift, material):
     mask, high, top = material
     opened = base.reveal(value + base.public(1 << 62) + mask)
     wrap = top * (1 - logical_shift(opened, 63))
-    factor = torch.tensor(1, dtype=torch.int64) << (64 - shift)
+    factor = torch.tensor(1, dtype=torch.int64, device=opened.device) << (64 - shift)
     return (base.public(logical_shift(opened, shift)) - high + wrap * factor
             - base.public(1 << (62 - shift)))
 
@@ -61,13 +63,16 @@ def prob_trunc(base, value, shift, material):
 def extension_material(base, wide, shape):
     """Correlated joint mask in [2**62, 2**62 + 3*2**60); no single owner knows it."""
     shape = tuple(shape)
-    mask64 = base.public(torch.full(shape, 1 << 62, dtype=torch.int64))
-    mask96 = wide.public(to_limbs(1 << 62).expand(shape + (4,)))
+    mask64 = base.public(torch.full(shape, 1 << 62, dtype=torch.int64,
+                                    device=base.device))
+    mask96 = wide.public(to_limbs(1 << 62, device=base.device).expand(shape + (4,)))
     for owner in range(3):
-        local = random_word(shape) & ((1 << 60) - 1)
+        local = random_word(shape, device=base.device) & ((1 << 60) - 1)
         mask64 = mask64 + base.private(local, owner)
         mask96 = add96(mask96, wide.private(limbs_from_uint64(local), owner))
-    return mask64, mask96, wide.public(to_limbs(1 << 64).expand(shape + (4,)))
+    return mask64, mask96, wide.public(
+        to_limbs(1 << 64, device=base.device).expand(shape + (4,))
+    )
 
 
 def extend_online(base, wide, value, material):
@@ -81,7 +86,9 @@ def sample_scale(base, shape):
     # XOR of independently secret-shared 29-bit strings is uniform. This avoids
     # the draft's two secret comparisons for reducing a sum modulo 2**29.
     bits = joint_random_bits(base, shape, 29)
-    weights = torch.ones(29, dtype=torch.int64) << torch.arange(29)
+    weights = torch.ones(29, dtype=torch.int64, device=bits.device) << torch.arange(
+        29, device=bits.device
+    )
     return base.refresh((bits * weights).sum(-1) + base.public(1 << 29))
 
 
@@ -101,8 +108,8 @@ class G2Material:
             raise RuntimeError("G2 material already consumed")
         if base is not self.runtime or tuple(value.shape) != self.shape:
             raise ValueError("material belongs to another runtime or tensor shape")
-        if value.dtype != torch.int64 or value.device.type != "cpu":
-            raise ValueError("expected CPU int64 Q17 additive share")
+        if value.dtype != torch.int64 or value.device != base.device:
+            raise ValueError(f"expected int64 Q17 share on {base.device}")
         self.used = True  # burn even if the subsequent online computation fails
 
 
@@ -137,7 +144,8 @@ def ruler_g2(base, wide, x_q17, material):
     square_q34 = base.square(x_q17)
     square_q16 = prob_trunc(base, square_q34, 18, trunc["square"])
     constants = torch.tensor([round(material.mu**2 * (1 << 16)),
-                              round(4 * material.mu**2 * (1 << 16))], dtype=torch.int64)
+                              round(4 * material.mu**2 * (1 << 16))],
+                             dtype=torch.int64, device=x_q17.device)
     constants = constants.reshape((2,) + (1,) * len(material.shape))
     values = square_q16.unsqueeze(0) + base.public(constants)
     values96 = extend_online(base, wide, values, material.extension)

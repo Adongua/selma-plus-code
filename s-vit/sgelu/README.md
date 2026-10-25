@@ -9,6 +9,7 @@
 - `sgelu.py`：G1/G2 浮点参考、`SmoothGeLU` 模块、公开激活的逐层尺度校准。
 - `wide.py`：96-bit 加减乘、4×24-bit limb、3×32-bit 紧凑通信、公开整数平方根。
 - `runtime.py`：CPU/Gloo 三进程 64/96-bit 加法分享、乘法、随机刷新。
+- `runtime_cuda.py`：实验性 CUDA/NCCL 三方运行时；每个参与方绑定一张 GPU。
 - `protocol.py`：联合掩码提升、概率截断、双分支 Ruler-G2 数值协议。
 - `bridge.py`：Q17 `MPCTensor` 输入输出，显式 `prepare()`，仅前向、不支持反向传播。
 - `validate.py`：三进程原语验收、一次预热和三次正式算子测量、JSON 报告。
@@ -36,7 +37,7 @@ G2(x; μ) = x/2 + x²/2 · [4/(3√(x²+μ²)) − 1/(3√(x²+4μ²))]。
 
 ## 正确性范围与安全结论
 
-当前固定点实现要求 CPU int64、恰好三方、Q17 输入输出，公开承诺 `|x| ≤ 8`、`0.25 ≤ μ ≤ 4`。
+CPU/Gloo 路径要求 CPU int64；CUDA/NCCL 路径使用 CUDA int64。两者都要求恰好三方、Q17 输入输出，公开承诺 `|x| ≤ 8`、`0.25 ≤ μ ≤ 4`。
 分母采用 Q16，倒平方根采用 Q24。盲化乘积小于 2⁸⁴，概率截断的重建输入必须在
 `[-2⁶², 2⁶²)`。公开 isqrt 对超界值报错。秘密输入的范围由调用者保证；实现不会通过打开
 原始秘密输入来检查范围，也不会静默裁剪。更大真实激活范围需要重新分析量化、范围和误差。
@@ -73,6 +74,17 @@ python -m unittest discover -s s-vit/sgelu/tests -v
 python -m sgelu.validate --output ../tmp/gelu-v2
 python -m sgelu.benchmark --output ../tmp/gelu-baseline
 ```
+
+GPU 功能验证使用独立入口，要求至少三张 GPU：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 python -m sgelu.benchmark_cuda \
+  --count 17 --batch 1 --repeats 1 --output ../tmp/sgelu-cuda-smoke
+```
+
+这是 CPU/Gloo 原型的工程移植，仍带有 Ruler 打开步骤的隐私限制。公开 96-bit
+整数平方根暂时回到 CPU 计算；CrypTen-erf、Quad 和 Fourier 的 GPU baseline
+尚未纳入该入口。
 
 `validate` 默认运行 10,000 个三方原语样本、257 个合成激活、1 次预热和 3 次正式重复。
 测试模块另行核验 10,000 对 96-bit 算术和 10,000 个随机公开整数根，并覆盖边界。

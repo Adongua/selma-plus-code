@@ -45,4 +45,15 @@ python -m slayernorm.benchmark --shapes 2x1 2x17 2x257 --distributions constant 
 
 默认正式测试为 `(B,T,D)` 的四种 ViT-like shape、normal 与 uniform 两种分布，每组 1 次预热 + 3 次测量，执行顺序轮换。每个阶段记录各方最大耗时、三方发送载荷合计和各方 exchange 次数。阶段包括输入分享、材料准备、在线计算、输出重构；同步和指标聚合不计入。`exchange` 次数是运行时交换阶段，并非跨不同后端通用的协议轮数。
 
+GPU 功能验证使用独立的 `benchmark_cuda.py`，要求至少三张 GPU：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 python -m slayernorm.benchmark_cuda \
+  --shapes 1x17x32 --distributions normal --methods fused_ruler \
+  --repeats 1 --output ../tmp/slayernorm-cuda-smoke
+```
+
+该入口只测自研 sLayerNorm 方法。公开平方根暂时回到 CPU 计算，因此 GPU 结果首先用于
+功能验证，之后再单独优化这一数据搬运点；CrypTen GPU baseline 尚未纳入同一入口。
+
 所有阶段的原始数据写入 `comparison.json`；自动生成 `summary.md`。普通 normal/uniform 输入最大绝对误差要求不超过 0.005，否则测试退出失败；边界输入如实记录是否达到该阈值。

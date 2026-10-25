@@ -105,8 +105,8 @@ def layernorm(base, wide, x, gamma, beta, material):
     if tuple(gamma.shape) != (x.shape[-1],) or beta.shape != gamma.shape:
         raise ValueError("affine parameters must have shape (hidden_width,)")
     for value in (x, gamma, beta):
-        if value.dtype != torch.int64 or value.device.type != "cpu":
-            raise ValueError("CPU int64 Q17 shares required")
+        if value.dtype != torch.int64 or value.device != base.device:
+            raise ValueError(f"int64 Q17 shares on {base.device} required")
     material.used = True
     p = material.profile
 
@@ -131,7 +131,8 @@ def layernorm(base, wide, x, gamma, beta, material):
         reciprocal = torch.div(2**56 + roots // 2, roots, rounding_mode="floor")
         r = trunc("inverse", a * reciprocal)
     elif material.method in ("fused_newton", "unfused_newton"):
-        r = base.public(torch.full(v.shape, 2**21, dtype=torch.int64))  # 0.125 in Q24
+        r = base.public(torch.full(v.shape, 2**21, dtype=torch.int64,
+                                   device=v.device))  # 0.125 in Q24
         for i in range(p.newton_steps):
             vr = trunc(f"vr_{i}", base.mul(v, r))
             vrr = trunc(f"vrr_{i}", base.mul(vr, r))
