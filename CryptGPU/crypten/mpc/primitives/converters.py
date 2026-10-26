@@ -40,7 +40,33 @@ def _A2B(arithmetic_tensor):
     binary_tensor.encoder = arithmetic_tensor.encoder
 
     return binary_tensor
-    
+
+
+def _B2A(binary_tensor, bits=1, precision=None):
+    """Convert a secret bit from XOR sharing to arithmetic sharing.
+
+    CryptGPU's comparison circuit returns the sign as a binary-shared bit.
+    The original tree calls ``to(Ptype.arithmetic, bits=1)`` afterwards but
+    omitted that conversion.  Reuse the repository's three-party mixed OT to
+    multiply the bit by a public one without opening it.
+
+    Only one-bit conversion is needed by the comparison API.  Keeping the
+    restriction explicit prevents silently treating a multi-bit XOR sharing
+    as an arithmetic integer.
+    """
+    if bits != 1:
+        raise NotImplementedError("CryptGPU B2A currently supports one bit")
+
+    rank = comm.get().get_rank()
+    ones = torch.ones_like(binary_tensor.share.data) if rank == 0 else None
+    result = resharing.mixed_mul_scalar(
+        ones, binary_tensor, bits=1, roles=[0, 1, 2]
+    )
+    if precision is None:
+        precision = binary_tensor.encoder._precision_bits
+    result.encoder = FixedPointEncoder(precision_bits=precision)
+    return result
+
 
 def convert(tensor, ptype, **kwargs):
     tensor_name = ptype.to_tensor()
@@ -48,6 +74,12 @@ def convert(tensor, ptype, **kwargs):
         return tensor
     if isinstance(tensor, ArithmeticSharedTensor) and ptype == Ptype.binary:
         return _A2B(tensor)
+    if isinstance(tensor, BinarySharedTensor) and ptype == Ptype.arithmetic:
+        return _B2A(
+            tensor,
+            bits=kwargs.get("bits", 1),
+            precision=kwargs.get("precision"),
+        )
     else:
         raise TypeError("Cannot convert %s to %s" % (type(tensor), ptype.__name__))
 

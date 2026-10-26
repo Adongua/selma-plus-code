@@ -147,6 +147,22 @@ class BinarySharedTensor(object):
         result.rep_share = self.rep_share
         return result
 
+    def clone(self):
+        """Create a deep copy compatible with ``MPCTensor.clone``.
+
+        The comparison path converts arithmetic shares to a binary
+        ``MPCTensor`` and then converts the sign bit back to arithmetic.  The
+        latter conversion starts by cloning the binary tensor, but upstream
+        CryptGPU omitted this method.
+        """
+        result = BinarySharedTensor(src=SENTINEL)
+        result.encoder = self.encoder
+        result.share = self.share.clone()
+        result.rep_share = (
+            self.rep_share.clone() if self.rep_share is not None else None
+        )
+        return result
+
     def copy_(self, other):
         """Copies other tensor into this tensor."""
         self.share.copy_(other.share)

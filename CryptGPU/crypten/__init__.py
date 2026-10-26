@@ -13,10 +13,19 @@ import warnings
 import crypten.common
 import crypten.communicator as comm
 import crypten.mpc  # noqa: F401
-import crypten.nn  # noqa: F401
 import crypten.optim  # noqa: F401
 import torch
-import torchcsprng as csprng
+try:
+    import crypten.nn  # noqa: F401
+    _nn_import_error = None
+except (ImportError, AttributeError) as error:
+    # The upstream ONNX bridge imports private PyTorch-1.6 symbols that were
+    # removed in modern PyTorch. Core MPC tensor operators do not depend on it.
+    _nn_import_error = error
+try:
+    import torchcsprng as csprng
+except ImportError:  # Optional for benchmark-only Philox mode.
+    csprng = None
 
 # other imports:
 from . import debug
@@ -43,6 +52,12 @@ def init(party_name=None, device=None, use_csprng=False, sync_key=False):
         device (int, str, torch.device): Specify device for RNG generators on
         GPU. Must be a GPU device.
     """
+    if use_csprng and csprng is None:
+        raise RuntimeError(
+            "torchcsprng is required when use_csprng=True; install the source-built "
+            "dependency or initialize CryptGPU with use_csprng=False for benchmarks"
+        )
+
     # Return and raise warning if initialized
     if comm.is_initialized():
         warnings.warn("CrypTen is already initialized.", RuntimeWarning)
@@ -208,8 +223,20 @@ def _setup_przs(device=None, use_csprng=False, sync_key=False ):
     import numpy
 
     numpy.random.seed(seed=None)
-    next_seed = torch.tensor(numpy.random.randint(-(2 ** 63), 2 ** 63 - 1, (1,)))
-    prev_seed = torch.LongTensor([0])  # placeholder
+    # NCCL only accepts CUDA tensors, whereas the original PyTorch-1.6 code
+    # exchanged CPU seed tensors unconditionally.  Put the tiny seed exchange
+    # on the active CUDA device when CryptGPU is initialized with NCCL.
+    seed_device = (
+        device
+        if getattr(comm.get(), "distributed_backend", "").lower() == "nccl"
+        else torch.device("cpu")
+    )
+    next_seed = torch.tensor(
+        numpy.random.randint(-(2 ** 63), 2 ** 63 - 1, (1,)),
+        dtype=torch.long,
+        device=seed_device,
+    )
+    prev_seed = torch.zeros(1, dtype=torch.long, device=seed_device)
 
     # Send random seed to next party, receive random seed from prev party
     world_size = comm.get().get_world_size()
@@ -229,6 +256,13 @@ def _setup_przs(device=None, use_csprng=False, sync_key=False ):
     # Seed Generators
     comm.get().g0.manual_seed(next_seed.item())
     comm.get().g1.manual_seed(prev_seed.item())
+
+    # Keep the GPU edge streams correlated in benchmark-correct Philox mode:
+    # rank i's g0 seed equals rank i+1's g1 seed.  Upstream created these
+    # generators but only seeded the CPU copies.
+    if torch.cuda.is_available():
+        comm.get().g0_cuda.manual_seed(next_seed.item())
+        comm.get().g1_cuda.manual_seed(prev_seed.item())
 
 
     if use_csprng:

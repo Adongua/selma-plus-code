@@ -336,7 +336,10 @@ def mixed_mul_scalar(xs, yB, bits=1, roles=[0,1,2]):
         bin_bits = b2.flatten().data
         m_b = m_b.view(2, -1)
 
-        m_b2 = m_b[bin_bits, torch.arange(bin_bits.size(0))]
+        m_b2 = m_b[
+            bin_bits,
+            torch.arange(bin_bits.size(0), device=bin_bits.device),
+        ]
         m_b2 = m_b2.view(size)
 
         message = m_b2 ^ w_b2
@@ -357,7 +360,10 @@ def mixed_mul_scalar(xs, yB, bits=1, roles=[0,1,2]):
         bin_bits = b2.flatten().data
         
         w = w.view(2, -1)
-        w_b2 = w[bin_bits, torch.arange(bin_bits.size(0))]
+        w_b2 = w[
+            bin_bits,
+            torch.arange(bin_bits.size(0), device=bin_bits.device),
+        ]
         w_b2 = w_b2.view(size)
 
         req1 = comm.get().isend(w_b2, dst=receiver, group=grouprh)
