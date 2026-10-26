@@ -8,6 +8,7 @@
 import builtins
 import collections
 import difflib
+import inspect
 import io
 import os
 import pickle
@@ -20,7 +21,23 @@ import warnings
 from contextlib import closing, contextmanager
 
 import torch
-from torch._utils_internal import get_source_lines_and_file
+try:
+    from torch._utils_internal import get_source_lines_and_file
+except ImportError:
+    # ``torch._utils_internal`` was used by the original PyTorch-1.6
+    # CryptGPU tree.  It moved/was removed in modern PyTorch; this is the
+    # same small helper that the maintained CrypTen serializer uses.
+    def get_source_lines_and_file(obj, error_msg=None):
+        filename = None
+        try:
+            filename = inspect.getsourcefile(obj)
+            source_lines, file_lineno = inspect.getsourcelines(obj)
+        except OSError as error:
+            message = f"Can't get source for {obj}."
+            if error_msg:
+                message += "\n" + error_msg
+            raise OSError(message) from error
+        return source_lines, file_lineno, filename
 from torch.serialization import (
     _check_seekable,
     _get_restore_location,
