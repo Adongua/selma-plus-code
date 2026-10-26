@@ -53,10 +53,40 @@ def prob_trunc(base, value, shift, material):
     """
     mask, high, top = material
     opened = base.reveal(value + base.public(1 << 62) + mask)
+    return _finish_prob_trunc(base, opened, shift, high, top)
+
+
+def _finish_prob_trunc(base, opened, shift, high, top):
     wrap = top * (1 - logical_shift(opened, 63))
     factor = torch.tensor(1, dtype=torch.int64, device=opened.device) << (64 - shift)
     return (base.public(logical_shift(opened, shift)) - high + wrap * factor
             - base.public(1 << (62 - shift)))
+
+
+def prob_trunc_batch(base, values, shifts, materials):
+    """Open independent truncation masks together when tensor shapes match.
+
+    This preserves independent one-time masks and the exact result of separate
+    ``prob_trunc`` calls, but pays for one reconstruction phase instead of one
+    phase per value.  It is useful for data-independent truncations that are
+    already available at the same point in the online graph.
+    """
+    if not (len(values) == len(shifts) == len(materials)) or not values:
+        raise ValueError("values, shifts and materials must have the same nonzero length")
+    shape = tuple(values[0].shape)
+    if any(tuple(value.shape) != shape for value in values):
+        raise ValueError("batched truncation values must have the same shape")
+    masked = []
+    for value, shift, material in zip(values, shifts, materials):
+        if not 1 <= shift <= 62:
+            raise ValueError("truncation shift must be in [1,62]")
+        mask, _, _ = material
+        masked.append(value + base.public(1 << 62) + mask)
+    opened = base.reveal(torch.stack(masked))
+    return tuple(
+        _finish_prob_trunc(base, item, shift, material[1], material[2])
+        for item, shift, material in zip(opened, shifts, materials)
+    )
 
 
 def extension_material(base, wide, shape):
@@ -141,7 +171,12 @@ def ruler_g2(base, wide, x_q17, material):
     material.consume(base, x_q17)
     trunc = material.truncations
     square_q34 = base.square(x_q17)
-    square_q16 = prob_trunc(base, square_q34, 18, trunc["square"])
+    # Both values are ready after the square.  Opening their independent masks
+    # as one tensor removes one reconstruction from the critical path.
+    square_q16, half_q17 = prob_trunc_batch(
+        base, (square_q34, x_q17), (18, 1),
+        (trunc["square"], trunc["half"]),
+    )
     constants = torch.tensor([round(material.mu**2 * (1 << 16)),
                               round(4 * material.mu**2 * (1 << 16))],
                              dtype=torch.int64, device=x_q17.device)
@@ -158,5 +193,4 @@ def ruler_g2(base, wide, x_q17, material):
     c43, c13 = round((4 / 3) * (1 << 24)), round((1 / 3) * (1 << 24))
     bracket = prob_trunc(base, c43 * inverse_q24[0] - c13 * inverse_q24[1], 24, trunc["bracket"])
     term2_q16 = prob_trunc(base, base.mul(square_q16, bracket), 24, trunc["product"])
-    half_q17 = prob_trunc(base, x_q17, 1, trunc["half"])
     return half_q17 + term2_q16

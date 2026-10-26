@@ -57,7 +57,7 @@ class CudaPairwiseZeroSharing:
 class CudaRing3:
     """Three-party additive ring over CUDA tensors using NCCL point-to-point."""
 
-    def __init__(self, rank=None, device=None):
+    def __init__(self, rank=None, device=None, reveal_mode="all_gather"):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
         if not dist.is_initialized() or dist.get_world_size() != 3:
@@ -68,6 +68,9 @@ class CudaRing3:
         if self.rank != dist.get_rank():
             raise ValueError("rank does not match the initialized process group")
         self.device = torch.device(device or f"cuda:{torch.cuda.current_device()}")
+        if reveal_mode not in ("all_gather", "p2p"):
+            raise ValueError("reveal_mode must be 'all_gather' or 'p2p'")
+        self.reveal_mode = reveal_mode
         self.sent_bytes = 0
         self.phases = 0
         local_seed = secrets.token_bytes(32)
@@ -99,6 +102,21 @@ class CudaRing3:
         self.phases += 1
         return received
 
+    def gather_all(self, value):
+        """Collect equal-sized CUDA tensors from all parties in one NCCL phase."""
+        value = value.contiguous()
+        if value.device != self.device:
+            raise ValueError(f"CUDA tensor on {self.device} required")
+        flat = value.reshape(-1)
+        gathered = torch.empty(3 * flat.numel(), dtype=value.dtype, device=self.device)
+        dist.all_gather_into_tensor(gathered, flat)
+        # A three-party ring all-gather transmits two input-sized chunks per
+        # rank.  This matches the payload accounting of the former two P2P
+        # reconstruction exchanges and keeps CPU/GPU reports comparable.
+        self.sent_bytes += 2 * value.numel() * value.element_size()
+        self.phases += 1
+        return gathered.reshape((3,) + tuple(value.shape))
+
     def public(self, value):
         value = torch.as_tensor(value, dtype=torch.int64, device=self.device)
         return value.clone() if self.rank == 0 else torch.zeros_like(value)
@@ -123,6 +141,8 @@ class CudaRing3:
         return self.refresh(value.square() + 2 * value * predecessor)
 
     def reveal(self, value):
+        if self.reveal_mode == "all_gather":
+            return self.gather_all(value).sum(dim=0)
         predecessor, = self.exchange([value])
         other, = self.exchange([predecessor])
         return value + predecessor + other
@@ -158,6 +178,13 @@ class CudaRing3Wide:
                                   mul96(lp, right)))
 
     def reveal(self, value):
+        if self.base.reveal_mode == "all_gather":
+            # Gather packed shares to retain the 3x32-bit wire format.  Packed
+            # shares must be unpacked before addition so carries are normalized
+            # in the 4x24-bit arithmetic representation rather than crossing
+            # packed fields.
+            gathered = self.base.gather_all(pack_wire(value))
+            return normalize96(unpack_wire(gathered).sum(dim=0))
         predecessor, = self.exchange([value])
         other, = self.exchange([predecessor])
         return normalize96(value + predecessor + other)
