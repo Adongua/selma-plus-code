@@ -19,6 +19,33 @@ SECFORMER_BETA = (
 )
 
 
+PUMA_T0 = -4.0
+PUMA_T1 = -1.95
+PUMA_T2 = 3.0
+PUMA_F0 = (-0.011034134030615728, -0.11807612951181953,
+           -0.42226581151983866, -0.5054031199708174)
+PUMA_F1 = (0.0018067462606141187, -0.037688200365904236,
+           0.3603292692789629, 0.5, 0.008526321541038084)
+
+
+def puma_gelu_reference(value):
+    """Plaintext reference for PUMA's published piecewise cubic GeLU.
+
+    This is the approximation from PUMA Eq. (3), not the exact GELU.  Keeping
+    this function separate makes the microbenchmark error target explicit.
+    """
+    import torch
+
+    x = value
+    x2 = x * x
+    f0 = PUMA_F0[0] * x**3 + PUMA_F0[1] * x2 + PUMA_F0[2] * x + PUMA_F0[3]
+    f1 = (PUMA_F1[0] * x**6 + PUMA_F1[1] * x**4 + PUMA_F1[2] * x2
+          + PUMA_F1[3] * x + PUMA_F1[4])
+    return torch.where(x < PUMA_T0, torch.zeros_like(x),
+                       torch.where(x < PUMA_T1, f0,
+                                   torch.where(x <= PUMA_T2, f1, x)))
+
+
 def secformer_fourier_gelu_reference(value, threshold=2.5):
     """Plaintext reference for the published seven-term Fourier fit."""
     import torch

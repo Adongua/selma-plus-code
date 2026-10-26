@@ -92,15 +92,17 @@ CUDA benchmark 默认使用实测更快的 P2P 重构，并将平方截断和 `x
 括号截断和最终乘法截断的同步分阶段时间。该选项会插入 CUDA 同步，只用于定位
 瓶颈，不能用于正式性能表。
 
-CUDA benchmark 现在同时测量同一 CUDA Ring3 上的 Quad 固定点移植，报告中对应
-`quad_offline`、`quad_online`、`quad_output_reconstruction` 和 `quad_vs_torch_gelu`。
-该 Quad 是与 CrypTen Quad 数学公式一致的工程 baseline，不代表 CrypTen GPU
-实现或相同安全证明；CrypTen-erf 和 Fourier GPU baseline 仍未接入。
+CUDA benchmark 现在同时测量同一 CUDA Ring3 上的 Quad 固定点移植和
+PUMA-style 分段多项式移植，报告中对应 `quad_*` 和 `puma_style_*` 字段。
+PUMA-style 使用论文公开的边界 `[-4, -1.95, 3]` 与三次/六次多项式；由于当前
+Ring3 尚未实现安全 less-than，区间选择会打开 Q17 输入，因此它只是同运行时
+工程 baseline，不是官方 SecretFlow-SPU PUMA 的安全复现。
 
 这是 CPU/Gloo 原型的工程移植，仍带有 Ruler 打开步骤的隐私限制。CUDA v2 的
 公开 96-bit 整数平方根、精确修正与随机词展开均留在 GPU；初始化时仅交换一次随机
 种子。GPU 随机词使用 PyTorch Philox，仅用于性能实验，不是经审查的密码学 PRG。
-CrypTen-erf、Quad 和 Fourier 的 GPU baseline 尚未纳入该入口。
+CrypTen-erf、Quad、Fourier 和 PUMA-style GPU baseline 均已纳入该入口；其中
+Fourier 和 PUMA-style 的区间选择仍有公开中间值，必须查看报告中的安全说明。
 
 `validate` 默认运行 10,000 个三方原语样本、257 个合成激活、1 次预热和 3 次正式重复。
 测试模块另行核验 10,000 对 96-bit 算术和 10,000 个随机公开整数根，并覆盖边界。
