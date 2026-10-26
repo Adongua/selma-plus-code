@@ -28,6 +28,75 @@ PUMA_F1 = (0.0018067462606141187, -0.037688200365904236,
            0.3603292692789629, 0.5, 0.008526321541038084)
 
 
+# SEAF (USENIX Security 2025) reduces GeLU to the even function
+# g(|x|) = .5 |x| erf(|x| / sqrt(2)) and uses a 64-entry lookup over
+# [0, 4).  Its published high-accuracy configuration has fractional precisions
+# (f_a, f_d) = (7, 12).  The paper's optimized protocol is 2PC and relies on a
+# bespoke secret LUT plus Trun-Eq, neither of which is a CrypTen primitive.
+#
+# The implementation below is consequently named ``seaf_pwl_3pc`` rather than
+# ``SEAF``: it preserves the public approximation structure and quantization,
+# but evaluates the secret interval selection with batched CrypTen comparisons.
+# The coefficients are deterministically regenerated from the exact GeLU
+# formula at segment midpoints; they are not claimed to be the authors' private
+# lookup-file bytes.
+SEAF_PWL_SEGMENTS = 64
+SEAF_PWL_BOUND = 4.0
+SEAF_PWL_SLOPE_FRACTION_BITS = 7
+SEAF_PWL_INTERCEPT_FRACTION_BITS = 12
+
+
+def seaf_pwl_table(*, device=None, dtype=None):
+    """Return the public 64-segment, SEAF-style table for ``g(|x|)``.
+
+    Each segment uses its midpoint tangent and then independently quantizes
+    the slope and intercept to the published SEAF1 fractional precisions.
+    ``thresholds`` contains the exclusive upper endpoint of every segment.
+    """
+    import torch
+
+    if dtype is None:
+        dtype = torch.float64
+    width = SEAF_PWL_BOUND / SEAF_PWL_SEGMENTS
+    slopes, intercepts = [], []
+    for index in range(SEAF_PWL_SEGMENTS):
+        midpoint = (index + 0.5) * width
+        erf_value = math.erf(midpoint / math.sqrt(2.0))
+        g_value = 0.5 * midpoint * erf_value
+        slope = (0.5 * erf_value
+                 + midpoint * math.exp(-0.5 * midpoint * midpoint)
+                 / math.sqrt(2.0 * math.pi))
+        intercept = g_value - slope * midpoint
+        slopes.append(round(slope * (1 << SEAF_PWL_SLOPE_FRACTION_BITS))
+                      / (1 << SEAF_PWL_SLOPE_FRACTION_BITS))
+        intercepts.append(round(intercept * (1 << SEAF_PWL_INTERCEPT_FRACTION_BITS))
+                          / (1 << SEAF_PWL_INTERCEPT_FRACTION_BITS))
+    return {
+        "slopes": torch.tensor(slopes, dtype=dtype, device=device),
+        "intercepts": torch.tensor(intercepts, dtype=dtype, device=device),
+        "thresholds": torch.arange(
+            1, SEAF_PWL_SEGMENTS + 1, dtype=dtype, device=device
+        ) * width,
+    }
+
+
+def seaf_pwl_3pc_gelu_reference(value, table=None):
+    """Plaintext reference of the reproducible SEAF-style 3PC PWL port."""
+    import torch
+
+    if table is None:
+        table = seaf_pwl_table(device=value.device, dtype=value.dtype)
+    absolute = value.abs()
+    indices = torch.floor(
+        absolute * (SEAF_PWL_SEGMENTS / SEAF_PWL_BOUND)
+    ).long().clamp(max=SEAF_PWL_SEGMENTS - 1)
+    inside = table["slopes"][indices] * absolute + table["intercepts"][indices]
+    g_value = torch.where(
+        absolute < SEAF_PWL_BOUND, inside, absolute.mul(0.5)
+    )
+    return value.mul(0.5).add(g_value)
+
+
 def puma_gelu_reference(value):
     """Plaintext reference for PUMA's published piecewise cubic GeLU.
 
@@ -88,6 +157,199 @@ def crypten_puma_gelu(value, comparison_value=None, comparison_scale=1 << 17):
     second = upper - middle
     above = 1 - upper
     return first.mul(f0).add(second.mul(f1)).add(above.mul(value))
+
+
+def crypten_seaf_pwl_3pc_gelu(
+    value, comparison_value=None, comparison_scale=1 << 17, table=None,
+):
+    """Evaluate a SEAF-style 64-segment PWL GeLU using CrypTen 3PC.
+
+    This is deliberately *not* presented as the official SEAF protocol.
+    SEAF's 2025 construction is a 2PC scheme with a specialised secret LUT
+    and Trun-Eq.  CrypTen has neither primitive, so this adaptation uses one
+    vectorized comparison over all 64 public breakpoints and arithmetic
+    selection.  It is useful as a same-runtime, recent-method structural
+    baseline, but its communication cost must not be attributed to SEAF.
+
+    ``comparison_value`` is a precision-zero, Q17 integer encoding of
+    ``value``.  Supplying it avoids CrypTen interpreting fractional shares in
+    the comparator; this is the same convention used by the PUMA baseline.
+    """
+    import crypten
+    import torch
+    from crypten.mpc import MPCTensor, ptype
+
+    if not isinstance(value, MPCTensor) or value.ptype != ptype.arithmetic:
+        raise ValueError("expected an arithmetic CrypTen MPCTensor")
+    if comparison_value is None:
+        raise ValueError("seaf_pwl_3pc requires a precision-zero comparison share")
+    if (not isinstance(comparison_value, MPCTensor)
+            or comparison_value.ptype != ptype.arithmetic
+            or comparison_value.encoder._precision_bits != 0):
+        raise ValueError("comparison_value must be a precision-zero arithmetic MPCTensor")
+    if table is None:
+        table = seaf_pwl_table(device=value.device, dtype=torch.float64)
+
+    shape = tuple(value.size())
+    view_shape = (SEAF_PWL_SEGMENTS,) + (1,) * len(shape)
+    expanded_shape = (SEAF_PWL_SEGMENTS,) + shape
+
+    # The residual g is even.  Obtain |x| without revealing the sign.  Since
+    # this is a 3PC port, CrypTen's generic comparison and multiplication are
+    # intentionally included in the reported cost.
+    negative = comparison_value.lt(0)
+    sign = 1 - negative.mul(2)
+    absolute = value.mul(sign)
+    comparison_absolute = comparison_value.mul(sign)
+
+    thresholds = (table["thresholds"] * comparison_scale).round().long()
+    upper = comparison_absolute.unsqueeze(0).expand(expanded_shape).lt(
+        thresholds.view(view_shape)
+    )
+    masks = crypten.cat(
+        [upper[:1], upper[1:].sub(upper[:-1])], dim=0
+    )
+    lines = absolute.unsqueeze(0).mul(
+        table["slopes"].view(view_shape)
+    ).add(table["intercepts"].view(view_shape))
+    inside = masks.mul(lines).sum(0)
+    tail = 1 - upper[-1]
+    g_value = inside.add(tail.mul(absolute).mul(0.5))
+    return value.mul(0.5).add(g_value)
+
+
+# EAST (IEEE TSC 2025) gives its OPPE evaluator configuration for GeLU as
+# m=8 segments and degree 3, but does not publish the complete set of fitted
+# GeLU coefficients.  The functions below therefore implement an explicitly
+# labelled *EAST-style* OPPE 3PC port: the public cubic coefficients are
+# deterministically regenerated from four Chebyshev nodes per segment.
+EAST_OPPE_SEGMENTS = 8
+EAST_OPPE_DEGREE = 3
+EAST_OPPE_BOUND = 4.0
+
+
+def _east_cubic_coefficients(lower, upper):
+    """Return global-basis cubic interpolant coefficients for exact GeLU."""
+    center = (lower + upper) / 2.0
+    radius = (upper - lower) / 2.0
+    nodes = [
+        center + radius * math.cos((2 * index + 1) * math.pi / 8.0)
+        for index in range(EAST_OPPE_DEGREE + 1)
+    ]
+    coefficients = [0.0] * (EAST_OPPE_DEGREE + 1)
+    for index, node in enumerate(nodes):
+        basis = [1.0]
+        denominator = 1.0
+        for other_index, other_node in enumerate(nodes):
+            if other_index == index:
+                continue
+            next_basis = [0.0] * (len(basis) + 1)
+            for power, coefficient in enumerate(basis):
+                next_basis[power] -= coefficient * other_node
+                next_basis[power + 1] += coefficient
+            basis = next_basis
+            denominator *= node - other_node
+        gelu = 0.5 * node * (1.0 + math.erf(node / math.sqrt(2.0)))
+        for power, coefficient in enumerate(basis):
+            coefficients[power] += gelu * coefficient / denominator
+    return coefficients
+
+
+def east_oppe_table(*, device=None, dtype=None):
+    """Return the public ``m=8``, degree-three EAST-style OPPE table."""
+    import torch
+
+    if dtype is None:
+        dtype = torch.float64
+    width = 2.0 * EAST_OPPE_BOUND / EAST_OPPE_SEGMENTS
+    coefficients = [
+        _east_cubic_coefficients(
+            -EAST_OPPE_BOUND + index * width,
+            -EAST_OPPE_BOUND + (index + 1) * width,
+        )
+        for index in range(EAST_OPPE_SEGMENTS)
+    ]
+    return {
+        "coefficients": torch.tensor(coefficients, dtype=dtype, device=device),
+        "thresholds": torch.linspace(
+            -EAST_OPPE_BOUND,
+            EAST_OPPE_BOUND,
+            EAST_OPPE_SEGMENTS + 1,
+            dtype=dtype,
+            device=device,
+        ),
+    }
+
+
+def east_oppe_3pc_gelu_reference(value, table=None):
+    """Plaintext reference for the deterministic EAST-style 3PC port."""
+    import torch
+
+    if table is None:
+        table = east_oppe_table(device=value.device, dtype=value.dtype)
+    width = 2.0 * EAST_OPPE_BOUND / EAST_OPPE_SEGMENTS
+    indices = torch.floor((value + EAST_OPPE_BOUND) / width).long().clamp(
+        min=0, max=EAST_OPPE_SEGMENTS - 1
+    )
+    coefficients = table["coefficients"][indices]
+    inside = coefficients[..., 0]
+    for power in range(1, EAST_OPPE_DEGREE + 1):
+        inside = inside + coefficients[..., power] * value.pow(power)
+    return torch.where(
+        value < -EAST_OPPE_BOUND,
+        torch.zeros_like(value),
+        torch.where(value < EAST_OPPE_BOUND, inside, value),
+    )
+
+
+def crypten_east_oppe_3pc_gelu(
+    value, comparison_value=None, comparison_scale=1 << 17, table=None,
+):
+    """Evaluate a CrypTen 3PC port of EAST's ``m=8`` cubic OPPE structure.
+
+    The original EAST protocol is a 2PC construction based on OT-backed MUX.
+    CrypTen provides neither that MUX primitive nor its unpublished GELU fit;
+    this function evaluates all eight deterministic cubic candidates and uses
+    batched CrypTen comparisons for oblivious selection.  It is therefore an
+    EAST-style structural baseline, not a report of official EAST performance.
+    """
+    import crypten
+    import torch
+    from crypten.mpc import MPCTensor, ptype
+
+    if not isinstance(value, MPCTensor) or value.ptype != ptype.arithmetic:
+        raise ValueError("expected an arithmetic CrypTen MPCTensor")
+    if comparison_value is None:
+        raise ValueError("east_oppe_3pc requires a precision-zero comparison share")
+    if (not isinstance(comparison_value, MPCTensor)
+            or comparison_value.ptype != ptype.arithmetic
+            or comparison_value.encoder._precision_bits != 0):
+        raise ValueError("comparison_value must be a precision-zero arithmetic MPCTensor")
+    if table is None:
+        table = east_oppe_table(device=value.device, dtype=torch.float64)
+
+    shape = tuple(value.size())
+    view_shape = (EAST_OPPE_SEGMENTS,) + (1,) * len(shape)
+    expanded_shape = (EAST_OPPE_SEGMENTS + 1,) + shape
+    thresholds = (table["thresholds"] * comparison_scale).round().long()
+    upper = comparison_value.unsqueeze(0).expand(expanded_shape).lt(
+        thresholds.view((EAST_OPPE_SEGMENTS + 1,) + (1,) * len(shape))
+    )
+    # ``upper[i+1] - upper[i]`` selects interval i.  Values below -4 map to
+    # zero and values at/above 4 map to x, matching the standard GeLU tails.
+    masks = upper[1:].sub(upper[:-1])
+
+    coefficients = table["coefficients"]
+    x2 = value.square()
+    x3 = x2.mul(value)
+    candidates = (
+        coefficients[:, 0].view(view_shape)
+        + value.unsqueeze(0).mul(coefficients[:, 1].view(view_shape))
+        + x2.unsqueeze(0).mul(coefficients[:, 2].view(view_shape))
+        + x3.unsqueeze(0).mul(coefficients[:, 3].view(view_shape))
+    )
+    inside = masks.mul(candidates).sum(0)
+    return inside.add((1 - upper[-1]).mul(value))
 
 
 def secformer_fourier_gelu_reference(value, threshold=2.5):

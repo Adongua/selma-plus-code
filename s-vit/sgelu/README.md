@@ -88,13 +88,24 @@ benchmark，使用：
 ```bash
 export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main"
 CUDA_VISIBLE_DEVICES=0,1,2 python -m sgelu.benchmark_crypten_cuda \
-  --shape 1x17 --repeats 1 --methods quad \
+  --shape 1x17 --repeats 1 --methods sgelu puma east_oppe_3pc seaf_pwl_3pc quad \
   --output "$HOME/home/tmp/sgelu-crypten-cuda-quad-smoke"
 ```
 
-该入口的 `puma`、`quad`、`erf`、`fourier` 和 `masked_fourier` 使用 CrypTen
+该入口的 `puma`、`east_oppe_3pc`、`seaf_pwl_3pc`、`quad`、`erf`、`fourier` 和 `masked_fourier` 使用 CrypTen
 GPU 算术共享；`sgelu` 使用同一 CrypTen NCCL 进程组上的 Ruler 协议适配器。
 它与 `benchmark_cuda.py` 的自定义 Ring3 baseline 不应混写在同一列。
+
+`seaf_pwl_3pc` 是 SEAF（USENIX Security 2025）的**结构性 3PC 适配基线**：保留
+`g(|x|)` 偶函数分解、`[0,4)` 上 64 段 PWL 和公开的高精度 `(f_a,f_d)=(7,12)`
+量化配置。官方 SEAF 是带专用 secret-LUT/Trun-Eq 的 2PC 协议；CrypTen 没有这两个
+原语，因此本实现以 batched secure comparison 和 arithmetic selection 代替，系数也按
+公开 GeLU 公式确定性重建。它不能被写成官方 SEAF 的运行时间或逐字节实现。
+
+`east_oppe_3pc` 同理是 EAST（IEEE TSC 2025）的结构性 3PC port：使用论文公开的
+`m=8`、三次 OPPE 结构，但 EAST 未公开完整 GeLU 分段系数，故该表由确定性的 Chebyshev
+节点拟合生成；CrypTen 的批量比较/算术选择也不能替代其原始 2PC OT-backed MUX。报告和论文
+中必须称其为 EAST-style 适配基线，不能使用为官方 EAST 性能数据。
 
 CUDA benchmark 默认使用实测更快的 P2P 重构，并将平方截断和 `x/2` 截断合并打开，
 在线 phase 从旧实现的 17 降至 15。使用 `--reveal-mode all_reduce` 或

@@ -20,12 +20,18 @@ import torch.multiprocessing as mp
 from torch.nn import functional as F
 
 from .baseline import (
+    crypten_east_oppe_3pc_gelu,
     crypten_erf_gelu,
     crypten_puma_gelu,
     crypten_quad_gelu,
+    crypten_seaf_pwl_3pc_gelu,
     crypten_secformer_fourier_gelu,
     crypten_secformer_masked_fourier_gelu,
+    east_oppe_3pc_gelu_reference,
+    east_oppe_table,
     puma_gelu_reference,
+    seaf_pwl_3pc_gelu_reference,
+    seaf_pwl_table,
     secformer_fourier_gelu_reference,
 )
 from .cuda_baseline import prepare_fourier, prepare_erf, prepare_quad
@@ -33,7 +39,10 @@ from .protocol import prepare_g2, ruler_g2
 from .runtime_cuda import CudaRing3, CudaRing3Wide
 from .sgelu import MU0, error_metrics, g2
 
-METHODS = ("sgelu", "puma", "quad", "erf", "fourier", "masked_fourier")
+METHODS = (
+    "sgelu", "puma", "east_oppe_3pc", "seaf_pwl_3pc", "quad", "erf", "fourier",
+    "masked_fourier",
+)
 
 
 def _parse_shape(value):
@@ -147,6 +156,10 @@ def _method_reference(x, method, mu):
         return g2(x, mu)
     if method == "puma":
         return puma_gelu_reference(x)
+    if method == "east_oppe_3pc":
+        return east_oppe_3pc_gelu_reference(x)
+    if method == "seaf_pwl_3pc":
+        return seaf_pwl_3pc_gelu_reference(x)
     if method == "quad":
         return 0.125 * x.square() + 0.25 * x + 0.5
     if method in ("erf", "fourier", "masked_fourier"):
@@ -180,6 +193,8 @@ def worker(rank, rendezvous, options):
             method: _method_reference(x, method, options["mu"])
             for method in options["methods"]
         }
+        seaf_table = seaf_pwl_table(device=device, dtype=x.dtype)
+        east_table = east_oppe_table(device=device, dtype=x.dtype)
 
         mask_generator = torch.Generator().manual_seed(options["seed"] + 1)
         mask_cpu = 2.0 * torch.pi * torch.rand(shape, generator=mask_generator, dtype=torch.float64) - torch.pi
@@ -224,6 +239,18 @@ def worker(rank, rendezvous, options):
                     if method == "puma":
                         function = lambda: crypten_puma_gelu(
                             encrypted.clone(), comparison_value=comparison_encrypted
+                        )
+                    elif method == "east_oppe_3pc":
+                        function = lambda: crypten_east_oppe_3pc_gelu(
+                            encrypted.clone(),
+                            comparison_value=comparison_encrypted,
+                            table=east_table,
+                        )
+                    elif method == "seaf_pwl_3pc":
+                        function = lambda: crypten_seaf_pwl_3pc_gelu(
+                            encrypted.clone(),
+                            comparison_value=comparison_encrypted,
+                            table=seaf_table,
                         )
                     elif method == "quad":
                         function = lambda: crypten_quad_gelu(encrypted.clone())
@@ -282,6 +309,18 @@ def worker(rank, rendezvous, options):
                 "method_provenance": {
                     "sgelu": "manuscript protocol using the Ring3 adapter on the CrypTen NCCL process group",
                     "puma": "PUMA piecewise polynomial re-evaluated with CrypTen MPCTensor",
+                    "east_oppe_3pc": (
+                        "EAST (IEEE TSC 2025)-style m=8 degree-3 OPPE port "
+                        "with deterministically regenerated public GeLU "
+                        "coefficients; CrypTen selection replaces EAST's 2PC "
+                        "OT MUX, so this is not official EAST performance"
+                    ),
+                    "seaf_pwl_3pc": (
+                        "SEAF (USENIX Security 2025)-style 64-segment PWL "
+                        "ported to CrypTen 3PC; CrypTen comparison/selection "
+                        "replaces SEAF's 2PC LUT and Trun-Eq, so this is not "
+                        "an official SEAF performance number"
+                    ),
                     "quad": "quadratic approximation evaluated with CrypTen MPCTensor",
                     "erf": "CrypTen MPCTensor erf Taylor approximation",
                     "fourier": "SecFormer Fourier coefficients evaluated with CrypTen MPCTensor",
