@@ -92,6 +92,11 @@ CUDA benchmark 默认使用实测更快的 P2P 重构，并将平方截断和 `x
 括号截断和最终乘法截断的同步分阶段时间。该选项会插入 CUDA 同步，只用于定位
 瓶颈，不能用于正式性能表。
 
+CUDA benchmark 现在同时测量同一 CUDA Ring3 上的 Quad 固定点移植，报告中对应
+`quad_offline`、`quad_online`、`quad_output_reconstruction` 和 `quad_vs_torch_gelu`。
+该 Quad 是与 CrypTen Quad 数学公式一致的工程 baseline，不代表 CrypTen GPU
+实现或相同安全证明；CrypTen-erf 和 Fourier GPU baseline 仍未接入。
+
 这是 CPU/Gloo 原型的工程移植，仍带有 Ruler 打开步骤的隐私限制。CUDA v2 的
 公开 96-bit 整数平方根、精确修正与随机词展开均留在 GPU；初始化时仅交换一次随机
 种子。GPU 随机词使用 PyTorch Philox，仅用于性能实验，不是经审查的密码学 PRG。

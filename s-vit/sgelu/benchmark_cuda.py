@@ -14,6 +14,7 @@ import torch.multiprocessing as mp
 from torch.nn import functional as F
 
 from .protocol import prepare_g2, ruler_g2
+from .cuda_baseline import prepare_quad, quad_gelu
 from .runtime_cuda import CudaRing3, CudaRing3Wide
 from .sgelu import MU0, error_metrics, g2
 
@@ -100,15 +101,25 @@ def worker(rank, rendezvous, options):
                 base, lambda: ruler_g2(base, wide, shares, material, profiler=profiler))
             profile = gather_profile(base, profiler)
             opened, reconstruction = measure(base, lambda: base.reveal(output))
+            quad_material, quad_offline = measure(
+                base, lambda: prepare_quad(base, x_q17.shape))
+            quad_output, quad_online = measure(
+                base, lambda: quad_gelu(base, shares, quad_material))
+            quad_opened, quad_reconstruction = measure(
+                base, lambda: base.reveal(quad_output))
             if rank == 0:
                 result = opened.double() / (1 << 17)
+                quad_result = quad_opened.double() / (1 << 17)
                 error = error_metrics(result, target)
                 records.append({"warmup": iteration == 0,
                                 "input_sharing": input_metrics, "offline": offline,
                                 "online": online, "output_reconstruction": reconstruction,
                                 "online_profile_seconds_max": profile,
+                                "quad_offline": quad_offline, "quad_online": quad_online,
+                                "quad_output_reconstruction": quad_reconstruction,
                                 "error_vs_float_g2": error_metrics(result, target_g2),
-                                "error_vs_torch_gelu": error})
+                                "error_vs_torch_gelu": error,
+                                "quad_vs_torch_gelu": error_metrics(quad_result, target)})
         if rank == 0:
             output = Path(options["output"])
             output.mkdir(parents=True, exist_ok=True)
@@ -122,11 +133,18 @@ def worker(rank, rendezvous, options):
                       "cuda_hot_path": {"public_isqrt": "CUDA float64 seed plus exact integer correction",
                                         "random_expansion": "CUDA Philox",
                                         "host_tensor_roundtrip": False},
+                      "cuda_quad": "same CUDA Ring3 fixed-point port of 0.125*x^2 + 0.25*x + 0.5",
                       "records": records,
                       "security": "Ruler remains not security validated; CUDA Philox is a benchmark PRG, not a reviewed CSPRNG"}
             (output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+            last = records[-1]
             print(json.dumps({"report": str(output / "comparison.json"),
-                              "records": len(records)}, indent=2), flush=True)
+                              "records": len(records),
+                              "sgelu_online_seconds": last["online"]["seconds_max"],
+                              "quad_online_seconds": last["quad_online"]["seconds_max"],
+                              "sgelu_bytes": last["online"]["sent_bytes_sum"],
+                              "quad_bytes": last["quad_online"]["sent_bytes_sum"]},
+                             indent=2), flush=True)
     finally:
         dist.destroy_process_group()
 
