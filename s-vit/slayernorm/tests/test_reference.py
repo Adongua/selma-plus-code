@@ -5,6 +5,7 @@ from torch.nn import functional as F
 
 from slayernorm.protocol import Profile
 from slayernorm.reference import scaled_layernorm
+from slayernorm.baselines import ALL_METHODS, goldschmidt_rsqrt_reference
 
 
 class ReferenceTests(unittest.TestCase):
@@ -35,6 +36,22 @@ class ReferenceTests(unittest.TestCase):
                 bad.validate((1, 257))
         with self.assertRaises(ValueError):
             Profile().validate((0, 257))
+
+    def test_secformer_goldschmidt_reference(self):
+        # SecFormer's published fixed iteration count targets ordinary
+        # activation variances; near-zero variance is covered separately by
+        # the stability-oriented SPRINT baseline.
+        variance = torch.logspace(-1, 1, 257, dtype=torch.float64)
+        actual = goldschmidt_rsqrt_reference(variance)
+        torch.testing.assert_close(
+            actual, variance.rsqrt(), rtol=1e-10, atol=1e-10
+        )
+
+    def test_unified_cuda_method_inventory(self):
+        self.assertEqual(ALL_METHODS, (
+            "slayernorm", "crypten_native", "secformer", "puma",
+            "sprint", "shaft_adapted_3pc", "newton_engineering",
+        ))
 
 
 if __name__ == "__main__":

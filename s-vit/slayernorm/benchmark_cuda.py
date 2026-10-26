@@ -4,9 +4,9 @@ Run with one process per GPU, for example:
     CUDA_VISIBLE_DEVICES=0,1,2 python -m slayernorm.benchmark_cuda \
         --shapes 1x197x768 --repeats 3 --output /path/to/output
 
-This benchmark covers the custom sLayerNorm methods only.  CrypTen GPU
-baselines are intentionally kept separate until their communicator and
-precision configuration has been independently verified.
+This benchmark covers the custom sLayerNorm methods only.  Use
+``slayernorm.benchmark_crypten_cuda`` for the unified seven-method CrypTen /
+Ring3 GPU comparison.
 """
 
 import argparse

@@ -57,4 +57,32 @@ CUDA_VISIBLE_DEVICES=0,1,2 python -m slayernorm.benchmark_cuda \
 GPU；PyTorch Philox 仅用于性能实验，不是经审查的密码学 PRG。CrypTen GPU baseline
 尚未纳入同一入口。
 
-所有阶段的原始数据写入 `comparison.json`；自动生成 `summary.md`。普通 normal/uniform 输入最大绝对误差要求不超过 0.005，否则测试退出失败；边界输入如实记录是否达到该阈值。
+统一 GPU micro benchmark 使用 `benchmark_crypten_cuda.py`。它将自研 sLayerNorm
+和 Newton 工程基线通过 Ring3 适配到同一 NCCL 进程组，其余方法使用 CrypTen
+MPCTensor：
+
+| CLI 方法 | 时间 | 实现口径 |
+|---|---:|---|
+| `slayernorm` | 本文 | 融合方差 + Ruler（本文方案） |
+| `crypten_native` | 2021 | 顺序 `sqrt -> reciprocal` CrypTen 组合 |
+| `secformer` | 2024 | 11 步 Goldschmidt，CrypTen 3PC 适配 |
+| `puma` | 2025 | 直接 `InvSqrt` + broadcast，CrypTen 3PC 适配；预印本为 2023 |
+| `sprint` | 2026 | `T=100,beta=1000` 分段 `InvSqrt`，CrypTen 3PC 适配 |
+| `shaft_adapted_3pc` | 2025 | SHAFT 的 8 次指数初始化、5 次 rSqrt 迭代，3PC 适配 |
+| `newton_engineering` | 工程对照 | 逐通道截断方差 + 32 步 Newton，同 Ring3 工程对照 |
+
+除 `crypten_native` 外，文献 baseline 的结果都是在本项目相同 CrypTen 3PC 环境中的
+算法移植结果，不是原作者系统的官方性能数字。运行完整的 D=256 测试：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+python -m slayernorm.benchmark_crypten_cuda \
+  --shapes 1x197x256 1x257x256 1x577x256 8x257x256 \
+  --distributions normal uniform --repeats 3 \
+  --methods slayernorm crypten_native secformer puma sprint shaft_adapted_3pc newton_engineering \
+  --output ../tmp/slayernorm-crypten-cuda-d256
+```
+
+所有阶段的原始数据写入 `comparison.json`；自动生成 `summary.md`。传统
+`benchmark.py` 对普通 normal/uniform 输入执行最大绝对误差 `0.005` 的 guard；统一
+GPU 入口会如实记录每个 baseline 的误差而不因某个近似误差较大提前终止整批实验。
