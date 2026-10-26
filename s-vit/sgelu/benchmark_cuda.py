@@ -14,7 +14,9 @@ import torch.multiprocessing as mp
 from torch.nn import functional as F
 
 from .protocol import prepare_g2, ruler_g2
-from .cuda_baseline import prepare_quad, quad_gelu
+from .cuda_baseline import (prepare_erf, prepare_fourier, prepare_quad,
+                             erf_gelu, fourier_gelu, quad_gelu)
+from .baseline import secformer_fourier_gelu_reference
 from .runtime_cuda import CudaRing3, CudaRing3Wide
 from .sgelu import MU0, error_metrics, g2
 
@@ -107,9 +109,23 @@ def worker(rank, rendezvous, options):
                 base, lambda: quad_gelu(base, shares, quad_material))
             quad_opened, quad_reconstruction = measure(
                 base, lambda: base.reveal(quad_output))
+            erf_material, erf_offline = measure(
+                base, lambda: prepare_erf(base, x_q17.shape))
+            erf_output, erf_online = measure(
+                base, lambda: erf_gelu(base, shares, erf_material))
+            erf_opened, erf_reconstruction = measure(
+                base, lambda: base.reveal(erf_output))
+            fourier_material, fourier_offline = measure(
+                base, lambda: prepare_fourier(base, x_q17.shape))
+            fourier_output, fourier_online = measure(
+                base, lambda: fourier_gelu(base, shares, fourier_material))
+            fourier_opened, fourier_reconstruction = measure(
+                base, lambda: base.reveal(fourier_output))
             if rank == 0:
                 result = opened.double() / (1 << 17)
                 quad_result = quad_opened.double() / (1 << 17)
+                erf_result = erf_opened.double() / (1 << 17)
+                fourier_result = fourier_opened.double() / (1 << 17)
                 error = error_metrics(result, target)
                 records.append({"warmup": iteration == 0,
                                 "input_sharing": input_metrics, "offline": offline,
@@ -117,9 +133,19 @@ def worker(rank, rendezvous, options):
                                 "online_profile_seconds_max": profile,
                                 "quad_offline": quad_offline, "quad_online": quad_online,
                                 "quad_output_reconstruction": quad_reconstruction,
+                                "crypten_erf_offline": erf_offline,
+                                "crypten_erf_online": erf_online,
+                                "crypten_erf_output_reconstruction": erf_reconstruction,
+                                "secformer_fourier_offline": fourier_offline,
+                                "secformer_fourier_online": fourier_online,
+                                "secformer_fourier_output_reconstruction": fourier_reconstruction,
                                 "error_vs_float_g2": error_metrics(result, target_g2),
                                 "error_vs_torch_gelu": error,
-                                "quad_vs_torch_gelu": error_metrics(quad_result, target)})
+                                "quad_vs_torch_gelu": error_metrics(quad_result, target),
+                                "crypten_erf_vs_torch_gelu": error_metrics(erf_result, target),
+                                "secformer_fourier_vs_torch_gelu": error_metrics(fourier_result, target),
+                                "secformer_fourier_reference_vs_torch_gelu": error_metrics(
+                                    secformer_fourier_gelu_reference(x.cpu()).to(base.device), target)})
         if rank == 0:
             output = Path(options["output"])
             output.mkdir(parents=True, exist_ok=True)
@@ -134,6 +160,8 @@ def worker(rank, rendezvous, options):
                                         "random_expansion": "CUDA Philox",
                                         "host_tensor_roundtrip": False},
                       "cuda_quad": "same CUDA Ring3 fixed-point port of 0.125*x^2 + 0.25*x + 0.5",
+                      "cuda_crypten_erf": "Q17 fixed-point port of CrypTen erf Taylor approximation with 8 iterations",
+                      "cuda_secformer_fourier": "Q17 fixed-point port of CrypTen repeated-squaring sine and seven SecFormer coefficients; interval threshold is opened publicly because CUDA comparison is not implemented",
                       "records": records,
                       "security": "Ruler remains not security validated; CUDA Philox is a benchmark PRG, not a reviewed CSPRNG"}
             (output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -142,8 +170,12 @@ def worker(rank, rendezvous, options):
                               "records": len(records),
                               "sgelu_online_seconds": last["online"]["seconds_max"],
                               "quad_online_seconds": last["quad_online"]["seconds_max"],
+                              "crypten_erf_online_seconds": last["crypten_erf_online"]["seconds_max"],
+                              "secformer_fourier_online_seconds": last["secformer_fourier_online"]["seconds_max"],
                               "sgelu_bytes": last["online"]["sent_bytes_sum"],
-                              "quad_bytes": last["quad_online"]["sent_bytes_sum"]},
+                              "quad_bytes": last["quad_online"]["sent_bytes_sum"],
+                              "crypten_erf_bytes": last["crypten_erf_online"]["sent_bytes_sum"],
+                              "secformer_fourier_bytes": last["secformer_fourier_online"]["sent_bytes_sum"]},
                              indent=2), flush=True)
     finally:
         dist.destroy_process_group()
