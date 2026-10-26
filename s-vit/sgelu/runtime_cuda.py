@@ -68,8 +68,8 @@ class CudaRing3:
         if self.rank != dist.get_rank():
             raise ValueError("rank does not match the initialized process group")
         self.device = torch.device(device or f"cuda:{torch.cuda.current_device()}")
-        if reveal_mode not in ("all_gather", "p2p"):
-            raise ValueError("reveal_mode must be 'all_gather' or 'p2p'")
+        if reveal_mode not in ("all_reduce", "all_gather", "p2p"):
+            raise ValueError("reveal_mode must be 'all_reduce', 'all_gather' or 'p2p'")
         self.reveal_mode = reveal_mode
         self.sent_bytes = 0
         self.phases = 0
@@ -117,6 +117,19 @@ class CudaRing3:
         self.phases += 1
         return gathered.reshape((3,) + tuple(value.shape))
 
+    def reduce_all(self, value):
+        """Reconstruct equal-sized shares using one NCCL integer all-reduce."""
+        value = value.contiguous()
+        if value.device != self.device:
+            raise ValueError(f"CUDA tensor on {self.device} required")
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        # Keep the same conservative two-input-sized accounting used for the
+        # ring reconstruction paths. NCCL's selected algorithm may transfer
+        # less or more than this application-level equivalent.
+        self.sent_bytes += 2 * value.numel() * value.element_size()
+        self.phases += 1
+        return value
+
     def public(self, value):
         value = torch.as_tensor(value, dtype=torch.int64, device=self.device)
         return value.clone() if self.rank == 0 else torch.zeros_like(value)
@@ -141,6 +154,8 @@ class CudaRing3:
         return self.refresh(value.square() + 2 * value * predecessor)
 
     def reveal(self, value):
+        if self.reveal_mode == "all_reduce":
+            return self.reduce_all(value)
         if self.reveal_mode == "all_gather":
             return self.gather_all(value).sum(dim=0)
         predecessor, = self.exchange([value])
@@ -178,6 +193,8 @@ class CudaRing3Wide:
                                   mul96(lp, right)))
 
     def reveal(self, value):
+        if self.base.reveal_mode == "all_reduce":
+            return normalize96(self.base.reduce_all(value))
         if self.base.reveal_mode == "all_gather":
             # Gather packed shares to retain the 3x32-bit wire format.  Packed
             # shares must be unpacked before addition so carries are normalized

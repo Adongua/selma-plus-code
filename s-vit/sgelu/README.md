@@ -83,8 +83,9 @@ CUDA_VISIBLE_DEVICES=0,1,2 python -m sgelu.benchmark_cuda \
 ```
 
 CUDA benchmark 默认使用实测更快的 P2P 重构，并将平方截断和 `x/2` 截断合并打开，
-在线 phase 从旧实现的 17 降至 15。使用 `--reveal-mode all_gather` 可测试单轮
-NCCL 集合重构；该模式理论上为 9 phase，但在当前服务器上实际更慢。两种模式的
+在线 phase 从旧实现的 17 降至 15。使用 `--reveal-mode all_reduce` 或
+`--reveal-mode all_gather` 可测试单轮 NCCL 集合重构；两种模式理论上为 9 phase，
+但 `all_gather` 在当前服务器上实际更慢。两种模式的
 通信字段都按三方环实际传输的等价 payload 计数，因此可直接比较。
 
 使用 `--profile-online` 可记录平方/截断、尺度提升、宽乘法/平方根、逆根截断、

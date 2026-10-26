@@ -139,7 +139,7 @@ def main():
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--mu", type=float, default=MU0)
     parser.add_argument("--seed", type=int, default=20261025)
-    parser.add_argument("--reveal-mode", choices=("all_gather", "p2p"),
+    parser.add_argument("--reveal-mode", choices=("all_reduce", "all_gather", "p2p"),
                         default="p2p",
                         help="one-phase NCCL collective or legacy two-phase ring opening")
     parser.add_argument("--profile-online", action="store_true",
