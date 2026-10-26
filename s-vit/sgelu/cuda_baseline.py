@@ -194,7 +194,6 @@ def fourier_gelu(base, x_q17, material, threshold=2.5):
     # SecFormer's masked opening: delta = z - t.  The opened residue is
     # public, so all seven CUDA trigonometric evaluations are local.
     delta = base.reveal(z - material.mask_share).double() / (1 << 17)
-    delta = torch.remainder(delta, 2.0 * math.pi)
     harmonics = torch.arange(1, 8, device=base.device, dtype=torch.float64)
     angles = delta.unsqueeze(-1) * (harmonics * math.pi / 10.0)
     p = (torch.sin(angles) * (1 << 17)).round().to(torch.int64)
