@@ -16,6 +16,7 @@ from torch.nn import functional as F
 
 from .baseline import (
     crypten_erf_gelu,
+    crypten_puma_gelu,
     crypten_quad_gelu,
     crypten_secformer_fourier_gelu,
     crypten_secformer_masked_fourier_gelu,
@@ -23,7 +24,6 @@ from .baseline import (
     secformer_fourier_gelu_reference,
 )
 from .bridge import ExperimentalG2Bridge
-from .puma_baseline import prepare_puma, puma_gelu
 from .sgelu import MU0, error_metrics, g2
 from .runtime import Ring3, Ring3Wide
 
@@ -55,7 +55,6 @@ def _gather_metrics(metrics):
 
 def worker(rank, rendezvous, options):
     import crypten
-    from crypten.mpc import MPCTensor
 
     torch.set_num_threads(1)
     os.environ.update(RANK=str(rank), WORLD_SIZE="3", RENDEZVOUS=rendezvous,
@@ -111,20 +110,16 @@ def worker(rank, rendezvous, options):
             sgelu_phases = base.phases - sgelu_phases_before
             sgelu_plain = sgelu_encrypted.get_plain_text()
 
-            # PUMA-style piecewise cubic port on the same experimental Ring3
-            # runtime.  The current prototype opens x for interval selection.
+            # CrypTen-native PUMA polynomial baseline.  Unlike sGeLU, this
+            # baseline remains entirely inside CrypTen and uses its LT masks.
             dist.barrier()
+            crypten.reset_communication_stats()
             started = time.perf_counter()
-            puma_material = prepare_puma(base, encrypted.share.shape)
-            puma_offline_seconds = time.perf_counter() - started
-            dist.barrier()
-            puma_bytes_before, puma_phases_before = base.sent_bytes, base.phases
-            started = time.perf_counter()
-            puma_share = puma_gelu(base, encrypted.share, puma_material)
+            puma_encrypted = crypten_puma_gelu(
+                encrypted, comparison_value=comparison_encrypted
+            )
             puma_online_seconds = time.perf_counter() - started
-            puma_bytes = base.sent_bytes - puma_bytes_before
-            puma_phases = base.phases - puma_phases_before
-            puma_encrypted = MPCTensor.from_shares(puma_share, precision=17)
+            puma_stats = _stats()
             puma_plain = puma_encrypted.get_plain_text()
 
             dist.barrier()
@@ -182,7 +177,7 @@ def worker(rank, rendezvous, options):
                 [masked_online_seconds, masked_stats[0], masked_stats[1],
                  masked_stats[2]], dtype=torch.float64)
             puma_metrics = torch.tensor(
-                [puma_offline_seconds, puma_online_seconds, puma_bytes, puma_phases],
+                [puma_online_seconds, puma_stats[0], puma_stats[1], puma_stats[2]],
                 dtype=torch.float64)
             sgelu_all = _gather_metrics(sgelu_metrics)
             baseline_all = _gather_metrics(baseline_metrics)
@@ -230,13 +225,13 @@ def worker(rank, rendezvous, options):
                     ),
                     "sgelu_vs_exact_gelu": error_metrics(sgelu_result, exact),
                     "baseline_vs_sgelu": error_metrics(baseline_result, sgelu_result),
-                    "puma_style_offline_seconds": puma_all[:, 0].max().item(),
-                    "puma_style_online_seconds": puma_all[:, 1].max().item(),
-                    "puma_style_sent_bytes_sum": int(puma_all[:, 2].sum()),
-                    "puma_style_exchange_phases_per_rank": puma_all[:, 3].int().tolist(),
-                    "puma_style_vs_puma_reference": error_metrics(
+                    "puma_crypten_online_seconds_max": puma_all[:, 0].max().item(),
+                    "puma_crypten_rounds_per_rank": puma_all[:, 1].int().tolist(),
+                    "puma_crypten_bytes_sum": int(puma_all[:, 2].sum()),
+                    "puma_crypten_comm_time_sum": puma_all[:, 3].sum().item(),
+                    "puma_crypten_vs_puma_reference": error_metrics(
                         puma_plain.double(), puma_gelu_reference(x)),
-                    "puma_style_vs_exact_gelu": error_metrics(puma_plain.double(), exact),
+                    "puma_crypten_vs_exact_gelu": error_metrics(puma_plain.double(), exact),
                 })
 
         if rank == 0:
@@ -252,7 +247,7 @@ def worker(rank, rendezvous, options):
                 "mpcformer_quad": "0.125*x^2 + 0.25*x + 0.5",
                 "secformer_fourier": "direct CrypTen sine; precision-zero integer copy for comparisons",
                 "secformer_masked_fourier": "masked opening reference; not a standalone security claim",
-                "puma_style": "PUMA published piecewise cubic approximation ported to experimental Ring3; interval selection opens Q17 x because secure less-than is not implemented",
+                "puma": "PUMA published piecewise polynomial evaluated natively with CrypTen arithmetic and encrypted LT masks",
                 "baseline_erf_iterations": int(crypten.cfg.functions.erf_iterations),
                 "communication_note": "CrypTen bytes are summed across parties; its documented overall-system estimate divides this by 2. sGeLU reports custom-ring sent bytes summed across parties.",
                 "records": records,
@@ -269,7 +264,7 @@ def worker(rank, rendezvous, options):
                               "mpcformer_quad_bytes": records[-1]["mpcformer_quad_bytes_sum"],
                               "secformer_fourier_bytes": records[-1]["secformer_fourier_bytes_sum"],
                               "secformer_masked_fourier_online_seconds": records[-1]["secformer_masked_fourier_online_seconds_max"],
-                              "puma_style_online_seconds": records[-1]["puma_style_online_seconds"],
+                              "puma_crypten_online_seconds": records[-1]["puma_crypten_online_seconds_max"],
                               "secformer_masked_fourier_bytes": records[-1]["secformer_masked_fourier_bytes_sum"]}, indent=2), flush=True)
     finally:
         crypten.uninit()

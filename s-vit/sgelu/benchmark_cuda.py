@@ -16,8 +16,7 @@ from torch.nn import functional as F
 from .protocol import prepare_g2, ruler_g2
 from .cuda_baseline import (prepare_erf, prepare_fourier, prepare_quad,
                              erf_gelu, fourier_gelu, quad_gelu)
-from .baseline import puma_gelu_reference, secformer_fourier_gelu_reference
-from .puma_baseline import prepare_puma, puma_gelu
+from .baseline import secformer_fourier_gelu_reference
 from .runtime_cuda import CudaRing3, CudaRing3Wide
 from .sgelu import MU0, error_metrics, g2
 
@@ -122,18 +121,11 @@ def worker(rank, rendezvous, options):
                 base, lambda: fourier_gelu(base, shares, fourier_material))
             fourier_opened, fourier_reconstruction = measure(
                 base, lambda: base.reveal(fourier_output))
-            puma_material, puma_offline = measure(
-                base, lambda: prepare_puma(base, x_q17.shape))
-            puma_output, puma_online = measure(
-                base, lambda: puma_gelu(base, shares, puma_material))
-            puma_opened, puma_reconstruction = measure(
-                base, lambda: base.reveal(puma_output))
             if rank == 0:
                 result = opened.double() / (1 << 17)
                 quad_result = quad_opened.double() / (1 << 17)
                 erf_result = erf_opened.double() / (1 << 17)
                 fourier_result = fourier_opened.double() / (1 << 17)
-                puma_result = puma_opened.double() / (1 << 17)
                 error = error_metrics(result, target)
                 records.append({"warmup": iteration == 0,
                                 "input_sharing": input_metrics, "offline": offline,
@@ -147,9 +139,6 @@ def worker(rank, rendezvous, options):
                                 "secformer_fourier_offline": fourier_offline,
                                 "secformer_fourier_online": fourier_online,
                                 "secformer_fourier_output_reconstruction": fourier_reconstruction,
-                                "puma_style_offline": puma_offline,
-                                "puma_style_online": puma_online,
-                                "puma_style_output_reconstruction": puma_reconstruction,
                                 "error_vs_float_g2": error_metrics(result, target_g2),
                                 "error_vs_torch_gelu": error,
                                 "quad_vs_torch_gelu": error_metrics(quad_result, target),
@@ -157,9 +146,6 @@ def worker(rank, rendezvous, options):
                                 "secformer_fourier_vs_torch_gelu": error_metrics(fourier_result, target),
                                 "secformer_fourier_reference_vs_torch_gelu": error_metrics(
                                     secformer_fourier_gelu_reference(x.cpu()).to(base.device), target)})
-                records[-1]["puma_style_vs_puma_reference"] = error_metrics(
-                    puma_result, puma_gelu_reference(x))
-                records[-1]["puma_style_vs_torch_gelu"] = error_metrics(puma_result, target)
         if rank == 0:
             output = Path(options["output"])
             output.mkdir(parents=True, exist_ok=True)
@@ -176,7 +162,6 @@ def worker(rank, rendezvous, options):
                       "cuda_quad": "same CUDA Ring3 fixed-point port of 0.125*x^2 + 0.25*x + 0.5",
                       "cuda_crypten_erf": "Q17 fixed-point port of CrypTen erf Taylor approximation with 8 iterations",
                       "cuda_secformer_fourier": "CUDA masked-Fourier port with precomputed secret mask sine/cosine and local CUDA sine/cosine on opened delta; interval threshold is opened publicly because CUDA comparison is not implemented",
-                      "cuda_puma_style": "PUMA published piecewise cubic approximation ported to CUDA Ring3; interval selection opens Q17 x because secure less-than is not implemented",
                       "records": records,
                       "security": "Ruler remains not security validated; CUDA Philox is a benchmark PRG, not a reviewed CSPRNG"}
             (output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -187,13 +172,10 @@ def worker(rank, rendezvous, options):
                               "quad_online_seconds": last["quad_online"]["seconds_max"],
                               "crypten_erf_online_seconds": last["crypten_erf_online"]["seconds_max"],
                               "secformer_fourier_online_seconds": last["secformer_fourier_online"]["seconds_max"],
-                              "puma_style_online_seconds": last["puma_style_online"]["seconds_max"],
                               "sgelu_bytes": last["online"]["sent_bytes_sum"],
                               "quad_bytes": last["quad_online"]["sent_bytes_sum"],
                               "crypten_erf_bytes": last["crypten_erf_online"]["sent_bytes_sum"],
-                              "secformer_fourier_bytes": last["secformer_fourier_online"]["sent_bytes_sum"],
-                              "puma_style_bytes": last["puma_style_online"]["sent_bytes_sum"],
-                              "puma_style_mae_vs_exact_gelu": last["puma_style_vs_torch_gelu"]["mae"]},
+                              "secformer_fourier_bytes": last["secformer_fourier_online"]["sent_bytes_sum"]},
                              indent=2), flush=True)
     finally:
         dist.destroy_process_group()

@@ -46,6 +46,50 @@ def puma_gelu_reference(value):
                                    torch.where(x <= PUMA_T2, f1, x)))
 
 
+def crypten_puma_gelu(value, comparison_value=None, comparison_scale=1 << 17):
+    """CrypTen-native implementation of PUMA's piecewise polynomial GeLU.
+
+    This is a same-framework reimplementation of PUMA's published
+    approximation, not the official SecretFlow-SPU PUMA runtime.  All powers,
+    polynomial evaluation, and interval masks stay in CrypTen.  When
+    ``comparison_value`` is supplied it is an encrypted precision-zero copy
+    of Q17 ``x``; this avoids asking CrypTen's comparator to interpret a
+    fractional fixed-point value.
+    """
+    from crypten.mpc import MPCTensor, ptype
+
+    if not isinstance(value, MPCTensor) or value.ptype != ptype.arithmetic:
+        raise ValueError("expected an arithmetic CrypTen MPCTensor")
+
+    x2 = value.square()
+    x3 = x2.mul(value)
+    x4 = x2.square()
+    x6 = x4.mul(x2)
+    f0 = (x3.mul(PUMA_F0[0]).add(x2.mul(PUMA_F0[1]))
+          .add(value.mul(PUMA_F0[2])).add(PUMA_F0[3]))
+    f1 = (x6.mul(PUMA_F1[0]).add(x4.mul(PUMA_F1[1]))
+          .add(x2.mul(PUMA_F1[2])).add(value.mul(PUMA_F1[3]))
+          .add(PUMA_F1[4]))
+
+    if comparison_value is None:
+        lower = value.lt(PUMA_T0)
+        middle = value.lt(PUMA_T1)
+        upper = value.lt(PUMA_T2)
+    else:
+        if (not isinstance(comparison_value, MPCTensor)
+                or comparison_value.ptype != ptype.arithmetic):
+            raise ValueError("comparison_value must be an arithmetic MPCTensor")
+        lower = comparison_value.lt(round(PUMA_T0 * comparison_scale))
+        middle = comparison_value.lt(round(PUMA_T1 * comparison_scale))
+        upper = comparison_value.lt(round(PUMA_T2 * comparison_scale))
+
+    # Masks are mutually exclusive: [T0,T1), [T1,T2), and [T2,+inf).
+    first = middle - lower
+    second = upper - middle
+    above = 1 - upper
+    return first.mul(f0).add(second.mul(f1)).add(above.mul(value))
+
+
 def secformer_fourier_gelu_reference(value, threshold=2.5):
     """Plaintext reference for the published seven-term Fourier fit."""
     import torch

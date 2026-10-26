@@ -92,17 +92,17 @@ CUDA benchmark 默认使用实测更快的 P2P 重构，并将平方截断和 `x
 括号截断和最终乘法截断的同步分阶段时间。该选项会插入 CUDA 同步，只用于定位
 瓶颈，不能用于正式性能表。
 
-CUDA benchmark 现在同时测量同一 CUDA Ring3 上的 Quad 固定点移植和
-PUMA-style 分段多项式移植，报告中对应 `quad_*` 和 `puma_style_*` 字段。
-PUMA-style 使用论文公开的边界 `[-4, -1.95, 3]` 与三次/六次多项式；由于当前
-Ring3 尚未实现安全 less-than，区间选择会打开 Q17 输入，因此它只是同运行时
-工程 baseline，不是官方 SecretFlow-SPU PUMA 的安全复现。
+CPU/Gloo benchmark 现在在 CrypTen 内部加入 PUMA 的分段多项式 baseline，报告中
+对应 `puma_crypten_*` 字段。它使用论文公开的边界 `[-4, -1.95, 3]`、三次/六次
+多项式以及 CrypTen 的加密 LT 掩码。它是 PUMA 公式的 CrypTen-native 重实现，
+不是官方 SecretFlow-SPU PUMA runtime。
 
 这是 CPU/Gloo 原型的工程移植，仍带有 Ruler 打开步骤的隐私限制。CUDA v2 的
 公开 96-bit 整数平方根、精确修正与随机词展开均留在 GPU；初始化时仅交换一次随机
 种子。GPU 随机词使用 PyTorch Philox，仅用于性能实验，不是经审查的密码学 PRG。
-CrypTen-erf、Quad、Fourier 和 PUMA-style GPU baseline 均已纳入该入口；其中
-Fourier 和 PUMA-style 的区间选择仍有公开中间值，必须查看报告中的安全说明。
+CrypTen-erf、Quad 和 Fourier 的 GPU baseline 不属于 CrypTen-native 主表；GPU
+入口仅用于 sGeLU 与自定义 CUDA 工程 baseline 的独立实验。PUMA 主对比应使用
+CPU/Gloo 的 CrypTen benchmark。
 
 `validate` 默认运行 10,000 个三方原语样本、257 个合成激活、1 次预热和 3 次正式重复。
 测试模块另行核验 10,000 对 96-bit 算术和 10,000 个随机公开整数根，并覆盖边界。
