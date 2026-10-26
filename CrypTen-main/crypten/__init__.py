@@ -208,14 +208,20 @@ def _setup_prng():
 
     # Generate next / prev seeds.
     seed = int.from_bytes(os.urandom(8), "big") - 2**63
-    next_seed = torch.tensor(seed)
+    seed_device = (
+        torch.device(f"cuda:{torch.cuda.current_device()}")
+        if torch.cuda.is_available()
+        and comm.get().get_distributed_backend().lower() == "nccl"
+        else torch.device("cpu")
+    )
+    next_seed = torch.tensor(seed, device=seed_device)
 
     # Create local seed - Each party has a separate local generator
     local_seed = int.from_bytes(os.urandom(8), "big") - 2**63
 
     # Create global generator - All parties share one global generator for sync'd rng
     global_seed = int.from_bytes(os.urandom(8), "big") - 2**63
-    global_seed = torch.tensor(global_seed)
+    global_seed = torch.tensor(global_seed, device=seed_device)
 
     _sync_seeds(next_seed, local_seed, global_seed)
 
@@ -230,7 +236,8 @@ def _sync_seeds(next_seed, local_seed, global_seed):
     global generators
 
     # Populated by recieving the previous party's next_seed (irecv)
-    prev_seed = torch.tensor([0], dtype=torch.long)
+    seed_device = next_seed.device
+    prev_seed = torch.zeros(1, dtype=torch.long, device=seed_device)
 
     # Send random seed to next party, receive random seed from prev party
     world_size = comm.get().get_world_size()

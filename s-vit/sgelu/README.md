@@ -82,6 +82,20 @@ CUDA_VISIBLE_DEVICES=0,1,2 python -m sgelu.benchmark_cuda \
   --count 17 --batch 1 --repeats 1 --output ../tmp/sgelu-cuda-smoke
 ```
 
+如果要使用 CrypTen 自身的 CUDA `MPCTensor` baseline，而不是上面的独立 Ring3
+benchmark，使用：
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main"
+CUDA_VISIBLE_DEVICES=0,1,2 python -m sgelu.benchmark_crypten_cuda \
+  --shape 1x17 --repeats 1 --methods quad \
+  --output "$HOME/home/tmp/sgelu-crypten-cuda-quad-smoke"
+```
+
+该入口的 `puma`、`quad`、`erf`、`fourier` 和 `masked_fourier` 使用 CrypTen
+GPU 算术共享；`sgelu` 使用同一 CrypTen NCCL 进程组上的 Ruler 协议适配器。
+它与 `benchmark_cuda.py` 的自定义 Ring3 baseline 不应混写在同一列。
+
 CUDA benchmark 默认使用实测更快的 P2P 重构，并将平方截断和 `x/2` 截断合并打开，
 在线 phase 从旧实现的 17 降至 15。使用 `--reveal-mode all_reduce` 或
 `--reveal-mode all_gather` 可测试单轮 NCCL 集合重构；两种模式理论上为 9 phase，
