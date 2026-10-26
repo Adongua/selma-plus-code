@@ -178,7 +178,9 @@ def crypten_secformer_masked_fourier_gelu(
     # its sine/cosine tables are sampled in the z-domain, so the opened
     # residue must be z-mask rather than x-mask.
     z = value.div(math.sqrt(2.0))
-    delta = torch.remainder((z - mask).get_plain_text(), 2.0 * math.pi)
+    # Do not reduce delta modulo 2*pi.  The fitted basis uses
+    # sin(k*pi*z/10), whose common period in z is 20, not 2*pi.
+    delta = (z - mask).get_plain_text()
     coefficients = torch.tensor(SECFORMER_BETA, dtype=delta.dtype, device=delta.device)
     harmonics = torch.arange(1, 8, dtype=delta.dtype, device=delta.device)
     angles = delta.unsqueeze(-1) * (harmonics * math.pi / 10.0)
