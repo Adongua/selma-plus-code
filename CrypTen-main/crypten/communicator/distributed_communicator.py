@@ -189,24 +189,50 @@ class DistributedCommunicator(Communicator):
         """Reduces the input data across all parties; all get the final result."""
         assert dist.is_initialized(), "initialize the communicator first"
 
+        # NCCL supports arithmetic reductions but not bitwise XOR.  CrypTen's
+        # binary shares use BXOR when opening Beaver masks for comparisons.
+        # Reconstruct the same public XOR by gathering CUDA shares and folding
+        # locally, without moving data to CPU or using a second Gloo group.
+        # This path is needed by CUDA PUMA/Fourier comparisons on modern
+        # PyTorch/NCCL.
+        use_nccl_xor_fallback = (
+            op == ReduceOp.BXOR
+            and self.get_distributed_backend().lower() == "nccl"
+        )
+
+        def nccl_xor(tensor):
+            gathered = [torch.empty_like(tensor.data) for _ in range(self.get_world_size())]
+            dist.all_gather(gathered, tensor.data, group=self.main_group)
+            result = tensor.clone()
+            result.data.copy_(gathered[0])
+            for share in gathered[1:]:
+                result.data.bitwise_xor_(share)
+            return result
+
         if batched:
             assert isinstance(input, list), "batched reduce input must be a list"
-            reqs = []
-            result = [x.clone() for x in input]
-            for tensor in result:
-                reqs.append(
-                    dist.all_reduce(
-                        tensor.data, op=op, group=self.main_group, async_op=True
+            if use_nccl_xor_fallback:
+                result = [nccl_xor(tensor) for tensor in input]
+            else:
+                reqs = []
+                result = [x.clone() for x in input]
+                for tensor in result:
+                    reqs.append(
+                        dist.all_reduce(
+                            tensor.data, op=op, group=self.main_group, async_op=True
+                        )
                     )
-                )
-            for req in reqs:
-                req.wait()
+                for req in reqs:
+                    req.wait()
         else:
             assert torch.is_tensor(
                 input.data
             ), "unbatched input for reduce must be a torch tensor"
-            result = input.clone()
-            dist.all_reduce(result.data, op=op, group=self.main_group)
+            if use_nccl_xor_fallback:
+                result = nccl_xor(input)
+            else:
+                result = input.clone()
+                dist.all_reduce(result.data, op=op, group=self.main_group)
         return result
 
     @_logging
