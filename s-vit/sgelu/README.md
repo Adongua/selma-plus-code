@@ -82,10 +82,14 @@ CUDA_VISIBLE_DEVICES=0,1,2 python -m sgelu.benchmark_cuda \
   --count 17 --batch 1 --repeats 1 --output ../tmp/sgelu-cuda-smoke
 ```
 
-CUDA benchmark 默认用单轮 NCCL `all_gather` 重构公开值，并将平方截断和 `x/2`
-截断合并打开，在线 phase 从旧实现的 17 降至 9。使用 `--reveal-mode p2p`
-可运行旧式两轮环重构作 A/B 对照；合并截断后该模式为 15 phase。两种模式的
+CUDA benchmark 默认使用实测更快的 P2P 重构，并将平方截断和 `x/2` 截断合并打开，
+在线 phase 从旧实现的 17 降至 15。使用 `--reveal-mode all_gather` 可测试单轮
+NCCL 集合重构；该模式理论上为 9 phase，但在当前服务器上实际更慢。两种模式的
 通信字段都按三方环实际传输的等价 payload 计数，因此可直接比较。
+
+使用 `--profile-online` 可记录平方/截断、尺度提升、宽乘法/平方根、逆根截断、
+括号截断和最终乘法截断的同步分阶段时间。该选项会插入 CUDA 同步，只用于定位
+瓶颈，不能用于正式性能表。
 
 这是 CPU/Gloo 原型的工程移植，仍带有 Ruler 打开步骤的隐私限制。CUDA v2 的
 公开 96-bit 整数平方根、精确修正与随机词展开均留在 GPU；初始化时仅交换一次随机

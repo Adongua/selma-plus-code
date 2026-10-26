@@ -164,12 +164,14 @@ def prepare_g2(base, wide, shape, mu):
     return G2Material(shape, mu, base, scale, scale96, extension, truncations)
 
 
-def ruler_g2(base, wide, x_q17, material):
+def ruler_g2(base, wide, x_q17, material, profiler=None):
     """Consume one prepared material and return a Q17 share (no output opening)."""
     if wide.base is not base:
         raise ValueError("64-bit and 96-bit runtimes must share the same base")
     material.consume(base, x_q17)
     trunc = material.truncations
+    if profiler is not None:
+        profiler.start("square_and_joint_trunc")
     square_q34 = base.square(x_q17)
     # Both values are ready after the square.  Opening their independent masks
     # as one tensor removes one reconstruction from the critical path.
@@ -177,20 +179,40 @@ def ruler_g2(base, wide, x_q17, material):
         base, (square_q34, x_q17), (18, 1),
         (trunc["square"], trunc["half"]),
     )
+    if profiler is not None:
+        profiler.stop("square_and_joint_trunc")
     constants = torch.tensor([round(material.mu**2 * (1 << 16)),
                               round(4 * material.mu**2 * (1 << 16))],
                              dtype=torch.int64, device=x_q17.device)
     constants = constants.reshape((2,) + (1,) * len(material.shape))
     values = square_q16.unsqueeze(0) + base.public(constants)
+    if profiler is not None:
+        profiler.start("scale_extension")
     values96 = extend_online(base, wide, values, material.extension)
+    if profiler is not None:
+        profiler.stop("scale_extension")
+        profiler.start("wide_mul_reveal_isqrt")
     opened = wide.reveal(wide.mul(material.squared_scale96, values96))
     roots = isqrt_from_limbs(opened)
+    if profiler is not None:
+        profiler.stop("wide_mul_reveal_isqrt")
     if torch.any(roots <= 0):
         raise ArithmeticError("nonpositive opened root: fixed-point input contract violated")
     # Exact integer nearest rounding (ties upward) avoids float64 reciprocal drift.
     public_inverse = torch.div((1 << 56) + roots // 2, roots, rounding_mode="floor")
+    if profiler is not None:
+        profiler.start("inverse_trunc")
     inverse_q24 = prob_trunc(base, material.scale * public_inverse, INVERSE_SHIFT, trunc["inverse"])
+    if profiler is not None:
+        profiler.stop("inverse_trunc")
     c43, c13 = round((4 / 3) * (1 << 24)), round((1 / 3) * (1 << 24))
+    if profiler is not None:
+        profiler.start("bracket_trunc")
     bracket = prob_trunc(base, c43 * inverse_q24[0] - c13 * inverse_q24[1], 24, trunc["bracket"])
+    if profiler is not None:
+        profiler.stop("bracket_trunc")
+        profiler.start("product_and_trunc")
     term2_q16 = prob_trunc(base, base.mul(square_q16, bracket), 24, trunc["product"])
+    if profiler is not None:
+        profiler.stop("product_and_trunc")
     return half_q17 + term2_q16
