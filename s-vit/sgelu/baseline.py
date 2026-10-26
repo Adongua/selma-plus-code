@@ -174,7 +174,11 @@ def crypten_secformer_masked_fourier_gelu(
 
     if (not isinstance(value, MPCTensor) or value.ptype != ptype.arithmetic):
         raise ValueError("expected an arithmetic CrypTen MPCTensor")
-    delta = torch.remainder((value - mask).get_plain_text(), 2.0 * math.pi)
+    # The Fourier fit approximates erf(z), where z=x/sqrt(2).  The mask and
+    # its sine/cosine tables are sampled in the z-domain, so the opened
+    # residue must be z-mask rather than x-mask.
+    z = value.div(math.sqrt(2.0))
+    delta = torch.remainder((z - mask).get_plain_text(), 2.0 * math.pi)
     coefficients = torch.tensor(SECFORMER_BETA, dtype=delta.dtype, device=delta.device)
     harmonics = torch.arange(1, 8, dtype=delta.dtype, device=delta.device)
     angles = delta.unsqueeze(-1) * (harmonics * math.pi / 10.0)
