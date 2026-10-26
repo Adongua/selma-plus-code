@@ -239,18 +239,26 @@ def _sync_seeds(next_seed, local_seed, global_seed):
     seed_device = next_seed.device
     prev_seed = torch.zeros(1, dtype=torch.long, device=seed_device)
 
-    # Send random seed to next party, receive random seed from prev party
+    # Send random seed to next party, receive random seed from prev party.
+    # NCCL point-to-point setup is order-sensitive: each rank's ring
+    # isend/irecv pair can try to create a different NCCL communicator first,
+    # leaving another rank waiting for its unique ID in the store.  Use a
+    # collective for NCCL initialization instead.  The Gloo path keeps the
+    # original ring exchange for compatibility with the CPU runtime.
     world_size = comm.get().get_world_size()
     rank = comm.get().get_rank()
     if world_size >= 2:  # Guard against segfaults when world_size == 1.
         next_rank = (rank + 1) % world_size
         prev_rank = (next_rank - 2) % world_size
+        if comm.get().get_distributed_backend().lower() == "nccl":
+            gathered = comm.get().all_gather(next_seed.reshape(1))
+            prev_seed = gathered[prev_rank]
+        else:
+            req0 = comm.get().isend(next_seed, next_rank)
+            req1 = comm.get().irecv(prev_seed, src=prev_rank)
 
-        req0 = comm.get().isend(next_seed, next_rank)
-        req1 = comm.get().irecv(prev_seed, src=prev_rank)
-
-        req0.wait()
-        req1.wait()
+            req0.wait()
+            req1.wait()
     else:
         prev_seed = next_seed
 
