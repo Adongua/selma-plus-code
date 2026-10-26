@@ -161,7 +161,7 @@ def worker(rank, rendezvous, options):
                                         "host_tensor_roundtrip": False},
                       "cuda_quad": "same CUDA Ring3 fixed-point port of 0.125*x^2 + 0.25*x + 0.5",
                       "cuda_crypten_erf": "Q17 fixed-point port of CrypTen erf Taylor approximation with 8 iterations",
-                      "cuda_secformer_fourier": "Q17 fixed-point port of CrypTen repeated-squaring sine and seven SecFormer coefficients; interval threshold is opened publicly because CUDA comparison is not implemented",
+                      "cuda_secformer_fourier": "CUDA masked-Fourier port with precomputed secret mask sine/cosine and local CUDA sine/cosine on opened delta; interval threshold is opened publicly because CUDA comparison is not implemented",
                       "records": records,
                       "security": "Ruler remains not security validated; CUDA Philox is a benchmark PRG, not a reviewed CSPRNG"}
             (output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")

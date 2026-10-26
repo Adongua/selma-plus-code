@@ -126,10 +126,14 @@ def erf_gelu(base, x_q17, material):
 
 @dataclass
 class FourierMaterial:
+    """One-use masked-Fourier material matching the SecFormer construction."""
+
     shape: tuple
     runtime: object
+    mask_share: torch.Tensor
+    mask_sin_share: torch.Tensor
+    mask_cos_share: torch.Tensor
     truncations: list
-    iterations: int
     used: bool = False
 
     def consume(self, base, value):
@@ -140,65 +144,75 @@ class FourierMaterial:
         self.used = True
 
 
-def prepare_fourier(base, shape, iterations=8):
-    """Prepare masks for a direct secure Fourier evaluation."""
+def prepare_fourier(base, shape):
+    """Prepare SecFormer masked Fourier material on CUDA.
+
+    The random mask is generated only at rank 0 and secret-shared.  Its seven
+    sine/cosine tables are also secret-shared, so the online path can evaluate
+    sine and cosine of the opened masked residue locally on CUDA.
+    """
     shape = tuple(shape)
-    if iterations < 1:
-        raise ValueError("iterations must be positive")
-    # Seven harmonics: angle scaling, complex exponential initialization,
-    # (2 squares + 1 multiply) per subsequent squaring, coefficient scaling.
-    count = 7 * (1 + 2 + 3 * (iterations - 1) + 1) + 2
-    return FourierMaterial(shape, base,
-                           [prob_trunc_material(base, shape, 17) for _ in range(count)],
-                           iterations)
-
-
-def _fourier_take(material):
-    return material.truncations.pop(0)
-
-
-def _cossin_q17(base, value, material):
-    """Match CrypTen's repeated-squaring approximation to exp(i*value)."""
-    im = prob_trunc(base, value, material.iterations, _fourier_take(material))
-    re = base.public(1 << 17).expand(value.shape)
-    re = re - prob_trunc(base, base.mul(im, im), 17, _fourier_take(material))
-    im = im * 2
-    for _ in range(material.iterations - 1):
-        a2 = prob_trunc(base, base.mul(re, re), 17, _fourier_take(material))
-        b2 = prob_trunc(base, base.mul(im, im), 17, _fourier_take(material))
-        im = prob_trunc(base, base.mul(im, re), 17, _fourier_take(material)) * 2
-        re = a2 - b2
-    return re, im
+    if any(not isinstance(n, int) or n <= 0 for n in shape):
+        raise ValueError("shape dimensions must be positive integers")
+    if base.rank == 0:
+        mask = (2 * math.pi * torch.rand(shape, device=base.device,
+                                         generator=base.local_generator) - math.pi)
+    else:
+        mask = torch.zeros(shape, dtype=torch.float32, device=base.device)
+    mask_q17 = (mask * (1 << 17)).round().to(torch.int64)
+    harmonics = torch.arange(1, 8, device=base.device, dtype=torch.float64)
+    angles = mask.double().unsqueeze(-1) * (harmonics * math.pi / 10.0)
+    mask_sin = torch.sin(angles)
+    mask_cos = torch.cos(angles)
+    mask_sin_q17 = (mask_sin * (1 << 17)).round().to(torch.int64)
+    mask_cos_q17 = (mask_cos * (1 << 17)).round().to(torch.int64)
+    # The three tensors are shaped (..., 7) for the harmonic dimension.
+    mask_share = base.private(mask_q17, 0)
+    mask_sin_share = base.private(mask_sin_q17, 0)
+    mask_cos_share = base.private(mask_cos_q17, 0)
+    # z scaling; seven masked sine combinations; seven beta products; final
+    # x*(1+erf) product; final multiplication by one half.
+    truncations = [prob_trunc_material(base, shape, 17)]
+    truncations.extend(prob_trunc_material(base, shape + (7,), 17) for _ in range(2))
+    truncations.extend((prob_trunc_material(base, shape, 17),
+                        prob_trunc_material(base, shape, 1)))
+    return FourierMaterial(shape, base, mask_share, mask_sin_share,
+                           mask_cos_share, truncations)
 
 
 def fourier_gelu(base, x_q17, material, threshold=2.5):
-    """CUDA port of the direct SecFormer Fourier arithmetic baseline.
+    """CUDA masked-Fourier port of SecFormer's GeLU baseline.
 
-    The Fourier terms remain secret-shared and use the same repeated-squaring
-    trigonometric approximation as CrypTen.  The current CUDA prototype opens
-    only x for the two interval masks because it has no comparison primitive;
-    this is therefore a public-threshold reference, not a security claim.
+    The Fourier table is evaluated with a masked opening and local CUDA
+    ``sin``/``cos``.  Thresholds are currently derived from one additional
+    public opening because this experimental Ring3 runtime has no comparison
+    primitive; this is not a security-validated implementation.
     """
     material.consume(base, x_q17)
-    shape = tuple(x_q17.shape)
-    opened_x = base.reveal(x_q17).double() / (1 << 17)
-    lower = (opened_x / math.sqrt(2.0) < -threshold).to(torch.int64)
-    upper = (opened_x / math.sqrt(2.0) < threshold).to(torch.int64)
-    lower = lower.to(base.device)
-    upper = upper.to(base.device)
-    fourier = None
-    for harmonic, beta in enumerate(SECFORMER_BETA, start=1):
-        angle_coeff = harmonic * math.pi / (10.0 * math.sqrt(2.0))
-        angle = prob_trunc(base,
-                           round(angle_coeff * (1 << 17)) * x_q17,
-                           17, _fourier_take(material))
-        _, sine = _cossin_q17(base, angle, material)
-        term = prob_trunc(base, round(beta * (1 << 17)) * sine,
-                          17, _fourier_take(material))
-        fourier = term if fourier is None else fourier + term
+    z = prob_trunc(base, round((1.0 / math.sqrt(2.0)) * (1 << 17)) * x_q17,
+                   17, material.truncations[0])
+    # SecFormer's masked opening: delta = z - t.  The opened residue is
+    # public, so all seven CUDA trigonometric evaluations are local.
+    delta = base.reveal(z - material.mask_share).double() / (1 << 17)
+    delta = torch.remainder(delta, 2.0 * math.pi)
+    harmonics = torch.arange(1, 8, device=base.device, dtype=torch.float64)
+    angles = delta.unsqueeze(-1) * (harmonics * math.pi / 10.0)
+    p = (torch.sin(angles) * (1 << 17)).round().to(torch.int64)
+    q = (torch.cos(angles) * (1 << 17)).round().to(torch.int64)
+    masked_sine = material.mask_cos_share * p + material.mask_sin_share * q
+    masked_sine = prob_trunc(base, masked_sine, 17, material.truncations[1])
+    beta = torch.tensor(SECFORMER_BETA, dtype=torch.float64, device=base.device)
+    beta_q17 = (beta * (1 << 17)).round().to(torch.int64)
+    terms = masked_sine * beta_q17
+    terms = prob_trunc(base, terms, 17, material.truncations[2])
+    fourier = terms.sum(dim=-1)
+
+    opened_z = base.reveal(z).double() / (1 << 17)
+    lower = (opened_z < -threshold).to(torch.int64)
+    upper = (opened_z < threshold).to(torch.int64)
     scale = 1 << 17
     branch = (base.public(-lower * scale) + (upper - lower) * fourier
               + base.public((1 - upper) * scale))
-    output = prob_trunc(base, base.mul(x_q17, branch + base.public(1 << 17)),
-                        17, _fourier_take(material))
-    return prob_trunc(base, output, 1, _fourier_take(material))
+    output = prob_trunc(base, base.mul(x_q17, branch + base.public(scale)),
+                        17, material.truncations[3])
+    return prob_trunc(base, output, 1, material.truncations[4])
