@@ -25,7 +25,8 @@ $ python benchmark.py --device cuda --world-size 2
 $ python benchmark.py --world-size=2 --multi-gpu
 
 # Save benchmarks to csv
-$ python benchmark.py -p ~/Downloads/
+$ python benchmark.py --device cuda --advanced-models --world-size 2
+$ python benchmark.py --only-functions --device cuda --world-size 2 -p /data2/ljd/home/SELMA/CrypTen-main/result/v3/gpu/functions/2
 """
 
 import argparse
@@ -34,52 +35,89 @@ import os
 import timeit
 from collections import namedtuple
 
+# mytest optim
+# from crypten import crypten
 import crypten
 import crypten.communicator as comm
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F # mytest for advanced model
 from examples import multiprocess_launcher
 
+#mytest
+import random as rd
 
-try:
-    from . import data, models
-except ImportError:
-    # direct import if relative fails
-    import data
-    import models
+from crypten.config import cfg  # add this line
 
-Runtime = namedtuple("Runtime", "mid q1 q3")
+cfg.communicator.verbose = True # add this line
+
+
+# try:
+#     from . import data, models
+# except ImportError:
+#     # direct import if relative fails
+#     import data
+#     import models
+
+import data
+import models
+
+# mytest
+Runtime = namedtuple("Runtime", "mid q1 q3 comm")
+# Runtime = namedtuple("Runtime", "mid q1 q3")
 
 
 def time_me(func=None, n_loops=10):
-    """Decorator returning average runtime in seconds over n_loops：
-    这个装饰器函数可以用于任何函数，用于计算函数的平均运行时间，并返回一个包含运行时间统计信息的对象
+    """Decorator returning average runtime in seconds over n_loops
 
     Args:
-        func (function): invoked with given args / kwargs（使用给定的args/kwargs调用）
-        n_loops (int): number of times to invoke function for timing（调用函数进行计时的次数）
+        func (function): invoked with given args / kwargs
+        n_loops (int): number of times to invoke function for timing
 
     Returns: tuple of (time in seconds, inner quartile range, function return value).
     """
     if func is None:
         return functools.partial(time_me, n_loops=n_loops)
 
-    @functools.wraps(func) # 装饰器，用于将 timing_wrapper 函数的元数据（如名称、文档字符串等）设置为原始函数 func 的元数据，以保留函数的原始信息
-    def timing_wrapper(*args, **kwargs): # 装饰函数 timing_wrapper，接受任意数量的位置参数和关键字参数
-        return_val = func(*args, **kwargs) # 调用原始函数 func 并记录返回值
-        times = [] # 创建一个空列表，用于存储每次函数调用的运行时间
-        for _ in range(n_loops): # 循环 n_loops 次，即指定的计时次数
-            start = timeit.default_timer() # 记录当前时间作为函数调用的起始时间
-            func(*args, **kwargs) # 再次调用原始函数 func，对其进行计时
-            times.append(timeit.default_timer() - start) # 计算函数调用的运行时间，并将其添加到 times 列表中
-        mid_runtime = np.quantile(times, 0.5) # 计算运行时间列表 times 的中位数
-        q1_runtime = np.quantile(times, 0.25) # 计算运行时间列表 times 的下四分位数
-        q3_runtime = np.quantile(times, 0.75) # 计算运行时间列表 times 的上四分位数
-        runtime = Runtime(mid_runtime, q1_runtime, q3_runtime) # 创建一个 Runtime 对象，存储中位数、下四分位数和上四分位数
-        return runtime, return_val # 返回一个元组，包含运行时间对象和原始函数的返回值
+#     mytest 带测通信
+    @functools.wraps(func)
+    def timing_wrapper(*args, **kwargs):
+        return_val = func(*args, **kwargs)
+        times = []
+        comm_bytes = []
+        for i in range(n_loops):
+            # mytest
+            comm.get().reset_communication_stats()
+            start = timeit.default_timer()
+            func(*args, **kwargs)
+            times.append(timeit.default_timer() - start)
+            val = comm.get().get_communication_stats()
+            comm_bytes.append(val["bytes"])
+        mid_runtime = np.quantile(times, 0.5)
+        q1_runtime = np.quantile(times, 0.25)
+        q3_runtime = np.quantile(times, 0.75)
+        mid_comm = np.quantile(comm_bytes, 0.5) / 1024**2
+        runtime = Runtime(mid_runtime, q1_runtime, q3_runtime, mid_comm)
+        return runtime, return_val
 
     return timing_wrapper
+
+#     @functools.wraps(func) # 装饰器，用于将 timing_wrapper 函数的元数据（如名称、文档字符串等）设置为原始函数 func 的元数据，以保留函数的原始信息
+#     def timing_wrapper(*args, **kwargs): # 装饰函数 timing_wrapper，接受任意数量的位置参数和关键字参数
+#         return_val = func(*args, **kwargs) # 调用原始函数 func 并记录返回值
+#         times = [] # 创建一个空列表，用于存储每次函数调用的运行时间
+#         for _ in range(n_loops): # 循环 n_loops 次，即指定的计时次数
+#             start = timeit.default_timer() # 记录当前时间作为函数调用的起始时间
+#             func(*args, **kwargs) # 再次调用原始函数 func，对其进行计时
+#             times.append(timeit.default_timer() - start) # 计算函数调用的运行时间，并将其添加到 times 列表中
+#         mid_runtime = np.quantile(times, 0.5) # 计算运行时间列表 times 的中位数
+#         q1_runtime = np.quantile(times, 0.25) # 计算运行时间列表 times 的下四分位数
+#         q3_runtime = np.quantile(times, 0.75) # 计算运行时间列表 times 的上四分位数
+#         runtime = Runtime(mid_runtime, q1_runtime, q3_runtime) # 创建一个 Runtime 对象，存储中位数、下四分位数和上四分位数
+#         return runtime, return_val # 返回一个元组，包含运行时间对象和原始函数的返回值
+
+#     return timing_wrapper
 
 
 class FuncBenchmarks:
@@ -94,6 +132,7 @@ class FuncBenchmarks:
     UNARY = [
         "sigmoid",
         "relu",
+        "approx_relu",
         "tanh",
         "exp",
         "log",
@@ -103,14 +142,28 @@ class FuncBenchmarks:
         "sum",
         "mean",
         "neg",
+        "approxinv_sqrt"
     ]
+    
+    LAYERS = ["conv2d","max_pool2d","approxmax_pool2d","avg_pool2d","dropout"] # mytest
 
-    LAYERS = ["conv2d"]
+    
+#     BINARY = []
 
-    # 用于基准测试的常量
-    DOMAIN = torch.arange(start=0.01, end=100, step=0.01) # 针对大部分函数
+#     UNARY = [
+#         "approxinv_sqrt"
+#     ]
+    
+#     LAYERS = [] # mytest
+    
+#     # LAYERS = ["conv2d"] 
+    
+
+    DOMAIN = torch.arange(start=0.01, end=100, step=0.01)
     # for exponential, sin, and cos
-    TRUNCATED_DOMAIN = torch.arange(start=0.001, end=10, step=0.001) # 针对指数、三角函数
+    TRUNCATED_DOMAIN = torch.arange(start=0.001, end=10, step=0.001)
+    # for inv_sqrt
+    LONG_TRUNCATED_DOMAIN = torch.arange(start=0.001, end=1, step=0.001)
 
     def __init__(self, tensor_size=(100, 100), device="cpu"):
         self.device = torch.device(device)
@@ -119,7 +172,6 @@ class FuncBenchmarks:
         # dataframe for benchmarks
         self.df = None
 
-    # 后面打表用的
     def __repr__(self):
         if self.df is not None:
             return self.df.to_string(index=False, justify="left")
@@ -128,48 +180,51 @@ class FuncBenchmarks:
     @staticmethod
     @time_me
     def time_func(x, func, y=None):
-        """
-        Invokes func as a method of x：根据给定的参数调用相应的函数，并测量其运行时间
-        getattr(x,func)<=>x.func
-        """
-        if y is None: # 一元函数
-            return getattr(x, func)() # 将 func 视为 x 的方法，并通过 getattr(x, func) 获取该方法，并调用它。此时返回函数的结果，并使用 time_me 装饰器测量其运行时间
-
-        # 二元函数
-        if func in {"conv1d", "conv2d"}: # 检查 func 是否为 "conv1d" 或 "conv2d"
-            if torch.is_tensor(x): # x是torch张量
-                return getattr(torch.nn.functional, func)(x, y) # 使用 torch.nn.functional 模块中的对应函数，并传递 x 和 y 作为参数
-            return getattr(x, func)(y) # 假定 x 是一个对象，并通过 getattr(x, func) 获取该方法，并将 y 作为参数调用它
-            # 返回函数的结果，并使用 time_me 装饰器测量其运行时间
-            # 需要注意的是，pytorch卷积层的卷积运算实质是调用torch.nn.functional里的conv方法，而crypten卷积层的卷积运算实质则是调用cryptensor里的conv方法
-
-        return getattr(x, func)(y) # 假定 x 是一个对象，并通过 getattr(x, func) 获取该方法，并将 y 作为参数调用它。返回函数的结果，并使用 time_me 装饰器测量其运行时间
-
+        """Invokes func as a method of x"""
+        if y is None:
+            return getattr(x, func)()
+ 
+        if func in {"conv1d", "conv2d", "max_pool2d", "avg_pool2d", "dropout"}: # mytest
+        # if func in {"conv1d", "conv2d"}:
+            if torch.is_tensor(x):
+                return getattr(torch.nn.functional, func)(x, y)
+            return getattr(x, func)(y)
+ 
+        return getattr(x, func)(y)
 
     def get_runtimes(self):
         """Returns plain text and crypten runtimes"""
         x, y = (
             torch.rand(self.tensor_size, device=self.device),
             torch.rand(self.tensor_size, device=self.device),
-        ) # 明文
-        x_enc, y_enc = crypten.cryptensor(x), crypten.cryptensor(y) # 密文
+        )
+        x_enc, y_enc = crypten.cryptensor(x), crypten.cryptensor(y)
 
         runtimes, runtimes_enc = [], []
 
         for func in FuncBenchmarks.UNARY + FuncBenchmarks.BINARY:
             second_operand, second_operand_enc = None, None
             if func in FuncBenchmarks.BINARY:
-                second_operand, second_operand_enc = y, y_enc # 二元函数多加一个操作数
+                second_operand, second_operand_enc = y, y_enc
 
-            runtime, _ = FuncBenchmarks.time_func(x, func, y=second_operand) # 对明文运算计算运行耗时
+            # mytest for optim
+            if func == "approx_relu" or func == "relu":
+                x = torch.rand(1, 1, *self.tensor_size, device=self.device)
+                x_enc = crypten.cryptensor(x)
+                runtime, _ = FuncBenchmarks.time_func(x, "relu", y=second_operand)
+                runtime_enc, _ = FuncBenchmarks.time_func(x_enc, func, y=second_operand_enc)
+            elif func == "approxinv_sqrt":
+                runtime, _ = FuncBenchmarks.time_func(x_enc, "inv_sqrt", y=False)
+                runtime_enc, _ = FuncBenchmarks.time_func(x_enc, "inv_sqrt", y=True)
+            else:
+                runtime, _ = FuncBenchmarks.time_func(x, func, y=second_operand)
+                runtime_enc, _ = FuncBenchmarks.time_func(x_enc, func, y=second_operand_enc)
             runtimes.append(runtime)
-
-            runtime_enc, _ = FuncBenchmarks.time_func(x_enc, func, y=second_operand_enc) # 对密文运算计算运行耗时
             runtimes_enc.append(runtime_enc)
 
-        # add layer runtimes（追加层的运行时间）
+        # add layer runtimes
         runtime_layers, runtime_layers_enc = self.get_layer_runtimes()
-        runtimes.extend(runtime_layers) # 在list最后追加
+        runtimes.extend(runtime_layers)
         runtimes_enc.extend(runtime_layers_enc)
 
         return runtimes, runtimes_enc
@@ -184,27 +239,50 @@ class FuncBenchmarks:
                 x, x_enc, y, y_enc = self.random_conv1d_inputs()
             elif layer == "conv2d":
                 x, x_enc, y, y_enc = self.random_conv2d_inputs()
-            else: # 它只写了测试conv的代码，其他层的还得补
-                raise ValueError(f"{layer} not supported")
-
-            runtime, _ = FuncBenchmarks.time_func(x, layer, y=y)
-            runtime_enc, _ = FuncBenchmarks.time_func(x_enc, layer, y=y_enc)
+            # mytest
+            elif layer == "max_pool2d" or layer == "avg_pool2d" or layer == "approxmax_pool2d" :
+                x,x_enc,y,y_enc = self.random_pool2d_inputs()
+            elif layer == "dropout":
+                x,x_enc,y,y_enc = self.random_dropout_inputs()
+            # else :
+            #     raise ValueError(f"{layer} not supported")
+            
+            # mytest for optim
+            if layer == "approxmax_pool2d":
+                x,x_enc,y,y_enc = self.random_pool2d_inputs()
+                runtime, _ = FuncBenchmarks.time_func(x, "max_pool2d", y=y) # runtime, _ = self.soft_pool2d(x,y)
+                runtime_enc, _ = FuncBenchmarks.time_func(x_enc, layer, y=y_enc)
+            else:
+                runtime, _ = FuncBenchmarks.time_func(x, layer, y=y)
+                runtime_enc, _ = FuncBenchmarks.time_func(x_enc, layer, y=y_enc)
 
             runtime_layers.append(runtime)
             runtime_layers_enc.append(runtime_enc)
 
         return runtime_layers, runtime_layers_enc
 
+    #mytest
+    def random_dropout_inputs(self):
+        """得到2d dropout层的随机input和p"""
+        x_dropout = torch.rand(1,1,*self.tensor_size,device=self.device)
+        p = 0.5 # 除了输入以外其他参数不能随机，否则无法多方
+        x_dropout_enc = crypten.cryptensor(x_dropout)
+        return x_dropout,x_dropout_enc,p,p
+    
+    def random_pool2d_inputs(self):
+        """得到2d 池化层的随机input和kernel"""
+        x_maxpool2d = torch.rand(1,1,*self.tensor_size,device=self.device) 
+        kernel_size = 10 #除了输入以外其他参数不能随机，否则无法多方
+        x_maxpool2d_enc = crypten.cryptensor(x_maxpool2d)
+        return x_maxpool2d,x_maxpool2d_enc,kernel_size,kernel_size
+        
+    
     def random_conv2d_inputs(self):
-        """
-        Returns random input and weight tensors for 2d convolutions
-        生成随机的输入和权重张量，用于进行二维卷积操作
-        """
+        """Returns random input and weight tensors for 2d convolutions"""
         filter_size = [size // 10 for size in self.tensor_size]
-        # 对应torch.nn.functional.conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1)中的input和weight
-        x_conv2d = torch.rand(1, 1, *self.tensor_size, device=self.device) # 生成一个形状为 (1, 1, *self.tensor_size) 的随机输入张量 x_conv2d，其中*self.tensor_size 表示将 self.tensor_size 中的元素作为单独的参数传递给 rand() 方法
-        weight2d = torch.rand(1, 1, *filter_size, device=self.device) # 生成一个形状为 (1, 1, *filter_size) 的随机权重张量 weight2d
-        x_conv2d_enc = crypten.cryptensor(x_conv2d) # 加密
+        x_conv2d = torch.rand(1, 1, *self.tensor_size, device=self.device)
+        weight2d = torch.rand(1, 1, *filter_size, device=self.device)
+        x_conv2d_enc = crypten.cryptensor(x_conv2d)
         weight2d_enc = crypten.cryptensor(weight2d)
         return x_conv2d, x_conv2d_enc, weight2d, weight2d_enc
 
@@ -223,9 +301,9 @@ class FuncBenchmarks:
         """Computes total absolute error"""
         ref, out = ref.cpu(), out.cpu()
         if ref.dtype == torch.bool:
-            errors = (out != ref).numpy().sum() # 计算不匹配元素数量的总和
+            errors = (out != ref).numpy().sum()
             return errors
-        errors = torch.abs(out - ref).numpy() # 计算输出张量 out 与参考张量 ref 之间的差的绝对值，得到误差张量
+        errors = torch.abs(out - ref).numpy()
         return errors.sum()
 
     @staticmethod
@@ -233,7 +311,7 @@ class FuncBenchmarks:
         """Computes average relative error"""
         ref, out = ref.cpu(), out.cpu()
         if ref.dtype == torch.bool:
-            errors = (out != ref).numpy().sum() // ref.nelement() # 不匹配元素数量/元素数量=mean
+            errors = (out != ref).numpy().sum() // ref.nelement()
             return errors
         errors = torch.abs((out - ref) / ref)
         # remove inf due to division by tiny numbers
@@ -246,18 +324,21 @@ class FuncBenchmarks:
 
         Returns: tuple of (plain text result, encrypted result)
         """
-        DOMAIN, TRUNCATED_DOMAIN = (
+        DOMAIN, TRUNCATED_DOMAIN, LONG_TRUNCATED_DOMAIN = (
             FuncBenchmarks.DOMAIN,
             FuncBenchmarks.TRUNCATED_DOMAIN,
+            FuncBenchmarks.LONG_TRUNCATED_DOMAIN
         )
         if hasattr(DOMAIN, "to") and hasattr(TRUNCATED_DOMAIN, "to"):
-            DOMAIN, TRUNCATED_DOMAIN = (
+            DOMAIN, TRUNCATED_DOMAIN, LONG_TRUNCATED_DOMAIN = (
                 DOMAIN.to(device=self.device),
                 TRUNCATED_DOMAIN.to(device=self.device),
+                LONG_TRUNCATED_DOMAIN.to(device=self.device)
             )
         y = torch.rand(DOMAIN.shape, device=self.device)
         DOMAIN_enc, y_enc = crypten.cryptensor(DOMAIN), crypten.cryptensor(y)
         TRUNCATED_DOMAIN_enc = crypten.cryptensor(TRUNCATED_DOMAIN)
+        LONG_TRUNCATED_DOMAIN_enc = crypten.cryptensor(LONG_TRUNCATED_DOMAIN)
 
         if func in ["exp", "cos", "sin"]:
             ref, out_enc = (
@@ -265,7 +346,17 @@ class FuncBenchmarks:
                 getattr(TRUNCATED_DOMAIN_enc, func)(),
             )
         elif func in FuncBenchmarks.UNARY:
-            ref, out_enc = getattr(DOMAIN, func)(), getattr(DOMAIN_enc, func)()
+            # mytest for optim
+            if func == "approx_relu":
+                ref = getattr(DOMAIN, "relu")()
+                out_enc = getattr(DOMAIN_enc, func)()
+            elif func == "approxinv_sqrt":
+                ref = getattr(LONG_TRUNCATED_DOMAIN_enc, "inv_sqrt")()
+                ref = ref.get_plain_text()
+                out_enc = getattr(LONG_TRUNCATED_DOMAIN_enc, "inv_sqrt")(True)
+            else:
+                ref = getattr(DOMAIN, func)()
+                out_enc = getattr(DOMAIN_enc, func)()
         elif func in FuncBenchmarks.LAYERS:
             ref, out_enc = self._call_layer(func)
         elif func in FuncBenchmarks.BINARY:
@@ -285,6 +376,8 @@ class FuncBenchmarks:
         for func in functions:
             ref, out_enc = self.call_function_on_domain(func)
             out = out_enc.get_plain_text()
+            # print("ref",ref)
+            # print("out",out)
 
             abs_error = FuncBenchmarks.calc_abs_error(ref, out)
             abs_errors.append(abs_error)
@@ -295,60 +388,107 @@ class FuncBenchmarks:
         return abs_errors, relative_errors
 
     def _call_layer(self, layer):
-        """Call supported layers：调用支持的层函数"""
+        """Call supported layers"""
         if layer == "conv1d":
             x, x_enc, y, y_enc = self.random_conv1d_inputs()
         elif layer == "conv2d":
             x, x_enc, y, y_enc = self.random_conv2d_inputs()
-        else: # 暂时只支持计算conv层
-            raise ValueError(f"{layer} not supported")
+        # mytest
+        elif layer == "max_pool2d" or layer == "avg_pool2d" or layer == "approxmax_pool2d":
+            x,x_enc,y,y_enc = self.random_pool2d_inputs()
+        elif layer == "dropout":
+            x,x_enc,y,y_enc = self.random_dropout_inputs()
+        # else:
+        #     raise ValueError(f"{layer} not supported")
 
-        ref = getattr(torch.nn.functional, layer)(x, y)
-        out_enc = getattr(x_enc, layer)(y_enc)
+        # mytest for approxmax_pool2d
+        if layer == "approxmax_pool2d":
+            x,x_enc,y,y_enc = self.random_pool2d_inputs()
+            ref = getattr(torch.nn.functional, "max_pool2d")(x, y) # _, ref = self.soft_pool2d(x,y)
+            out_enc = getattr(x_enc, layer)(y_enc)
+        else:
+            ref = getattr(torch.nn.functional, layer)(x, y)
+            out_enc = getattr(x_enc, layer)(y_enc)
 
+        # print(ref)
+        # print(out_enc.get_plain_text())
+        # print()
         return ref, out_enc
 
+    # 带测通信
     def save(self, path):
+        print("===============save==============")
         if self.device.type == "cuda":
-            csv_path = os.path.join(path, "func_benchmarks_cuda.csv")
+            csv_path = os.path.join(path, "runtime_cuda.csv") # mytest for approxmax_pool2d 
         else:
-            csv_path = os.path.join(path, "func_benchmarks.csv")
+            csv_path = os.path.join(path, "runtime.csv")
         self.df.to_csv(csv_path, index=False)
+        
+    # 不带测通信
+    # def save(self, path):
+    #     if self.device.type == "cuda":
+    #         csv_path = os.path.join(path, "func_benchmarks_cuda.csv")
+    #     else:
+    #         csv_path = os.path.join(path, "func_benchmarks.csv")
+    #     self.df.to_csv(csv_path, index=False)
 
     def get_results(self):
         return self.df
-
+    
+    # 带测通信
     def run(self):
         """Runs and stores benchmarks in self.df"""
         runtimes, runtimes_enc = self.get_runtimes()
 
         abs_errors, relative_errors = self.get_errors()
 
+        # mytest
         self.df = pd.DataFrame.from_dict(
             {
                 "function": FuncBenchmarks.UNARY
                 + FuncBenchmarks.BINARY
                 + FuncBenchmarks.LAYERS,
                 "runtime": [r.mid for r in runtimes],
-                "runtime Q1": [r.q1 for r in runtimes],
-                "runtime Q3": [r.q3 for r in runtimes],
+                "runtime comm": [r.comm for r in runtimes],
                 "runtime crypten": [r.mid for r in runtimes_enc],
-                "runtime crypten Q1": [r.q1 for r in runtimes_enc],
-                "runtime crypten Q3": [r.q3 for r in runtimes_enc],
+                "runtime crypten comm": [r.comm for r in runtimes_enc],
                 "total abs error": abs_errors,
                 "average relative error": relative_errors,
             }
-        )
+        )    
+    
+    # 不带测通信
+    
+#     def run(self):
+#         """Runs and stores benchmarks in self.df"""
+#         runtimes, runtimes_enc = self.get_runtimes()
+
+#         abs_errors, relative_errors = self.get_errors()
+
+#         # mytest
+#         self.df = pd.DataFrame.from_dict(
+#             {
+#                 "function": FuncBenchmarks.UNARY
+#                 + FuncBenchmarks.BINARY
+#                 + FuncBenchmarks.LAYERS,
+#                 "runtime": [r.mid for r in runtimes],
+#                 "runtime Q1": [r.q1 for r in runtimes],
+#                 "runtime Q3": [r.q3 for r in runtimes],
+#                 "runtime crypten": [r.mid for r in runtimes_enc],
+#                 "runtime crypten Q1": [r.q1 for r in runtimes_enc],
+#                 "runtime crypten Q3": [r.q3 for r in runtimes_enc],
+#                 "total abs error": abs_errors,
+#                 "average relative error": relative_errors,
+#             }
+#         )
 
 
 class ModelBenchmarks:
-    """Benchmarks runtime and accuracy of crypten models:
-    比较普通 PyTorch 模型和 CrypTen 加密模型训练和推理效率、准确率
+    """Benchmarks runtime and accuracy of crypten models
 
     Models are benchmarked on synthetically generated
     Gaussian clusters for binary classification. Resnet18 is
     benchmarks use image data.
-    模型在合成生成的高斯簇上进行二值分类做基准实验，。Resnet18是使用图像数据的基准测试。
 
     Args:
         n_samples (int): number of samples for Gaussian cluster model training
@@ -371,7 +511,7 @@ class ModelBenchmarks:
 
     def remove_advanced_models(self):
         """Removes advanced models from instance"""
-        self.models = list(filter(lambda x: not x.advanced, self.models)) # filter 函数和 lambda 表达式来过滤出不包含 advanced 标志的模型，然后将结果存储回 self.models 变量中
+        self.models = list(filter(lambda x: not x.advanced, self.models))
 
     @time_me(n_loops=3)
     def train(self, model, x, y, epochs, lr, loss):
@@ -418,14 +558,52 @@ class ModelBenchmarks:
         """
         assert isinstance(model, crypten.nn.Module), "must be a CrypTen model"
         criterion = getattr(crypten.nn, loss)()
-        # 似乎没有optimizer
 
-        for _ in range(epochs):
+        for epoch in range(epochs):
+            output_enc = model(x)
+            loss = criterion(output_enc, y)
+            if epoch%10 == 0:
+                print(f"Epoch:{epoch},Loss:{loss.get_plain_text().item():.4f}")
             model.zero_grad()
-            output = model(x)
-            loss = criterion(output, y)
             loss.backward()
             model.update_parameters(lr)
+
+        return model
+    
+    @time_me(n_loops=3)
+    def train_advanced(self, train_loader, model, criterion, optimizer, device):
+        assert isinstance(model, torch.nn.Module), "must be a PyTorch model"
+
+        for i,(input,target) in enumerate(train_loader):
+            input,target = input.to(device=device),target.to(device=device)
+            output = model(input)
+            loss = criterion(output,target)
+            print("plain loss:",loss)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            break
+
+        return model
+    
+    @time_me(n_loops=3)
+    def train_advanced_crypten(self, train_loader, model, criterion, lr, device):
+        assert isinstance(model, crypten.nn.Module), "must be a CrypTen model"
+
+        for i,(input,target) in enumerate(train_loader):
+            input,target = input.to(device=device),target.to(device=device)
+            target = F.one_hot(target,10) # crypten不像pytorch可以自动转换成onehot，所以还得额外做一步
+            input_enc = crypten.cryptensor(input, requires_grad=True)
+            target_enc = crypten.cryptensor(target, requires_grad=True)
+            output_enc = model(input_enc)
+            loss = criterion(output_enc,target_enc)
+            print(f"Loss:{loss.get_plain_text().item():.4f}")
+            model.zero_grad()
+            loss.backward()
+            # backpropagation_done = all(param.grad is not None for param in model.parameters())
+            # print(backpropagation_done)
+            model.update_parameters(lr)
+            break
 
         return model
 
@@ -433,8 +611,42 @@ class ModelBenchmarks:
         """Returns training time per epoch for plain text and CrypTen"""
         runtimes = []
         runtimes_enc = []
-
+        print("=============Time Training=============")
         for model in self.models:
+            print("=============",model.name,"=============")
+            if model.advanced:
+                train_loader = model.data.train_loader
+                # 明文
+                print("----------plain----------")
+                model_plain = model.plain
+                if hasattr(model_plain, "to"):
+                    model_plain = model_plain.to(self.device)
+                model_plain.train()
+                criterion = getattr(torch.nn, model.loss)()
+                optimizer = torch.optim.SGD(model_plain.parameters(), lr=model.lr)
+                for _ in range(0,1):
+                    runtime, model_plain = self.train_advanced(
+                        train_loader,model_plain,criterion,optimizer,self.device
+                    )
+                runtimes.append(runtime)
+                
+                # 密文
+                print("----------Enc----------")
+                model_crypten = model.crypten
+                if hasattr(model_plain, "to"):
+                    model_crypten = model_crypten.to(self.device)
+                # model_crypten.train() # 设置为训练模式
+                model_enc = model_crypten.encrypt()
+                criterion = getattr(crypten.nn, model.loss)()
+                for _ in range(0,1):
+                    runtime_enc, model_enc = self.train_advanced_crypten(
+                        train_loader,model_enc,criterion,model.lr,self.device
+                    )
+                runtimes_enc.append(runtime_enc)
+                continue
+    
+            # 明文
+            print("----------plain----------")
             x, y = model.data.x, model.data.y
             x, y = x.to(device=self.device), y.to(device=self.device)
             model_plain = model.plain
@@ -442,16 +654,15 @@ class ModelBenchmarks:
                 model_plain = model_plain.to(self.device)
             runtime, _ = self.train(model_plain, x, y, 1, model.lr, model.loss)
             runtimes.append(runtime)
-
-            if model.advanced: # 对于 CrypTen 加密模型，会先根据模型是否为高级模型，对标签数据进行处理
-                y = model.data.y_onehot.to(self.device) # 转成onehot
+            
+            # 密文
+            print("----------Enc----------")
             x_enc = crypten.cryptensor(x)
             y_enc = crypten.cryptensor(y)
-
             model_crypten = model.crypten
             if hasattr(model_crypten, "to"):
                 model_crypten = model_crypten.to(self.device)
-            model_enc = model_crypten.encrypt() # 加密model还需要做一次encrypt操作才算完成
+            model_enc = model_crypten.encrypt()
             runtime_enc, _ = self.train_crypten(
                 model_enc, x_enc, y_enc, 1, model.lr, model.loss
             )
@@ -466,22 +677,54 @@ class ModelBenchmarks:
 
     def time_inference(self):
         """Returns inference time for plain text and CrypTen"""
+        print("=============Time Inference=============")
         runtimes = []
         runtimes_enc = []
 
         for model in self.models:
+            if model.advanced:
+                train_loader = model.data.train_loader
+                # 明文
+                print("----------plain----------")
+                model_plain = model.plain
+                if hasattr(model_plain, "to"):
+                    model_plain = model_plain.to(self.device)
+                for i,(input,target) in enumerate(train_loader):
+                    input,target = input.to(device=self.device),target.to(device=self.device)
+                    break
+                runtime, _ = self.predict(model_plain, input)
+                runtimes.append(runtime)
+                
+                # 密文
+                print("----------Enc----------")
+                model_crypten = model.crypten
+                if hasattr(model_plain, "to"):
+                    model_plain = model_plain.to(self.device)
+                model_enc = model_crypten.encrypt()
+                for i,(input,target) in enumerate(train_loader):
+                    input,target = input.to(device=self.device),target.to(device=self.device)
+                    break
+                input_enc = crypten.cryptensor(input)
+                runtime_enc, _ = self.predict(model_enc, input_enc)
+                runtimes_enc.append(runtime_enc)
+                continue
+                
+                
+            # 明文
+            print("----------plain----------")
             x = model.data.x.to(self.device)
             model_plain = model.plain
             if hasattr(model_plain, "to"):
                 model_plain = model_plain.to(self.device)
             runtime, _ = self.predict(model_plain, x)
             runtimes.append(runtime)
-
+            
+            # 密文
+            print("----------Enc----------")
             model_crypten = model.crypten
             if hasattr(model_crypten, "to"):
                 model_crypten = model_crypten.to(self.device)
             model_enc = model_crypten.encrypt()
-
             x_enc = crypten.cryptensor(x)
             runtime_enc, _ = self.predict(model_enc, x_enc)
             runtimes_enc.append(runtime_enc)
@@ -500,43 +743,105 @@ class ModelBenchmarks:
         Returns (float): percent accuracy
         """
         output, y = output.cpu(), y.cpu()
-        predicted = (output > threshold).float() # 得到预测label
-        correct = (predicted == y).sum().float() # 得到预测正确的总数
+        if threshold == 1:
+            predicted = torch.argmax(output, dim=1).float()
+        else:
+            predicted = (output > threshold).float()
+        correct = (predicted == y).sum().float()
         accuracy = float((correct / y.shape[0]).cpu().numpy())
         return accuracy
 
     def evaluate(self):
         """Evaluates accuracy of crypten versus plain text models"""
+        print("=============Evaluate=============")
         accuracies, accuracies_crypten = [], []
 
         for model in self.models:
+            print("=============",model.name,"=============")
+            if model.advanced:
+                print("----------plain----------")
+                train_loader, test_loader = model.data.train_loader, model.data.test_loader
+                # 明文
+                model_plain = model.plain
+                if hasattr(model_plain, "to"):
+                    model_plain = model_plain.to(self.device)
+                model_plain.train()
+                criterion = getattr(torch.nn, model.loss)()
+                optimizer = torch.optim.SGD(model_plain.parameters(), lr=model.lr)
+                ## 训练
+                for _ in range(0,model.epochs):
+                    _, model_plain = self.train_advanced(
+                        train_loader,model_plain,criterion,optimizer,self.device
+                    )
+                    break
+                ## 测试
+                accuracy = 0
+                for i,(input,target) in enumerate(test_loader):
+                    x_test,y_test = input.to(device=self.device),target.to(device=self.device)
+                    accuracy += ModelBenchmarks.calc_accuracy(model_plain(x_test), y_test, 1)
+                    break
+                accuracy /= (i+1)   
+                accuracies.append(accuracy)
+                
+                
+                # 密文
+                print("----------Enc----------")
+                model_crypten = model.crypten
+                if hasattr(model_plain, "to"):
+                    model_crypten = model_crypten.to(self.device)
+                # model_crypten.train()
+                model_enc = model_crypten.encrypt()
+                criterion = getattr(crypten.nn, model.loss)()
+                for _ in range(0,model.epochs):
+                    _, model_enc = self.train_advanced_crypten(
+                        train_loader,model_enc,criterion,model.lr,self.device
+                    )
+                    break
+                ## 测试
+                accuracy = 0
+                for i,(input,target) in enumerate(test_loader):
+                    x_test,y_test = input.to(device=self.device),target.to(device=self.device)
+                    x_test_enc = crypten.cryptensor(x_test)
+                    output = model_crypten(x_test_enc).get_plain_text()
+                    accuracy += ModelBenchmarks.calc_accuracy(output, y_test, 1)
+                    break
+                    
+                accuracy /= (i+1)   
+                accuracies_crypten.append(accuracy)
+                continue
+             
+            
+            # 明文
+            print("----------plain----------")
             model_plain = model.plain
             if hasattr(model_plain, "to"):
                 model_plain = model_plain.to(self.device)
             x, y = model.data.x, model.data.y
             x, y = x.to(device=self.device), y.to(device=self.device)
+            # 训练
             _, model_plain = self.train(
                 model_plain, x, y, model.epochs, model.lr, model.loss
-            )
-
+            )            
+            # 测试
             x_test = model.data.x_test.to(device=self.device)
             y_test = model.data.y_test.to(device=self.device)
             accuracy = ModelBenchmarks.calc_accuracy(model_plain(x_test), y_test)
             accuracies.append(accuracy)
-
+            
+            # 密文
+            print("----------Enc----------")
             model_crypten = model.crypten
             if hasattr(model_crypten, "to"):
                 model_crypten = model_crypten.to(self.device)
             model_crypten = model_crypten.encrypt()
-            if model.advanced:
-                y = model.data.y_onehot.to(self.device)
             x_enc = crypten.cryptensor(x)
             y_enc = crypten.cryptensor(y)
+            # 训练
             _, model_crypten = self.train_crypten(
                 model_crypten, x_enc, y_enc, model.epochs, model.lr, model.loss
             )
+            # 测试
             x_test_enc = crypten.cryptensor(x_test)
-
             output = model_crypten(x_test_enc).get_plain_text()
             accuracy = ModelBenchmarks.calc_accuracy(output, y_test)
             accuracies_crypten.append(accuracy)

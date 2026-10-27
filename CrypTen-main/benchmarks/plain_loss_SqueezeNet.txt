@@ -1,0 +1,8 @@
+Epoch -1
+Batch 0, Loss: 5.3170
+Epoch -1
+Batch 0, Loss: 5.3818
+Epoch -1
+Batch 0, Loss: 5.3957
+Epoch -1
+Batch 0, Loss: 5.2826

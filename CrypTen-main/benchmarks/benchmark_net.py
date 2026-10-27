@@ -24,7 +24,7 @@ $ python benchmark_net.py --world-size 2 --multi-gpu
 $ python benchmark_net.py -p /mnt/workspace/Downloads/v2/cpu/LeNet/now/1
 $ python benchmark_net.py --world-size 2 -p /mnt/workspace/Downloads/v2/cpu/LeNet/now/2
 
-$ python benchmark_net.py --device cuda -p /mnt/workspace/Downloads/v2/gpu/LeNet/now/1
+$ python benchmark_net.py --device cuda -p /mnt/workspace/Downloads/v2/gpu/LeNet/before/1
 $ python benchmark_net.py --device cuda --world-size 2 -p /mnt/workspace/Downloads/v2/gpu/LeNet/now/2
 """
 
@@ -427,7 +427,7 @@ def time_training(device,epochs=2,lr=0.01,context_manager=None):
     
     if context_manager is None:
         context_manager = NoopContextManager()
-    data_dirname = "/mnt/data/tmpd5wtqqcd/"
+    data_dirname = "/data/"
     # data_dirname = "/tmp/tmpd5wtqqcd/" # data_dir = tempfile.TemporaryDirectory()
     train_loader, val_loader = preprocess_data(context_manager, data_dirname) # 得到训练数据加载器和验证数据加载器
 

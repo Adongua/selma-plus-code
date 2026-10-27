@@ -232,16 +232,11 @@ class MPCTensor(CrypTensor):
     # Comparators
     def _ltz(self):
         """Returns 1 for elements that are < 0 and 0 otherwise"""
+        shift = torch.iinfo(torch.long).bits - 1
         precision = 0 if self.encoder.scale == 1 else None
 
         result = self._to_ptype(Ptype.binary)
-        # Compare the secret-shared binary value against public zero using
-        # CrypTen's secure comparison circuit.  Extracting the sign from each
-        # local int64 share is not a valid replacement for this circuit: the
-        # A2B result is XOR-shared, but the local signed representation is not
-        # itself the secret sign bit.  The circuit handles the signed ordering
-        # by flipping the sign bit before the SPK comparison.
-        result = result.lt(0)
+        result.share >>= shift
         result = result._to_ptype(Ptype.arithmetic, precision=precision, bits=1)
         result.encoder._scale = 1
         return result

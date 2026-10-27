@@ -130,10 +130,9 @@ class FuncBenchmarks:
     """
     BINARY = [] 
 
-    # Strict CrypTen-native benchmark.  The historical approx_relu path is
-    # retained below for compatibility, but it is not a native ReLU and must
-    # not be used for the ReLU baseline.
-    UNARY = ["relu"]
+    UNARY = [
+        "approx_relu"
+    ] # mytest
     
     LAYERS = [] 
     
@@ -215,14 +214,10 @@ class FuncBenchmarks:
             if func in FuncBenchmarks.BINARY:
                 second_operand, second_operand_enc = y, y_enc
 
-            runtime, _ = FuncBenchmarks.time_func(x, func, y=second_operand)
+            runtime, _ = FuncBenchmarks.time_func(x, "relu", y=second_operand)
             runtimes.append(runtime)
 
-            runtime_enc, _ = FuncBenchmarks.time_func(
-                x_enc,
-                func,
-                y=second_operand_enc,
-            )
+            runtime_enc, _ = self.approx_relu(x_enc)
             runtimes_enc.append(runtime_enc)
 
         # add layer runtimes
@@ -350,8 +345,8 @@ class FuncBenchmarks:
                 getattr(TRUNCATED_DOMAIN_enc, func)(),
             )
         elif func in FuncBenchmarks.UNARY:
-            ref = getattr(DOMAIN, func)()
-            out_enc = getattr(DOMAIN_enc, func)()
+            ref = getattr(DOMAIN, "relu")()
+            _, out_enc = self.approx_relu(DOMAIN_enc)
         elif func in FuncBenchmarks.LAYERS:
             ref, out_enc = self._call_layer(func)
         elif func in FuncBenchmarks.BINARY:
@@ -408,9 +403,9 @@ class FuncBenchmarks:
     def save(self, path):
         print("===============save==============")
         if self.device.type == "cuda":
-            csv_path = os.path.join(path, "relu_runtime_cuda.csv")
+            csv_path = os.path.join(path, "approx_relu_runtime_cuda.csv") # mytest for approxmax_pool2d 
         else:
-            csv_path = os.path.join(path, "relu_runtime.csv")
+            csv_path = os.path.join(path, "approx_relu_runtime.csv") # experiment
         self.df.to_csv(csv_path, index=False)
         
     # 不带测通信

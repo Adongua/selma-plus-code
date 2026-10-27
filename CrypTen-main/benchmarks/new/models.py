@@ -231,12 +231,12 @@ class ResidualCrypTen(crypten.nn.Module):
         
     def forward(self, x):
         y = self.bn1(self.conv1(x))
-        y = y.approx_relu()
+        y = y.relu()
         y = self.bn2(self.conv2(y))
         if self.conv3:
             x = self.conv3(x)
         y = y + x
-        return y.approx_relu()
+        return y.relu()
 class ResNetCrypTen(crypten.nn.Module):
     def __init__(self, input_channels=3, num_classes=10, n_layers=18):
         super().__init__()
@@ -260,8 +260,8 @@ class ResNetCrypTen(crypten.nn.Module):
         b1 = crypten.nn.Sequential(
             crypten.nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3),
             crypten.nn.BatchNorm2d(64), 
-            crypten.nn.ApproxReLU(),
-            crypten.nn.ApproxMaxPool2d(kernel_size=3, stride=2, padding=1)
+            crypten.nn.ReLU(),
+            crypten.nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
         b2 = crypten.nn.Sequential(*self.resnet_block(64, 64, rbs[0], first_block=True))
         b3 = crypten.nn.Sequential(*self.resnet_block(64, 128, rbs[1]))
@@ -290,15 +290,15 @@ class Residual50CrypTen(crypten.nn.Module):
     def forward(self, x):
         identity = x
         y = self.bn1(self.conv1(x))
-        y = y.approx_relu()
+        y = y.relu()
         y = self.bn2(self.conv2(y))
-        y = y.approx_relu()
+        y = y.relu()
         y = self.bn3(self.conv3(y))
         
         if self.downsample is not None:
             identity = self.downsample(x)
         y = y + identity
-        return y.approx_relu()
+        return y.relu()
 class ResNet50CrypTen(crypten.nn.Module):
     def __init__(self, input_channels=3, num_classes=10, n_layers=50):
         super().__init__()
@@ -331,8 +331,8 @@ class ResNet50CrypTen(crypten.nn.Module):
         b1 = crypten.nn.Sequential(
             crypten.nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3),
             crypten.nn.BatchNorm2d(64), 
-            crypten.nn.ApproxReLU(),
-            crypten.nn.ApproxMaxPool2d(kernel_size=3, stride=2, padding=1)
+            crypten.nn.ReLU(),
+            crypten.nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
         b2 = crypten.nn.Sequential(*self.resnet_block(64, 64, rbs[0], first_block=True))
         b3 = crypten.nn.Sequential(*self.resnet_block(256, 128, rbs[1]))
@@ -433,7 +433,7 @@ class DenseBlockCrypTen(crypten.nn.Module):
     def conv_block(self, input_channels, output_channels):
         return crypten.nn.Sequential(
             crypten.nn.BatchNorm2d(input_channels), 
-            crypten.nn.ApproxReLU(),
+            crypten.nn.ReLU(),
             crypten.nn.Conv2d(input_channels, output_channels, kernel_size=3, padding=1)
         )
 
@@ -449,7 +449,7 @@ class TransitionCrypTen(crypten.nn.Module):
         super().__init__()
         self.trans_layer = crypten.nn.Sequential(
             crypten.nn.BatchNorm2d(input_channels),
-            crypten.nn.ApproxReLU(),
+            crypten.nn.ReLU(),
             crypten.nn.Conv2d(input_channels, output_channels, kernel_size=1),
             crypten.nn.AvgPool2d(kernel_size=2, stride=2),
         )
@@ -467,8 +467,8 @@ class DenseNet121CrypTen(crypten.nn.Module):
         b1 = crypten.nn.Sequential(
             crypten.nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
             crypten.nn.BatchNorm2d(64),
-            crypten.nn.ApproxReLU(),
-            crypten.nn.ApproxMaxPool2d(kernel_size=3, stride=2, padding=1)
+            crypten.nn.ReLU(),
+            crypten.nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
         
         # 4个DenseBlock和3个Transition层
@@ -497,167 +497,7 @@ class DenseNet121CrypTen(crypten.nn.Module):
         out = self.model(x)
         return out
 
-class VGG16(torch.nn.Module):
-    def __init__(self, input_channels=3, num_classes=10):
-        super().__init__()
-        self.model = self._make_model(input_channels, num_classes)
-    
-    def vgg_block(self, num_convs, input_channels, output_channels):
-        layers = []
-        for _ in range(num_convs):
-            layers.append(torch.nn.Conv2d(input_channels, output_channels,kernel_size=3, padding=1))
-            layers.append(torch.nn.ReLU())
-            input_channels = output_channels
-        layers.append(torch.nn.MaxPool2d(kernel_size=2,stride=2))
-        return torch.nn.Sequential(*layers)
-    
-    def vgg(self, input_channels, num_classes, conv_arch):
-        conv_blks = []
-        for (num_convs, output_channels) in conv_arch:
-            conv_blks.append(self.vgg_block(num_convs, input_channels, output_channels))
-            input_channels = output_channels
 
-        return torch.nn.Sequential(
-            *conv_blks, 
-            torch.nn.Flatten(),
-            # 全连接层部分
-            torch.nn.Linear(output_channels, 4096), torch.nn.ReLU(), torch.nn.Dropout(0.4),
-            torch.nn.Linear(4096, 4096), torch.nn.ReLU(), torch.nn.Dropout(0.4),
-            torch.nn.Linear(4096, num_classes)
-        )
-    
-    def _make_model(self, input_channels, num_classes):
-        conv_arch = ((2, 64), (2, 128), (3, 256), (3, 512), (3, 512))
-        net = self.vgg(input_channels, num_classes, conv_arch)
-        return net
-    
-    def forward(self, x):
-        return self.model(x)
-    
-    
-class VGG16CrypTen(crypten.nn.Module):
-    def __init__(self, input_channels=3, num_classes=10):
-        super().__init__()
-        self.model = self._make_model(input_channels, num_classes)
-    
-    def vgg_block(self, num_convs, input_channels, output_channels):
-        layers = []
-        for _ in range(num_convs):
-            layers.append(crypten.nn.Conv2d(input_channels, output_channels,kernel_size=3, padding=1))
-            layers.append(crypten.nn.ApproxReLU())
-            input_channels = output_channels
-        layers.append(crypten.nn.ApproxMaxPool2d(kernel_size=2,stride=2))
-        return crypten.nn.Sequential(*layers)
-    
-    def vgg(self, input_channels, num_classes, conv_arch):
-        conv_blks = []
-        for (num_convs, output_channels) in conv_arch:
-            conv_blks.append(self.vgg_block(num_convs, input_channels, output_channels))
-            input_channels = output_channels
-
-        return crypten.nn.Sequential(
-            *conv_blks, 
-            crypten.nn.Flatten(),
-            # 全连接层部分
-            crypten.nn.Linear(output_channels, 4096), crypten.nn.ApproxReLU(), crypten.nn.Dropout(0.4),
-            crypten.nn.Linear(4096, 4096), crypten.nn.ApproxReLU(), crypten.nn.Dropout(0.4),
-            crypten.nn.Linear(4096, num_classes)
-        )
-    
-    def _make_model(self, input_channels, num_classes):
-        conv_arch = ((2, 64), (2, 128), (3, 256), (3, 512), (3, 512))
-        net = self.vgg(input_channels, num_classes, conv_arch)
-        return net
-    
-    def forward(self, x):
-        return self.model(x)
-
-    
-class FireModule(torch.nn.Module):
-    def __init__(self, input_channels, squeeze_channels, expand1x1_channels, expand3x3_channels):
-        super(FireModule, self).__init__()
-        self.squeeze = torch.nn.Conv2d(input_channels, squeeze_channels, kernel_size=1)
-        self.expand1x1 = torch.nn.Conv2d(squeeze_channels, expand1x1_channels, kernel_size=1)
-        self.expand3x3 = torch.nn.Conv2d(squeeze_channels, expand3x3_channels, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        squeezed = torch.relu(self.squeeze(x))
-        expanded1x1 = torch.relu(self.expand1x1(squeezed))
-        expanded3x3 = torch.relu(self.expand3x3(squeezed))
-        return torch.cat([expanded1x1, expanded3x3], 1)
-
-class SqueezeNet(torch.nn.Module):
-    def __init__(self, num_classes=10):
-        super(SqueezeNet, self).__init__()
-        self.features = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 96, kernel_size=3, stride=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool2d(kernel_size=3, stride=2),
-            FireModule(96, 16, 64, 64),
-            FireModule(128, 16, 64, 64),
-            FireModule(128, 32, 128, 128),
-            torch.nn.MaxPool2d(kernel_size=3, stride=2),
-            FireModule(256, 32, 128, 128),
-            FireModule(256, 48, 192, 192),
-            FireModule(384, 48, 192, 192),
-            FireModule(384, 64, 256, 256),
-            torch.nn.MaxPool2d(kernel_size=3, stride=2),
-            FireModule(512, 64, 256, 256)
-        )
-        self.final_conv = torch.nn.Conv2d(512, num_classes, kernel_size=1)
-        self.global_avgpool = torch.nn.AdaptiveAvgPool2d(1)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.final_conv(x)
-        x = self.global_avgpool(x)
-        x = x.view(x.size(0), -1)
-        return x
-    
-
-class FireModuleCrypTen(crypten.nn.Module):
-    def __init__(self, input_channels, squeeze_channels, expand1x1_channels, expand3x3_channels):
-        super().__init__()
-        self.squeeze = crypten.nn.Conv2d(input_channels, squeeze_channels, kernel_size=1)
-        self.expand1x1 = crypten.nn.Conv2d(squeeze_channels, expand1x1_channels, kernel_size=1)
-        self.expand3x3 = crypten.nn.Conv2d(squeeze_channels, expand3x3_channels, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        squeezed = self.squeeze(x)      
-        squeezed = squeezed.approx_relu()
-        expanded1x1 = self.expand1x1(squeezed)
-        expanded1x1 = expanded1x1.approx_relu()
-        expanded3x3 = self.expand3x3(squeezed)
-        expanded3x3 = expanded3x3.approx_relu()
-        return crypten.cat([expanded1x1, expanded3x3], 1)
-class SqueezeNetCrypTen(crypten.nn.Module):
-    def __init__(self, num_classes=10):
-        super().__init__()
-        self.features = crypten.nn.Sequential(
-            crypten.nn.Conv2d(3, 96, kernel_size=3, stride=1),
-            crypten.nn.ApproxReLU(),
-            crypten.nn.ApproxMaxPool2d(kernel_size=3, stride=2),
-            FireModuleCrypTen(96, 16, 64, 64),
-            FireModuleCrypTen(128, 16, 64, 64),
-            FireModuleCrypTen(128, 32, 128, 128),
-            crypten.nn.ApproxMaxPool2d(kernel_size=3, stride=2),
-            FireModuleCrypTen(256, 32, 128, 128),
-            FireModuleCrypTen(256, 48, 192, 192),
-            FireModuleCrypTen(384, 48, 192, 192),
-            FireModuleCrypTen(384, 64, 256, 256),
-            crypten.nn.ApproxMaxPool2d(kernel_size=3, stride=2),
-            FireModuleCrypTen(512, 64, 256, 256)
-        )
-        self.final_conv = crypten.nn.Conv2d(512, num_classes, kernel_size=1)
-        self.global_avgpool = crypten.nn.AdaptiveAvgPool2d(1)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.final_conv(x)
-        x = self.global_avgpool(x)
-        x = x.view(x.size(0), -1)
-        return x
-    
 
 MODELS = [
     # Model(
@@ -680,16 +520,16 @@ MODELS = [
     #     loss="BCELoss",
     #     advanced=False,
     # ),
-    Model(
-        name="resnet18",
-        plain=ResNet(n_layers=18),
-        crypten=ResNetCrypTen(n_layers=18),
-        data=data.Images(),
-        epochs=1,
-        lr=0.001,
-        loss="CrossEntropyLoss",
-        advanced=True,
-    ),
+    # Model(
+    #     name="resnet18",
+    #     plain=ResNet(n_layers=18),
+    #     crypten=ResNetCrypTen(n_layers=18),
+    #     data=data.Images(),
+    #     epochs=1,
+    #     lr=0.001,
+    #     loss="CrossEntropyLoss",
+    #     advanced=True,
+    # ),
     # Model(
     #     name="resnet34",
     #     plain=ResNet(n_layers=34),
@@ -706,39 +546,18 @@ MODELS = [
     #     crypten=ResNet50CrypTen(n_layers=50),
     #     data=data.Images(),
     #     epochs=1,
-    #     lr=1e-5,
+    #     lr=0.001,
     #     loss="CrossEntropyLoss",
     #     advanced=True,
     # ),
-    # Model(
-    #     name="DenseNet121",
-    #     plain=DenseNet121(num_classes=10),
-    #     crypten=DenseNet121CrypTen(num_classes=10),
-    #     data=data.Images(),
-    #     epochs=1,
-    #     lr=1e-3,
-    #     loss="CrossEntropyLoss",
-    #     advanced=True,
-    # ),
-    # Model(
-    #     name="VGG16",
-    #     plain=VGG16(num_classes=10),
-    #     crypten=VGG16CrypTen(num_classes=10),
-    #     data=data.Images(),
-    #     epochs=1,
-    #     lr=1e-3,
-    #     loss="CrossEntropyLoss",
-    #     advanced=True,
-    # ),
-    # Model(
-    #     name="SqueezeNet",
-    #     plain=SqueezeNet(num_classes=10),
-    #     crypten=SqueezeNetCrypTen(num_classes=10),
-    #     data=data.Images(),
-    #     epochs=3,
-    #     lr=1e-3,
-    #     loss="CrossEntropyLoss",
-    #     advanced=True,
-    # )
-    
+    Model(
+        name="DenseNet121",
+        plain=DenseNet121(num_classes=10),
+        crypten=DenseNet121CrypTen(num_classes=10),
+        data=data.Images(),
+        epochs=1,
+        lr=0.001,
+        loss="CrossEntropyLoss",
+        advanced=True,
+    )
 ]

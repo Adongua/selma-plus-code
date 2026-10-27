@@ -208,20 +208,14 @@ def _setup_prng():
 
     # Generate next / prev seeds.
     seed = int.from_bytes(os.urandom(8), "big") - 2**63
-    seed_device = (
-        torch.device(f"cuda:{torch.cuda.current_device()}")
-        if torch.cuda.is_available()
-        and comm.get().get_distributed_backend().lower() == "nccl"
-        else torch.device("cpu")
-    )
-    next_seed = torch.tensor(seed, device=seed_device)
+    next_seed = torch.tensor(seed)
 
     # Create local seed - Each party has a separate local generator
     local_seed = int.from_bytes(os.urandom(8), "big") - 2**63
 
     # Create global generator - All parties share one global generator for sync'd rng
     global_seed = int.from_bytes(os.urandom(8), "big") - 2**63
-    global_seed = torch.tensor(global_seed, device=seed_device)
+    global_seed = torch.tensor(global_seed)
 
     _sync_seeds(next_seed, local_seed, global_seed)
 
@@ -236,29 +230,20 @@ def _sync_seeds(next_seed, local_seed, global_seed):
     global generators
 
     # Populated by recieving the previous party's next_seed (irecv)
-    seed_device = next_seed.device
-    prev_seed = torch.zeros(1, dtype=torch.long, device=seed_device)
+    prev_seed = torch.tensor([0], dtype=torch.long)
 
-    # Send random seed to next party, receive random seed from prev party.
-    # NCCL point-to-point setup is order-sensitive: each rank's ring
-    # isend/irecv pair can try to create a different NCCL communicator first,
-    # leaving another rank waiting for its unique ID in the store.  Use a
-    # collective for NCCL initialization instead.  The Gloo path keeps the
-    # original ring exchange for compatibility with the CPU runtime.
+    # Send random seed to next party, receive random seed from prev party
     world_size = comm.get().get_world_size()
     rank = comm.get().get_rank()
     if world_size >= 2:  # Guard against segfaults when world_size == 1.
         next_rank = (rank + 1) % world_size
         prev_rank = (next_rank - 2) % world_size
-        if comm.get().get_distributed_backend().lower() == "nccl":
-            gathered = comm.get().all_gather(next_seed.reshape(1))
-            prev_seed = gathered[prev_rank]
-        else:
-            req0 = comm.get().isend(next_seed, next_rank)
-            req1 = comm.get().irecv(prev_seed, src=prev_rank)
 
-            req0.wait()
-            req1.wait()
+        req0 = comm.get().isend(next_seed, next_rank)
+        req1 = comm.get().irecv(prev_seed, src=prev_rank)
+
+        req0.wait()
+        req1.wait()
     else:
         prev_seed = next_seed
 
