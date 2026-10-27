@@ -114,6 +114,29 @@ detect fast but semantically incorrect comparison paths.
 The benchmark also records `crypten_import` and refuses to run if Python
 resolves `crypten` outside this repository's `CrypTen-main/crypten` directory.
 
+To isolate a native-ReLU failure, run the diagnostic separately on CPU/Gloo
+and CUDA/NCCL:
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main"
+
+python -m srelu.diagnose_crypten_relu \
+  --device cpu \
+  --shape 1x17 \
+  --output "$HOME/home/tmp/crypten-relu-diagnostic-cpu.json"
+
+CUDA_VISIBLE_DEVICES=0,1,2 \
+TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+timeout 600 \
+python -m srelu.diagnose_crypten_relu \
+  --device cuda \
+  --shape 1x17 \
+  --output "$HOME/home/tmp/crypten-relu-diagnostic-cuda.json"
+```
+
+The diagnostic invokes only CrypTen's native `_ltz()`, `ge(0)` and `relu()`
+methods and reports each result separately.
+
 The fairness and claim policy is recorded in
 [`../../plan/experiment-protocol.md`](../../plan/experiment-protocol.md).
 
