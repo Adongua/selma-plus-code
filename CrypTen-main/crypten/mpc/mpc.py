@@ -232,11 +232,19 @@ class MPCTensor(CrypTensor):
     # Comparators
     def _ltz(self):
         """Returns 1 for elements that are < 0 and 0 otherwise"""
-        shift = torch.iinfo(torch.long).bits - 1
         precision = 0 if self.encoder.scale == 1 else None
 
         result = self._to_ptype(Ptype.binary)
-        result.share >>= shift
+        # BinarySharedTensor uses XOR sharing.  Arithmetic right-shifting each
+        # signed local int64 share is not XOR-linear and therefore cannot be
+        # used to extract the shared sign bit.  Extract the local MSB instead:
+        # the MSB of an XOR is exactly the XOR of the local MSBs.  Keep the
+        # CUDA wrapper when the binary share lives on a CUDA device.
+        if isinstance(result.share, CUDALongTensor):
+            local_share = result.share.tensor()
+            result.share = CUDALongTensor((local_share < 0).long())
+        else:
+            result.share = (result.share < 0).long()
         result = result._to_ptype(Ptype.arithmetic, precision=precision, bits=1)
         result.encoder._scale = 1
         return result
