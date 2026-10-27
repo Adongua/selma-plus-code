@@ -86,3 +86,16 @@ python -m slayernorm.benchmark_crypten_cuda \
 所有阶段的原始数据写入 `comparison.json`；自动生成 `summary.md`。传统
 `benchmark.py` 对普通 normal/uniform 输入执行最大绝对误差 `0.005` 的 guard；统一
 GPU 入口会如实记录每个 baseline 的误差而不因某个近似误差较大提前终止整批实验。
+
+同一入口也可通过 `--backend gloo` 使用 GPU 计算和 Gloo 通信。Ring3 的 CUDA 份额
+经 CPU 缓冲区传输，拷贝时间计入测量；CrypTen 方法使用自身 Gloo/CUDA 通信路径。
+报告记录导入路径、backend 和 Q17 精度，不能直接把此路径的运行时间当成 NCCL 结果。
+先运行小形状并检查各方法误差：
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+CUDA_VISIBLE_DEVICES=0,1,2 timeout 600 python -m slayernorm.benchmark_crypten_cuda \
+  --backend gloo --shapes 1x17x32 --distributions normal --repeats 1 \
+  --methods slayernorm crypten_native --output "$HOME/home/tmp/slayernorm-gloo-smoke"
+```

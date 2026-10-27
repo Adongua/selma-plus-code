@@ -9,7 +9,7 @@
 - `sgelu.py`：G1/G2 浮点参考、`SmoothGeLU` 模块、公开激活的逐层尺度校准。
 - `wide.py`：96-bit 加减乘、4×24-bit limb、3×32-bit 紧凑通信、公开整数平方根。
 - `runtime.py`：CPU/Gloo 三进程 64/96-bit 加法分享、乘法、随机刷新。
-- `runtime_cuda.py`：实验性 CUDA/NCCL 三方运行时；每个参与方绑定一张 GPU。
+- `runtime_cuda.py`：实验性 CUDA 三方运行时，可选 NCCL 或 Gloo；每个参与方绑定一张 GPU。
 - `protocol.py`：联合掩码提升、概率截断、双分支 Ruler-G2 数值协议。
 - `bridge.py`：Q17 `MPCTensor` 输入输出，显式 `prepare()`，仅前向、不支持反向传播。
 - `validate.py`：三进程原语验收、一次预热和三次正式算子测量、JSON 报告。
@@ -215,3 +215,19 @@ GeLU 近似误差均小于这个数值。
 后续：核定安全打开方案；在公开 Tiny-ImageNet 数据与已核对权重上采集 9 层 pre-GeLU 激活并校准；
 解耦 MPCViT 模型导入时的参数解析；接入单 block 和完整图；测量精度、通信、时间及消融。
 本阶段没有修改旧 CrypTen 的全局算子映射或 MPCViT 注意力行为。
+
+## Gloo/CUDA 统一 benchmark
+
+`benchmark_crypten_cuda` 可用 `--backend gloo` 运行三方 GPU 实验。Ring3 算术在 GPU，
+Gloo 通信将各方本地份额复制到 CPU 再传输，往返拷贝计入各阶段耗时；CrypTen 方法
+使用其 Gloo/CUDA 通信实现。报告记录 backend、CrypTen 导入路径和默认 Q17 精度。
+不同通信后端与不同内存传输路径的性能应分别标注，且须先检查各方法的数值误差。
+CrypTen 方法的 `offline` 与 `online` 字段是同一段测量，不可相加。
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+CUDA_VISIBLE_DEVICES=0,1,2 timeout 600 python -m sgelu.benchmark_crypten_cuda \
+  --backend gloo --shape 1x17 --repeats 1 --methods sgelu puma \
+  --output "$HOME/home/tmp/sgelu-gloo-smoke"
+```

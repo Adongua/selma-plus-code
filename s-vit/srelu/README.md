@@ -116,9 +116,8 @@ The benchmark records `crypten_import` and requires the
 import resolution. Its native baseline calls `MPCTensor.relu()` directly.
 The standalone diagnostic below uses the same CrypTen `MultiProcessLauncher`
 and default Gloo backend as `CrypTen-main/benchmarks/benchmark.py`. The unified
-CUDA microbenchmark instead uses NCCL for all methods so its method timings
-share one transport. Do not compare those Gloo and NCCL timings as one
-controlled experiment.
+CUDA microbenchmark supports `--backend gloo` and `--backend nccl`. Report the
+backend; do not combine Gloo and NCCL timings as one controlled experiment.
 
 To isolate a native-ReLU failure, run the diagnostic separately on CPU/Gloo
 and CUDA/Gloo. CUDA tensor placement is retained, while CrypTen communication
@@ -143,11 +142,10 @@ python -m srelu.diagnose_crypten_relu \
 The diagnostic invokes only CrypTen's native `_ltz()`, `ge(0)` and `relu()`
 methods and reports each result separately.
 
-The unified CUDA microbenchmark still uses an NCCL process group for the custom
-CUDA Ring3 methods; that transport setup differs from the legacy benchmark's
-Gloo launcher. The native call and CrypTen source package now match, but do not
-interpret their runtime as an exact reproduction of the legacy benchmark's
-Gloo timing without accounting for this backend difference.
+With `--backend gloo`, the unified CUDA benchmark stages Ring3 communication
+through CPU memory and includes those copies in timing. CrypTen's native
+methods use their own Gloo/CUDA communication path. The default remains NCCL.
+The three-GPU Gloo path needs server validation before interpreting results.
 
 The fairness and claim policy is recorded in
 [`../../plan/experiment-protocol.md`](../../plan/experiment-protocol.md).

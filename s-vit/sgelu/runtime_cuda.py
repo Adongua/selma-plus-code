@@ -1,8 +1,9 @@
-"""CUDA/NCCL runtime for the experimental three-party arithmetic protocol.
+"""CUDA runtime for the experimental three-party arithmetic protocol.
 
 This module is intentionally separate from :mod:`sgelu.runtime`.  It expects
-one process per GPU, exactly three processes, and an initialized NCCL process
-group.  It is an engineering port of the CPU/Gloo prototype; it does not add
+one process per GPU, exactly three processes, and an NCCL or Gloo process
+group. Gloo exchanges explicitly stage secret shares through host memory. It
+is an engineering port of the CPU/Gloo prototype; it does not add
 new security guarantees.  Arithmetic, random-word expansion and public 96-bit
 square roots stay on CUDA after one-time seed setup.
 """
@@ -55,15 +56,16 @@ class CudaPairwiseZeroSharing:
 
 
 class CudaRing3:
-    """Three-party additive ring over CUDA tensors using NCCL point-to-point."""
+    """Three-party additive ring over CUDA tensors, using NCCL or staged Gloo."""
 
     def __init__(self, rank=None, device=None, reveal_mode="all_gather"):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
         if not dist.is_initialized() or dist.get_world_size() != 3:
             raise RuntimeError("initialize exactly three distributed processes first")
-        if dist.get_backend() != "nccl":
-            raise ValueError("CUDA runtime requires the NCCL backend")
+        self.backend = str(dist.get_backend()).lower()
+        if self.backend not in ("nccl", "gloo"):
+            raise ValueError("CUDA runtime requires the NCCL or Gloo backend")
         self.rank = dist.get_rank() if rank is None else rank
         if self.rank != dist.get_rank():
             raise ValueError("rank does not match the initialized process group")
@@ -85,11 +87,13 @@ class CudaRing3:
 
     def exchange(self, tensors):
         sends = [x.contiguous() for x in tensors]
-        received = [torch.empty_like(x, device=self.device) for x in sends]
-        operations = []
-        for x, y in zip(sends, received):
+        for x in sends:
             if x.device != self.device:
                 raise ValueError(f"CUDA tensor on {self.device} required")
+        wire_sends = [x.cpu() for x in sends] if self.backend == "gloo" else sends
+        received = [torch.empty_like(x) for x in wire_sends]
+        operations = []
+        for x, y in zip(wire_sends, received):
             # NCCL may deadlock while lazily creating peer communicators if
             # every rank issues send/recv calls in a different order.  Submit
             # the complete ring exchange as one batch instead.
@@ -100,7 +104,8 @@ class CudaRing3:
         for request in requests:
             request.wait()
         self.phases += 1
-        return received
+        return ([x.to(self.device) for x in received]
+                if self.backend == "gloo" else received)
 
     def gather_all(self, value):
         """Collect equal-sized CUDA tensors from all parties in one NCCL phase."""
@@ -108,8 +113,14 @@ class CudaRing3:
         if value.device != self.device:
             raise ValueError(f"CUDA tensor on {self.device} required")
         flat = value.reshape(-1)
-        gathered = torch.empty(3 * flat.numel(), dtype=value.dtype, device=self.device)
-        dist.all_gather_into_tensor(gathered, flat)
+        if self.backend == "gloo":
+            wire = flat.cpu()
+            parts = [torch.empty_like(wire) for _ in range(3)]
+            dist.all_gather(parts, wire)
+            gathered = torch.cat(parts).to(self.device)
+        else:
+            gathered = torch.empty(3 * flat.numel(), dtype=value.dtype, device=self.device)
+            dist.all_gather_into_tensor(gathered, flat)
         # A three-party ring all-gather transmits two input-sized chunks per
         # rank.  This matches the payload accounting of the former two P2P
         # reconstruction exchanges and keeps CPU/GPU reports comparable.
@@ -122,13 +133,14 @@ class CudaRing3:
         value = value.contiguous()
         if value.device != self.device:
             raise ValueError(f"CUDA tensor on {self.device} required")
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        wire = value.cpu() if self.backend == "gloo" else value
+        dist.all_reduce(wire, op=dist.ReduceOp.SUM)
         # Keep the same conservative two-input-sized accounting used for the
         # ring reconstruction paths. NCCL's selected algorithm may transfer
         # less or more than this application-level equivalent.
         self.sent_bytes += 2 * value.numel() * value.element_size()
         self.phases += 1
-        return value
+        return wire.to(self.device) if self.backend == "gloo" else wire
 
     def public(self, value):
         value = torch.as_tensor(value, dtype=torch.int64, device=self.device)

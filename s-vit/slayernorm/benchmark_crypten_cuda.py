@@ -69,7 +69,10 @@ def _fixture(shape, distribution, seed, device):
 
 
 def _barrier(device):
-    dist.barrier(device_ids=[device.index])
+    if dist.get_backend() == "gloo":
+        dist.barrier()
+    else:
+        dist.barrier(device_ids=[device.index])
 
 
 def _sync(device):
@@ -80,7 +83,7 @@ def _aggregate(device, seconds, stats, *, bidirectional_counter=False):
     row = torch.tensor(
         [seconds, stats["bytes"], stats["rounds"], stats["time"]],
         dtype=torch.float64,
-        device=device,
+        device="cpu" if dist.get_backend() == "gloo" else device,
     )
     rows = [torch.empty_like(row) for _ in range(3)]
     dist.all_gather(rows, row)
@@ -199,6 +202,8 @@ def _summarize(report):
     lines = [
         "# sLayerNorm CUDA micro benchmark",
         "",
+        f"Backend: {report['backend'].upper()}; Ring3 transport: {report['ring3_transport']}.",
+        "",
         "所有 shape 为 `(B,T,D)`，沿最后一维执行 LayerNorm。时间为三方最慢值；"
         "通信量使用三方系统级发送载荷，CrypTen 的双向日志计数已除以二。",
         "",
@@ -245,11 +250,17 @@ def worker(rank, rendezvous, options):
         RANK=str(rank),
         WORLD_SIZE="3",
         RENDEZVOUS=rendezvous,
-        DISTRIBUTED_BACKEND="nccl",
+        DISTRIBUTED_BACKEND=options["backend"],
     )
     import crypten
 
+    crypten.cfg.encoder.precision_bits = 17
+    if options["progress"]:
+        print(json.dumps({"event": "crypten_init_started", "rank": rank,
+                          "backend": options["backend"]}), flush=True)
     crypten.init(device=device)
+    if options["progress"]:
+        print(json.dumps({"event": "crypten_init_complete", "rank": rank}), flush=True)
     crypten.cfg.communicator.verbose = True
     try:
         profile = Profile(epsilon=options["epsilon"], scale=options["scale"])
@@ -262,7 +273,7 @@ def worker(rank, rendezvous, options):
         if rank == 0 and options["progress"]:
             print(json.dumps({
                 "event": "initialized",
-                "framework": "CrypTen MPCTensor + Ring3 / NCCL / CUDA",
+                "framework": f"CrypTen MPCTensor + Ring3 / {options['backend'].upper()} / CUDA",
                 "shapes": [list(shape) for shape in options["shapes"]],
                 "methods": options["methods"],
             }), flush=True)
@@ -365,7 +376,14 @@ def worker(rank, rendezvous, options):
             output.mkdir(parents=True, exist_ok=True)
             report = {
                 "status": "executed_not_security_validated",
-                "framework": "CrypTen-main MPCTensor + Ring3 adapters / NCCL / CUDA",
+                "framework": f"CrypTen MPCTensor + Ring3 adapters / {options['backend'].upper()} / CUDA",
+                "backend": options["backend"],
+                "crypten_import": str(Path(crypten.__file__).resolve()),
+                "crypten_default_precision_bits": crypten.cfg.encoder.precision_bits,
+                "ring3_transport": (
+                    "Gloo with CPU staging of CUDA shares; staging is timed"
+                    if options["backend"] == "gloo" else "NCCL on CUDA tensors"
+                ),
                 "world_size": 3,
                 "devices": [f"cuda:{index}" for index in range(3)],
                 "shapes": [list(shape) for shape in options["shapes"]],
@@ -383,11 +401,13 @@ def worker(rank, rendezvous, options):
                 "communication": (
                     "system_bytes is sent-payload equivalent across three parties; "
                     "CrypTen logs send+receive and is divided by two, while Ring3 "
-                    "already counts sends only"
+                    "point-to-point counts sends. Ring3 collective bytes are "
+                    "application-level estimates, not measured wire traffic"
                 ),
                 "timing_boundary": (
                     "Ring3 methods separate preprocessing; CrypTen provider work "
-                    "inside MPCTensor primitives is included in online"
+                    "inside MPCTensor primitives is included in online; Gloo "
+                    "Ring3 CPU staging is included in each measured phase"
                 ),
                 "security": (
                     "literature methods are same-framework 3PC adaptations, not "
@@ -422,6 +442,7 @@ def main():
         default=["normal"],
     )
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--backend", choices=("nccl", "gloo"), default="nccl")
     parser.add_argument(
         "--methods", nargs="+", choices=ALL_METHODS, default=list(ALL_METHODS)
     )
