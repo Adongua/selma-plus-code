@@ -88,8 +88,6 @@ def worker(options):
     # Match benchmark.py's --device cuda behavior by default: each party uses
     # the default CUDA device unless the caller launches a multi-GPU variant.
     device = torch.device("cuda" if use_cuda else "cpu")
-    if use_cuda:
-        torch.cuda.set_device(device)
 
     crypten_path = _assert_vendored_crypten(crypten)
     plain = _fixture(options["shape"]).to(device)
