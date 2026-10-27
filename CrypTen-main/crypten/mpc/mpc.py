@@ -235,16 +235,13 @@ class MPCTensor(CrypTensor):
         precision = 0 if self.encoder.scale == 1 else None
 
         result = self._to_ptype(Ptype.binary)
-        # BinarySharedTensor uses XOR sharing.  Arithmetic right-shifting each
-        # signed local int64 share is not XOR-linear and therefore cannot be
-        # used to extract the shared sign bit.  Extract the local MSB instead:
-        # the MSB of an XOR is exactly the XOR of the local MSBs.  Keep the
-        # CUDA wrapper when the binary share lives on a CUDA device.
-        if isinstance(result.share, CUDALongTensor):
-            local_share = result.share.tensor()
-            result.share = CUDALongTensor((local_share < 0).long())
-        else:
-            result.share = (result.share < 0).long()
+        # Compare the secret-shared binary value against public zero using
+        # CrypTen's secure comparison circuit.  Extracting the sign from each
+        # local int64 share is not a valid replacement for this circuit: the
+        # A2B result is XOR-shared, but the local signed representation is not
+        # itself the secret sign bit.  The circuit handles the signed ordering
+        # by flipping the sign bit before the SPK comparison.
+        result = result.lt(0)
         result = result._to_ptype(Ptype.arithmetic, precision=precision, bits=1)
         result.encoder._scale = 1
         return result
