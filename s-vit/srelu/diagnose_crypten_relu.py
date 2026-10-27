@@ -83,6 +83,13 @@ def worker(options):
     import crypten
     import crypten.communicator as comm
 
+    # This probe encrypts Q17 inputs. CrypTen's _ltz() converts a binary
+    # comparison result back to arithmetic using the configured default
+    # precision; keeping that default at Q16 makes its scale conversion zero.
+    # Set this inside every spawned party before creating or operating on MPC
+    # tensors, so the diagnostic tests native CrypTen at the input's precision.
+    crypten.cfg.encoder.precision_bits = 17
+
     rank = comm.get().get_rank()
     use_cuda = options["device"] == "cuda"
     # Match benchmark.py's --device cuda behavior by default: each party uses
@@ -137,6 +144,9 @@ def worker(options):
             "torch": torch.__version__,
             "backend": "Gloo/CUDA" if use_cuda else "Gloo/CPU",
             "world_size": 3,
+            "crypten_default_precision_bits": (
+                crypten.cfg.encoder.precision_bits
+            ),
             "shape": list(options["shape"]),
             "row": row,
             "note": (
@@ -176,6 +186,7 @@ def main():
     }
     # Mirror benchmark.py: initialize CrypTen in the parent, then use its own
     # launcher, which configures child processes with the default Gloo backend.
+    # The precision override is applied inside worker() on each party.
     crypten.init()
     launcher = multiprocess_launcher.MultiProcessLauncher(
         3,
