@@ -48,11 +48,23 @@ def sub96(x, y):
 
 
 def mul96(x, y):
+    """Multiply two four-limb integers modulo ``2**96``.
+
+    The former implementation issued one CUDA tensor multiplication for each
+    of the ten nonzero limb pairs.  That launch overhead dominates small
+    operator benchmarks even when the protocol has few communication rounds.
+    Forming the 4x4 outer product and reducing the lower triangular terms keeps
+    the same exact integer arithmetic while reducing the multiplication part to
+    one vectorized CUDA operation plus one reduction.
+    """
+
     x, y = torch.broadcast_tensors(x, y)
-    acc = torch.zeros_like(x)
-    for i in range(4):
-        for j in range(4 - i):
-            acc[..., i + j] += x[..., i] * y[..., j]
+    products = x.unsqueeze(-1) * y.unsqueeze(-2)
+    row = torch.arange(4, device=x.device).reshape(4, 1, 1)
+    column = torch.arange(4, device=x.device).reshape(1, 4, 1)
+    output = torch.arange(4, device=x.device).reshape(1, 1, 4)
+    diagonal_terms = (row + column == output).to(dtype=x.dtype)
+    acc = (products.unsqueeze(-1) * diagonal_terms).sum(dim=(-3, -2))
     return normalize96(acc)
 
 
