@@ -210,6 +210,11 @@ class FuncBenchmarks:
             # mytest for optim
             if func == "approx_relu" or func == "relu":
                 x = torch.rand(1, 1, *self.tensor_size, device=self.device)
+                if func == "relu":
+                    # Exercise both branches of native ReLU. The previous
+                    # torch.rand-only fixture contained no negative values,
+                    # so an incorrect sign comparison could pass unnoticed.
+                    x = 2 * x - 1
                 x_enc = crypten.cryptensor(x)
                 runtime, _ = FuncBenchmarks.time_func(x, "relu", y=second_operand)
                 runtime_enc, _ = FuncBenchmarks.time_func(x_enc, func, y=second_operand_enc)
@@ -335,6 +340,10 @@ class FuncBenchmarks:
                 TRUNCATED_DOMAIN.to(device=self.device),
                 LONG_TRUNCATED_DOMAIN.to(device=self.device)
             )
+        if func == "relu":
+            # The generic DOMAIN is strictly positive. Add its negative
+            # reflection and zero only for the native ReLU correctness test.
+            DOMAIN = torch.cat((-DOMAIN.flip(0), DOMAIN.new_zeros(1), DOMAIN))
         y = torch.rand(DOMAIN.shape, device=self.device)
         DOMAIN_enc, y_enc = crypten.cryptensor(DOMAIN), crypten.cryptensor(y)
         TRUNCATED_DOMAIN_enc = crypten.cryptensor(TRUNCATED_DOMAIN)
