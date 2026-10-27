@@ -18,6 +18,7 @@ from hattention.reference import (
     positive_srelu,
     rsa_attention,
 )
+from hattention.srelu import SReLUProfile
 
 
 class ReferencePathTests(unittest.TestCase):
@@ -40,6 +41,14 @@ class ReferencePathTests(unittest.TestCase):
         legacy = legacy_zero_origin_srelu(value, radius=0.01)
         self.assertAlmostEqual(float(legacy[value.numel() // 2]), 0.0, places=12)
         self.assertLess(float(legacy[0]), 0.0)
+        self.assertTrue(
+            torch.allclose(
+                positive_srelu(value, radius=0.01),
+                legacy + 0.005,
+                atol=1e-15,
+                rtol=0.0,
+            )
+        )
 
     def test_rsa_rows_are_normalized_up_to_epsilon(self):
         q = torch.randn(1, 2, 17, 4, dtype=torch.float64)
@@ -118,6 +127,26 @@ class FixedModuleTests(unittest.TestCase):
 
 
 class FixedPointTests(unittest.TestCase):
+    def test_srelu_profile_two_stage_reference(self):
+        profile = SReLUProfile(radius=0.0055)
+        value = torch.linspace(-16.0, 16.0, 10001, dtype=torch.float64)
+        shifted = profile.shifted_reference(value)
+        corrected = profile.corrected_reference(value)
+        direct = 0.5 * torch.sqrt(value.square() + profile.radius**2) + 0.5 * value
+        self.assertTrue(torch.allclose(corrected, direct, atol=1e-15, rtol=0.0))
+        self.assertTrue(torch.all(corrected >= 0))
+        self.assertAlmostEqual(float(shifted[value.numel() // 2]), 0.0, places=15)
+        self.assertAlmostEqual(
+            float(corrected[value.numel() // 2]),
+            profile.radius / 2,
+            places=15,
+        )
+        self.assertEqual(profile.radius_squared_q16, 2)
+        self.assertEqual(profile.radius_q17, 721)
+        self.assertEqual(profile.half_radius_q17, 360)
+        with self.assertRaises(ValueError):
+            profile.encode(torch.tensor([16.0], dtype=torch.float64))
+
     def test_q17_roundtrip_and_bounds(self):
         profile = FixedPointProfile(
             fraction_bits=17,

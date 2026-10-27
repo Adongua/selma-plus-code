@@ -19,6 +19,14 @@ from .reference import (
     positive_srelu,
     rsa_attention,
 )
+from .srelu import (
+    SReLUMaterial,
+    SReLUProfile,
+    add_public_half_radius,
+    prepare_srelu,
+    ruler_srelu,
+    ruler_srelu_shifted,
+)
 
 __all__ = [
     "FixedHAttention",
@@ -35,6 +43,12 @@ __all__ = [
     "prepare_grouped_lsa_mixer",
     "prepare_lsa",
     "rsa_attention",
+    "SReLUMaterial",
+    "SReLUProfile",
+    "add_public_half_radius",
+    "prepare_srelu",
+    "ruler_srelu",
+    "ruler_srelu_shifted",
     "secure_grouped_lsa_mixer",
     "secure_lsa",
     "secure_matmul",

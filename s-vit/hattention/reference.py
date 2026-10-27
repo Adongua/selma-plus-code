@@ -66,13 +66,23 @@ def rsa_attention(
     if score_scale is None:
         score_scale = q.shape[-1] ** -0.5
     scores = torch.matmul(q, k.transpose(-2, -1)) * score_scale
-    positive = torch.relu(scores) if use_exact_relu else positive_srelu(scores, radius)
+    if use_exact_relu:
+        positive = torch.relu(scores)
+        shifted = positive
+    else:
+        # Keep the manuscript's two-stage convention explicit: first use the
+        # zero-at-origin shifted sReLU, then add the public r/2 before row
+        # normalization.  The resulting weight is non-negative and is
+        # algebraically identical to positive_srelu(scores, radius).
+        shifted = legacy_zero_origin_srelu(scores, radius)
+        positive = shifted + 0.5 * radius
     denominator = positive.sum(dim=-1, keepdim=True) + epsilon
     weights = positive / denominator
     output = torch.matmul(weights, v)
     if return_aux:
         return output, {
             "scores": scores,
+            "shifted_srelu": shifted,
             "positive": positive,
             "denominator": denominator,
             "weights": weights,

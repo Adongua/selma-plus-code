@@ -18,15 +18,23 @@ remaining `14x14`, `16x16`, and `24x24` patch grids.
 
 ## sReLU convention
 
-The method chapter requires RSA weights to be non-negative.  Its default is
+The method chapter writes RSA's activation in two explicit stages.  First use
+the zero-at-origin shifted form
 
 ```text
-(x + sqrt(x^2 + r^2)) / 2, r = 0.0055.
+(x + sqrt(x^2 + r^2) - r) / 2
 ```
 
-The technical draft's legacy appendix subtracts `r/2` to make the origin zero.
-That profile has a small negative tail and is retained only as
-`legacy_zero_origin_srelu`; it is not the default RSA activation.
+Then add the public constant `r/2` to every element before row summation and
+normalization.  Therefore the effective non-negative RSA weight is
+
+```text
+(x + sqrt(x^2 + r^2) - r) / 2 + r / 2
+```
+
+which is algebraically equal to `(x + sqrt(x^2 + r^2)) / 2`, with `r = 0.0055`.
+The intermediate shifted form is retained as `legacy_zero_origin_srelu` for
+auditability; it must not be normalized before the public `r/2` correction.
 
 ## Tests
 
@@ -78,3 +86,32 @@ benchmark is experimental and does not claim production security validation.
 
 Secure RSA normalization, the grouped three-path benchmark, cost-table-driven
 search, pruning, and distillation remain subsequent phases.
+
+## Standalone Ruler-sReLU
+
+`srelu.py` implements the RSA activation as two explicit fixed-point stages:
+
+1. securely compute `(x + sqrt(x^2 + r^2) - r) / 2` with the experimental
+   96-bit Ruler masked-square-root path;
+2. add public `r/2` elementwise before any row sum or reciprocal.
+
+The one-time material contains an independently sampled scale per element, its
+96-bit square, a secret Q50 reciprocal generated during preprocessing, and
+fresh truncation masks. The online result is Q17 and the current fixed-point
+contract requires `|x| < 16`, keeping the pre-truncation square-root recovery
+strictly below the signed-ring bound. To run the smallest CUDA
+smoke test on three GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 \
+TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+python -m hattention.benchmark_srelu_cuda \
+  --shape 1x2x17x17 \
+  --repeats 1 \
+  --output "$HOME/home/tmp/hattention-srelu-smoke"
+```
+
+The report compares the secure result with the continuous two-stage sReLU, a
+reference using the quantized Q16/Q17 public constants, and ordinary ReLU.
+Ruler's masked opening remains experimental and is not presented as a completed
+privacy proof.
