@@ -103,21 +103,30 @@ def _binary_add_mod(left, right, bits: int):
 
     from crypten.mpc.primitives.binary import BinarySharedTensor
 
-    if not 2 <= bits <= 62:
-        raise ValueError("bits must lie in [2,62]")
-    mask = (1 << bits) - 1
-    propagate = (left ^ right) & mask
+    if bits not in (64,) and not 2 <= bits <= 62:
+        raise ValueError("bits must lie in [2,62] or equal 64")
+    # For a full 64-bit signed CUDA tensor, ``2**64 - 1`` cannot be passed to
+    # an int64 bitwise kernel. The tensor already stores the ring element in
+    # the complete 64-bit bit pattern, so omit the redundant full-width mask.
+    full_width = bits == 64
+    mask = None if full_width else (1 << bits) - 1
+    propagate = left ^ right if full_width else (left ^ right) & mask
     original_propagate = propagate.clone()
-    generate = (left & right) & mask
+    generate = left & right if full_width else (left & right) & mask
     distance = 1
     while distance < bits:
         low_mask = (1 << distance) - 1
-        active_mask = mask ^ low_mask
-        active_propagate = propagate & active_mask
+        active_propagate = (
+            propagate & ~low_mask if full_width else propagate & (mask ^ low_mask)
+        )
         shifted = BinarySharedTensor.stack(
             [
-                (generate << distance) & mask,
-                (propagate << distance) & mask,
+                (generate << distance)
+                if full_width
+                else (generate << distance) & mask,
+                (propagate << distance)
+                if full_width
+                else (propagate << distance) & mask,
             ]
         )
         fanout = BinarySharedTensor.stack(
@@ -126,6 +135,8 @@ def _binary_add_mod(left, right, bits: int):
         generate ^= fanout[0]
         propagate = (propagate & low_mask) ^ fanout[1]
         distance <<= 1
+    if full_width:
+        return original_propagate ^ (generate << 1)
     return (original_propagate ^ ((generate << 1) & mask)) & mask
 
 
@@ -141,8 +152,8 @@ def _reduced_ring_drelu(value, bits: int):
         raise ValueError("reduced-ring DReLU requires arithmetic shares")
     if comm.get().get_world_size() != 3:
         raise ValueError("this benchmark adaptation requires exactly three parties")
-    mask = (1 << bits) - 1
-    local_share = value.share & mask
+    mask = None if bits == 64 else (1 << bits) - 1
+    local_share = value.share if mask is None else value.share & mask
     binary_parts = [
         BinarySharedTensor(local_share, src=owner, device=value.device)
         for owner in range(3)
