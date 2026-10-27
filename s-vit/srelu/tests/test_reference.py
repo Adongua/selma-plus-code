@@ -3,6 +3,8 @@ import unittest
 import torch
 
 from srelu import (
+    METHOD_IMPLEMENTATION_CLASS,
+    METHOD_MAIN_TABLE_SCOPE,
     METHOD_PROVENANCE,
     SReLUProfile,
     effective_signed_bits,
@@ -61,6 +63,14 @@ class BaselineReferenceTests(unittest.TestCase):
         )
         self.assertTrue(torch.equal(exact, torch.relu(value)))
         self.assertIn("not the official", METHOD_PROVENANCE["bicoptor2_keybits"])
+        self.assertEqual(
+            METHOD_IMPLEMENTATION_CLASS["crypten_native"],
+            "upstream_native",
+        )
+        self.assertIn(
+            "adapted comparison only",
+            METHOD_MAIN_TABLE_SCOPE["hummingbird_eco"],
+        )
         with self.assertRaises(ValueError):
             method_reference(
                 "unknown",

@@ -17,6 +17,8 @@ import torch.multiprocessing as mp
 from sgelu.runtime_cuda import CudaRing3, CudaRing3Wide
 
 from .baselines import (
+    METHOD_IMPLEMENTATION_CLASS,
+    METHOD_MAIN_TABLE_SCOPE,
     METHOD_PROVENANCE,
     METHOD_YEAR,
     crypten_relu,
@@ -33,6 +35,8 @@ METHODS = (
     "hummingbird_budget",
     "srelu",
 )
+
+EXACT_REFERENCE_METHODS = frozenset(("crypten_native", "hummingbird_eco"))
 
 
 def _parse_shape(value):
@@ -132,6 +136,54 @@ def _error_metrics(actual, expected):
     }
 
 
+def _masked_mean(value, mask):
+    selected = value[mask]
+    return selected.mean().item() if selected.numel() else 0.0
+
+
+def _semantic_diagnostics(actual, source):
+    """Detect fast-but-wrong identity, absolute-value and sign-leakage paths."""
+
+    negative = source < 0
+    nonnegative = ~negative
+    quantum = 1.0 / (1 << 17)
+    return {
+        "all_finite": bool(torch.isfinite(actual).all().item()),
+        "error_vs_identity": _error_metrics(actual, source),
+        "error_vs_absolute_value": _error_metrics(actual, source.abs()),
+        "negative_output_abs_mean": _masked_mean(actual.abs(), negative),
+        "negative_output_nonzero_fraction": _masked_mean(
+            (actual.abs() > quantum).to(torch.float64), negative
+        ),
+        "nonnegative_payload_mae": _masked_mean(
+            (actual - source).abs(), nonnegative
+        ),
+    }
+
+
+def _correctness_gate(method, reference_error, diagnostics, options):
+    threshold = (
+        options["exact_max_abs"]
+        if method in EXACT_REFERENCE_METHODS
+        else options["adapted_max_abs"]
+    )
+    passed = (
+        diagnostics["all_finite"]
+        and reference_error["max_abs"] <= threshold
+    )
+    return {
+        "passed": passed,
+        "reference": (
+            "exact_relu"
+            if method in EXACT_REFERENCE_METHODS
+            else "declared_method_reference"
+        ),
+        "max_abs_threshold": threshold,
+        "observed_max_abs": reference_error["max_abs"],
+        "timing_claim_allowed": passed,
+    }
+
+
 def _plain(value):
     return (value.tensor() if hasattr(value, "tensor") else value).double()
 
@@ -197,11 +249,21 @@ def _method_metadata(options):
         "crypten_native": {
             "year": METHOD_YEAR["crypten_native"],
             "provenance": METHOD_PROVENANCE["crypten_native"],
+            "implementation_class": METHOD_IMPLEMENTATION_CLASS[
+                "crypten_native"
+            ],
+            "main_table_scope": METHOD_MAIN_TABLE_SCOPE["crypten_native"],
             "comparison_bits": 64,
         },
         "bicoptor2_keybits": {
             "year": METHOD_YEAR["bicoptor2_keybits"],
             "provenance": METHOD_PROVENANCE["bicoptor2_keybits"],
+            "implementation_class": METHOD_IMPLEMENTATION_CLASS[
+                "bicoptor2_keybits"
+            ],
+            "main_table_scope": METHOD_MAIN_TABLE_SCOPE[
+                "bicoptor2_keybits"
+            ],
             "comparison_fraction_bits": options["bicoptor_fraction_bits"],
             "comparison_bits": effective_signed_bits(
                 options["input_bound"], options["bicoptor_fraction_bits"]
@@ -210,6 +272,10 @@ def _method_metadata(options):
         "hummingbird_eco": {
             "year": METHOD_YEAR["hummingbird_eco"],
             "provenance": METHOD_PROVENANCE["hummingbird_eco"],
+            "implementation_class": METHOD_IMPLEMENTATION_CLASS[
+                "hummingbird_eco"
+            ],
+            "main_table_scope": METHOD_MAIN_TABLE_SCOPE["hummingbird_eco"],
             "comparison_fraction_bits": 17,
             "comparison_bits": effective_signed_bits(
                 options["input_bound"], 17
@@ -218,6 +284,12 @@ def _method_metadata(options):
         "hummingbird_budget": {
             "year": METHOD_YEAR["hummingbird_budget"],
             "provenance": METHOD_PROVENANCE["hummingbird_budget"],
+            "implementation_class": METHOD_IMPLEMENTATION_CLASS[
+                "hummingbird_budget"
+            ],
+            "main_table_scope": METHOD_MAIN_TABLE_SCOPE[
+                "hummingbird_budget"
+            ],
             "comparison_fraction_bits": options["hummingbird_fraction_bits"],
             "comparison_bits": effective_signed_bits(
                 options["input_bound"], options["hummingbird_fraction_bits"]
@@ -228,6 +300,11 @@ def _method_metadata(options):
             "provenance": (
                 "manuscript Ruler-sReLU using the standalone Ring3 adapter on "
                 "the same CrypTen NCCL process group"
+            ),
+            "implementation_class": "ours_experimental",
+            "main_table_scope": (
+                "eligible after the corrected-sReLU numerical gate and the "
+                "Ruler security caveat are reported"
             ),
             "comparison_bits": None,
         },
@@ -241,8 +318,10 @@ def _summary(report):
         "",
         "All values below exclude warmup. Time, communication and rounds are online only.",
         "",
-        "| Method | Year | Shape | Time (s) | Comm. (KB) | Rounds | MAE vs ReLU | Max error vs ReLU |",
-        "|---|---:|---|---:|---:|---:|---:|---:|",
+        "A method that fails its declared-reference correctness gate is not allowed to make a timing claim.",
+        "",
+        "| Method | Year | Shape | Gate | Time (s) | Comm. (KB) | Rounds | MAE vs ReLU | Max error vs ReLU |",
+        "|---|---:|---|---|---:|---:|---:|---:|---:|",
     ]
     for shape in report["shapes"]:
         shape_records = [
@@ -267,18 +346,30 @@ def _summary(report):
             max_mean = statistics.mean(
                 entry["error_vs_relu"]["max_abs"] for entry in entries
             )
+            valid = all(
+                entry["correctness_gate"]["passed"] for entry in entries
+            )
             shape_text = "(" + ",".join(str(item) for item in shape) + ")"
             year = report["method_metadata"][method]["year"]
+            if valid:
+                performance = (
+                    f"{time_mean:.6f} | {comm_mean:.1f} | "
+                    f"{rounds_mean:.1f}"
+                )
+                gate = "PASS"
+            else:
+                performance = "-- | -- | --"
+                gate = "INVALID"
             lines.append(
-                f"| {method} | {year} | `{shape_text}` | {time_mean:.6f} | "
-                f"{comm_mean:.1f} | {rounds_mean:.1f} | {mae_mean:.6e} | "
-                f"{max_mean:.6e} |"
+                f"| {method} | {year} | `{shape_text}` | {gate} | "
+                f"{performance} | {mae_mean:.6e} | {max_mean:.6e} |"
             )
     lines.extend(
         [
             "",
             "`bicoptor2_keybits` is a same-backend key-bit adaptation, not the official two-round protocol.",
             "`hummingbird_*` are three-party adaptations of the paper's reduced-bit DReLU idea.",
+            "An INVALID row remains in comparison.json for diagnosis, but its timing must not be used in a paper table.",
             "",
         ]
     )
@@ -404,20 +495,29 @@ def worker(rank, rendezvous, options):
                     )
                     if rank == 0:
                         actual = _plain(opened)
+                        reference_error = _error_metrics(
+                            actual,
+                            references[method],
+                        )
+                        diagnostics = _semantic_diagnostics(actual, quantized)
                         row["methods"][method] = {
                             "offline": offline,
                             "online": online,
                             "output_reconstruction": reconstruction,
-                            "error_vs_method_reference": _error_metrics(
-                                actual,
-                                references[method],
-                            ),
+                            "error_vs_method_reference": reference_error,
                             "error_vs_relu": _error_metrics(
                                 actual,
                                 exact_relu,
                             ),
                             "output_min": actual.min().item(),
                             "output_max": actual.max().item(),
+                            "semantic_diagnostics": diagnostics,
+                            "correctness_gate": _correctness_gate(
+                                method,
+                                reference_error,
+                                diagnostics,
+                                options,
+                            ),
                         }
                         if options["progress"]:
                             print(
@@ -434,6 +534,9 @@ def worker(rank, rendezvous, options):
                                         "online_rounds": online[
                                             "rounds_per_rank"
                                         ],
+                                        "correctness_passed": row["methods"][
+                                            method
+                                        ]["correctness_gate"]["passed"],
                                     }
                                 ),
                                 flush=True,
@@ -444,8 +547,23 @@ def worker(rank, rendezvous, options):
         if rank == 0:
             output_directory = Path(options["output"])
             output_directory.mkdir(parents=True, exist_ok=True)
+            invalid_cases = [
+                {
+                    "shape": record["shape"],
+                    "method": method,
+                    "gate": record["methods"][method]["correctness_gate"],
+                }
+                for record in records
+                if not record["warmup"]
+                for method in options["methods"]
+                if not record["methods"][method]["correctness_gate"]["passed"]
+            ]
             report = {
-                "status": "executed_not_security_validated",
+                "status": (
+                    "benchmark_passed"
+                    if not invalid_cases
+                    else "benchmark_failed_correctness"
+                ),
                 "framework": "CrypTen MPCTensor plus standalone Ring3 / NCCL / CUDA",
                 "world_size": 3,
                 "shapes": [list(shape) for shape in options["shapes"]],
@@ -457,6 +575,15 @@ def worker(rank, rendezvous, options):
                 "input_std": options["input_std"],
                 "seed": options["seed"],
                 "reveal_mode": options["reveal_mode"],
+                "correctness_policy": {
+                    "exact_max_abs": options["exact_max_abs"],
+                    "adapted_max_abs": options["adapted_max_abs"],
+                    "invalid_timing_policy": (
+                        "retain raw data for diagnosis but suppress timing in "
+                        "summary and forbid performance claims"
+                    ),
+                },
+                "invalid_cases": invalid_cases,
                 "python": platform.python_version(),
                 "torch": torch.__version__,
                 "fixture": (
@@ -488,6 +615,8 @@ def worker(rank, rendezvous, options):
                         "report": str(report_path),
                         "summary": str(summary_path),
                         "records": len(records),
+                        "status": report["status"],
+                        "invalid_cases": len(invalid_cases),
                     },
                     indent=2,
                 ),
@@ -504,7 +633,7 @@ def main():
         "--shapes",
         nargs="+",
         type=_parse_shape,
-        default=[(1, 1, 197, 197)],
+        default=[(1, 197), (1, 257), (1, 577), (8, 257)],
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--seed", type=int, default=20261027)
@@ -513,6 +642,8 @@ def main():
     parser.add_argument("--radius", type=float, default=0.0055)
     parser.add_argument("--hummingbird-fraction-bits", type=int, default=8)
     parser.add_argument("--bicoptor-fraction-bits", type=int, default=2)
+    parser.add_argument("--exact-max-abs", type=float, default=1e-3)
+    parser.add_argument("--adapted-max-abs", type=float, default=5e-3)
     parser.add_argument(
         "--methods",
         nargs="+",
@@ -543,6 +674,10 @@ def main():
         parser.error("hummingbird-fraction-bits must lie in [0,17]")
     if not 0 <= args.bicoptor_fraction_bits <= 17:
         parser.error("bicoptor-fraction-bits must lie in [0,17]")
+    if args.exact_max_abs <= 0 or not math.isfinite(args.exact_max_abs):
+        parser.error("exact-max-abs must be positive and finite")
+    if args.adapted_max_abs <= 0 or not math.isfinite(args.adapted_max_abs):
+        parser.error("adapted-max-abs must be positive and finite")
     if torch.cuda.device_count() < 3:
         parser.error("at least three visible CUDA devices are required")
 
@@ -561,6 +696,14 @@ def main():
             nprocs=3,
             join=True,
         )
+    report_path = args.output / "comparison.json"
+    if report_path.exists():
+        status = json.loads(report_path.read_text())["status"]
+        if status != "benchmark_passed":
+            raise SystemExit(
+                "benchmark completed but failed correctness gates; inspect "
+                f"{report_path}"
+            )
 
 
 if __name__ == "__main__":

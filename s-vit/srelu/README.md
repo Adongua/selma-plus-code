@@ -65,7 +65,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 \
 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
 timeout 600 \
 python -m srelu.benchmark_crypten_cuda \
-  --shapes 1x1x17x17 \
+  --shapes 1x17 \
   --repeats 1 \
   --methods crypten_native bicoptor2_keybits hummingbird_eco hummingbird_budget srelu \
   --output "$HOME/home/tmp/srelu-cuda-smoke"
@@ -73,14 +73,14 @@ python -m srelu.benchmark_crypten_cuda \
 
 ## Formal operator benchmark
 
-Run the main four methods on ViT attention-score shapes with three repeats:
+Run the main four methods on the same shapes as the sGeLU microbenchmark:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2 \
 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
 timeout 7200 \
 python -m srelu.benchmark_crypten_cuda \
-  --shapes 1x1x197x197 1x1x257x257 1x1x577x577 \
+  --shapes 1x197 1x257 1x577 8x257 \
   --repeats 3 \
   --methods crypten_native bicoptor2_keybits hummingbird_eco srelu \
   --output "$HOME/home/tmp/srelu-cuda-main"
@@ -91,6 +91,17 @@ warmup and reports online wall time, normalized system-sent payload bytes,
 rounds, MAE and maximum error against exact ReLU.  CrypTen provider work is
 included in the CrypTen method's online interval; Ruler-sReLU preprocessing is
 reported separately as offline work.
+
+The benchmark is correctness-gated. Exact methods must match ReLU within
+`1e-3`; adapted methods and sReLU must match their declared method reference
+within `5e-3`. A failed method remains in `comparison.json` for diagnosis, but
+its performance cells are replaced by `INVALID` in `summary.md`, and the
+command exits unsuccessfully. The JSON also records error versus identity and
+absolute-value mappings, negative-output leakage and positive-payload error to
+detect fast but semantically incorrect comparison paths.
+
+The fairness and claim policy is recorded in
+[`../../plan/experiment-protocol.md`](../../plan/experiment-protocol.md).
 
 The code is experimental.  Ruler masked openings are not privacy validated,
 the adapted baselines are not official implementations of their cited papers,

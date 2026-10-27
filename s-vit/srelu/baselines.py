@@ -49,6 +49,29 @@ METHOD_PROVENANCE = {
     ),
 }
 
+METHOD_IMPLEMENTATION_CLASS = {
+    "crypten_native": "upstream_native",
+    "bicoptor2_keybits": "paper_idea_adapted_3pc",
+    "hummingbird_eco": "paper_idea_adapted_3pc",
+    "hummingbird_budget": "engineering_ablation",
+}
+
+METHOD_MAIN_TABLE_SCOPE = {
+    "crypten_native": (
+        "eligible only after the unmodified upstream output passes the exact-"
+        "ReLU correctness gate"
+    ),
+    "bicoptor2_keybits": (
+        "adapted comparison only; must not be labelled as the official "
+        "Bicoptor 2.0 two-round implementation"
+    ),
+    "hummingbird_eco": (
+        "adapted comparison only; must not reuse timing numbers from the "
+        "paper's two-party experiments"
+    ),
+    "hummingbird_budget": "ablation only; excluded from the main comparison",
+}
+
 
 def effective_signed_bits(input_bound: float, fraction_bits: int) -> int:
     """Smallest signed ring width covering ``|x| < input_bound``."""

@@ -1,6 +1,8 @@
 """Standalone secure smooth-ReLU protocol and comparison baselines."""
 
 from .baselines import (
+    METHOD_IMPLEMENTATION_CLASS,
+    METHOD_MAIN_TABLE_SCOPE,
     METHOD_PROVENANCE,
     METHOD_YEAR,
     METHODS,
@@ -19,6 +21,8 @@ from .protocol import (
 
 __all__ = [
     "METHOD_PROVENANCE",
+    "METHOD_IMPLEMENTATION_CLASS",
+    "METHOD_MAIN_TABLE_SCOPE",
     "METHOD_YEAR",
     "METHODS",
     "SReLUMaterial",
