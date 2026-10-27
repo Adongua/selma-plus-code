@@ -7,6 +7,7 @@ from srelu import (
     METHOD_MAIN_TABLE_SCOPE,
     METHOD_PROVENANCE,
     SReLUProfile,
+    crypten_native_relu,
     effective_signed_bits,
     method_reference,
     quantized_drelu_reference,
@@ -34,6 +35,19 @@ class SReLUReferenceTests(unittest.TestCase):
 
 
 class BaselineReferenceTests(unittest.TestCase):
+    def test_crypten_native_baseline_calls_relu_method_directly(self):
+        class NativeTensorSpy:
+            def __init__(self):
+                self.called = False
+
+            def relu(self):
+                self.called = True
+                return "native-result"
+
+        value = NativeTensorSpy()
+        self.assertEqual(crypten_native_relu(value), "native-result")
+        self.assertTrue(value.called)
+
     def test_effective_signed_widths(self):
         self.assertEqual(effective_signed_bits(16.0, 17), 22)
         self.assertEqual(effective_signed_bits(16.0, 8), 13)

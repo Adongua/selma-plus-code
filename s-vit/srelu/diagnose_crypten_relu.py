@@ -8,15 +8,11 @@ the CrypTen benchmark launcher rather than creating a separate NCCL group.
 
 import argparse
 import json
-import os
 from pathlib import Path
 import platform
 import sys
-import tempfile
 
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 
 def _assert_vendored_crypten(crypten):
@@ -82,92 +78,77 @@ def _describe(value):
     }
 
 
-def worker(rank, rendezvous, options):
+def worker(options):
+    """Run inside CrypTen's own MultiProcessLauncher worker."""
+    import crypten
+    import crypten.communicator as comm
+
+    rank = comm.get().get_rank()
     use_cuda = options["device"] == "cuda"
-    device = torch.device(f"cuda:{rank}" if use_cuda else "cpu")
+    # Match benchmark.py's --device cuda behavior by default: each party uses
+    # the default CUDA device unless the caller launches a multi-GPU variant.
+    device = torch.device("cuda" if use_cuda else "cpu")
     if use_cuda:
         torch.cuda.set_device(device)
-    os.environ.update(
-        RANK=str(rank),
-        WORLD_SIZE="3",
-        RENDEZVOUS=rendezvous,
-        # Match the legacy benchmark launcher, which uses CrypTen's default
-        # Gloo communicator even when the input tensors are on CUDA.
-        DISTRIBUTED_BACKEND="gloo",
-    )
-
-    benchmark_crypten_parent = (
-        Path(__file__).resolve().parents[2]
-        / "CrypTen-main"
-        / "benchmarks"
-    ).resolve()
-    sys.path.insert(0, str(benchmark_crypten_parent))
-    import crypten
 
     crypten_path = _assert_vendored_crypten(crypten)
-    # Matches MultiProcessLauncher._run_process in the legacy benchmark.
-    crypten.init()
-    try:
-        plain = _fixture(options["shape"]).to(device)
-        encrypted = crypten.cryptensor(
-            plain,
-            src=0,
-            precision=17,
-            device=device,
+    plain = _fixture(options["shape"]).to(device)
+    encrypted = crypten.cryptensor(
+        plain,
+        src=0,
+        precision=17,
+        device=device,
+    )
+    operations = {
+        "ltz_private": lambda x: x._ltz(),
+        "ge_zero": lambda x: x.ge(0),
+        "relu_native": lambda x: x.relu(),
+    }
+    expected = {
+        "ltz_private": (plain < 0).to(torch.float64).cpu(),
+        "ge_zero": (plain >= 0).to(torch.float64).cpu(),
+        "relu_native": torch.relu(plain).cpu(),
+    }
+
+    row = {
+        "rank": rank,
+        "crypten_import": crypten_path,
+        "device": str(device),
+        "input": plain.cpu().reshape(-1).tolist(),
+        "encrypted": _describe(encrypted),
+        "operations": {},
+    }
+    for name, operation in operations.items():
+        output = operation(encrypted.clone())
+        opened = _plain(output)
+        row["operations"][name] = {
+            "output": opened.reshape(-1).tolist(),
+            "output_description": _describe(output),
+        }
+        row["operations"][name]["metrics"] = _metrics(
+            opened,
+            expected[name],
         )
-        operations = {
-            "ltz_private": lambda x: x._ltz(),
-            "ge_zero": lambda x: x.ge(0),
-            "relu_native": lambda x: x.relu(),
-        }
-        expected = {
-            "ltz_private": (plain < 0).to(torch.float64).cpu(),
-            "ge_zero": (plain >= 0).to(torch.float64).cpu(),
-            "relu_native": torch.relu(plain).cpu(),
-        }
 
-        row = {
-            "rank": rank,
-            "crypten_import": crypten_path,
-            "device": str(device),
-            "input": plain.cpu().reshape(-1).tolist(),
-            "encrypted": _describe(encrypted),
-            "operations": {},
+    if rank == 0:
+        output_path = Path(options["output"])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        report = {
+            "status": "diagnostic_complete",
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "backend": "Gloo/CUDA" if use_cuda else "Gloo/CPU",
+            "world_size": 3,
+            "shape": list(options["shape"]),
+            "row": row,
+            "note": (
+                "Launched with the same CrypTen MultiProcessLauncher and "
+                "default Gloo backend as CrypTen-main/benchmarks/benchmark.py. "
+                "Calls unmodified MPCTensor methods; no adapter or sReLU."
+            ),
         }
-        for name, operation in operations.items():
-            output = operation(encrypted.clone())
-            opened = _plain(output)
-            row["operations"][name] = {
-                "output": opened.reshape(-1).tolist(),
-                "output_description": _describe(output),
-            }
-            row["operations"][name]["metrics"] = _metrics(
-                opened,
-                expected[name],
-            )
-
-        gathered = [None, None, None]
-        dist.all_gather_object(gathered, row)
-        if rank == 0:
-            output = Path(options["output"])
-            output.parent.mkdir(parents=True, exist_ok=True)
-            report = {
-                "status": "diagnostic_complete",
-                "python": platform.python_version(),
-                "torch": torch.__version__,
-                "backend": "Gloo/CUDA" if use_cuda else "Gloo/CPU",
-                "world_size": 3,
-                "shape": list(options["shape"]),
-                "rows": gathered,
-                "note": (
-                    "This diagnostic calls the unmodified CrypTen methods. "
-                    "It does not use the full-width adapter or sReLU."
-                ),
-            }
-            output.write_text(json.dumps(report, indent=2) + "\n")
-            print(json.dumps(report, indent=2), flush=True)
-    finally:
-        crypten.uninit()
+        output_path.write_text(json.dumps(report, indent=2) + "\n")
+        print(json.dumps(report, indent=2), flush=True)
 
 
 def main():
@@ -181,21 +162,34 @@ def main():
 
     args.output = args.output.resolve()
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    benchmark_crypten_parent = (
+        Path(__file__).resolve().parents[2]
+        / "CrypTen-main"
+        / "benchmarks"
+    ).resolve()
+    sys.path.insert(0, str(benchmark_crypten_parent))
+    import crypten
+    from examples import multiprocess_launcher
+
     options = {
         "device": args.device,
         "shape": args.shape,
         "output": str(args.output),
     }
-    with tempfile.TemporaryDirectory(
-        prefix="crypten-relu-diagnostic-",
-        dir=args.output.parent,
-    ) as directory:
-        mp.spawn(
-            worker,
-            args=(Path(directory, "store").as_uri(), options),
-            nprocs=3,
-            join=True,
-        )
+    # Mirror benchmark.py: initialize CrypTen in the parent, then use its own
+    # launcher, which configures child processes with the default Gloo backend.
+    crypten.init()
+    launcher = multiprocess_launcher.MultiProcessLauncher(
+        3,
+        worker,
+        fn_args=options,
+    )
+    try:
+        launcher.start()
+        launcher.join()
+    finally:
+        launcher.terminate()
+        crypten.uninit()
 
 
 if __name__ == "__main__":

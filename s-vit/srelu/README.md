@@ -114,8 +114,11 @@ detect fast but semantically incorrect comparison paths.
 The benchmark records `crypten_import` and requires the
 `CrypTen-main/benchmarks/crypten` package, matching the legacy benchmark's
 import resolution. Its native baseline calls `MPCTensor.relu()` directly.
-This microbenchmark retains signed normal inputs to validate negative-value
-behavior; the legacy benchmark's ReLU timing/error inputs are nonnegative.
+The standalone diagnostic below uses the same CrypTen `MultiProcessLauncher`
+and default Gloo backend as `CrypTen-main/benchmarks/benchmark.py`. The unified
+CUDA microbenchmark instead uses NCCL for all methods so its method timings
+share one transport. Do not compare those Gloo and NCCL timings as one
+controlled experiment.
 
 To isolate a native-ReLU failure, run the diagnostic separately on CPU/Gloo
 and CUDA/Gloo. CUDA tensor placement is retained, while CrypTen communication
