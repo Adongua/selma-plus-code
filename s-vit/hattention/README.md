@@ -87,31 +87,11 @@ benchmark is experimental and does not claim production security validation.
 Secure RSA normalization, the grouped three-path benchmark, cost-table-driven
 search, pruning, and distillation remain subsequent phases.
 
-## Standalone Ruler-sReLU
+## Standalone sReLU dependency
 
-`srelu.py` implements the RSA activation as two explicit fixed-point stages:
-
-1. securely compute `(x + sqrt(x^2 + r^2) - r) / 2` with the experimental
-   96-bit Ruler masked-square-root path;
-2. add public `r/2` elementwise before any row sum or reciprocal.
-
-The one-time material contains an independently sampled scale per element, its
-96-bit square, a secret Q50 reciprocal generated during preprocessing, and
-fresh truncation masks. The online result is Q17 and the current fixed-point
-contract requires `|x| < 16`, keeping the pre-truncation square-root recovery
-strictly below the signed-ring bound. To run the smallest CUDA
-smoke test on three GPUs:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2 \
-TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
-python -m hattention.benchmark_srelu_cuda \
-  --shape 1x2x17x17 \
-  --repeats 1 \
-  --output "$HOME/home/tmp/hattention-srelu-smoke"
-```
-
-The report compares the secure result with the continuous two-stage sReLU, a
-reference using the quantized Q16/Q17 public constants, and ordinary ReLU.
-Ruler's masked opening remains experimental and is not presented as a completed
-privacy proof.
+The secure sReLU protocol no longer lives inside this attention package.  Its
+Ruler implementation, one-time material, recent ReLU baselines and CUDA
+microbenchmark are isolated in [`../srelu`](../srelu/README.md).  hAttention
+will import that package when the secure RSA normalization path is connected;
+the plaintext `positive_srelu` formula remains here as part of the RSA
+reference definition.

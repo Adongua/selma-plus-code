@@ -1,4 +1,4 @@
-"""Ruler-based secure smooth ReLU for hAttention RSA.
+"""Standalone Ruler-based secure smooth ReLU protocol.
 
 The protocol follows the manuscript's two-stage convention:
 

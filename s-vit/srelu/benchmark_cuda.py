@@ -1,4 +1,7 @@
-"""Three-party CUDA/NCCL microbenchmark for hAttention Ruler-sReLU."""
+"""Legacy standalone three-party CUDA/NCCL benchmark for Ruler-sReLU.
+
+Use :mod:`srelu.benchmark_crypten_cuda` for the unified baseline comparison.
+"""
 
 import argparse
 from datetime import timedelta
@@ -15,7 +18,7 @@ import torch.multiprocessing as mp
 
 from sgelu.runtime_cuda import CudaRing3, CudaRing3Wide
 
-from .srelu import SReLUProfile, prepare_srelu, ruler_srelu
+from .protocol import SReLUProfile, prepare_srelu, ruler_srelu
 
 
 def _parse_shape(value):
@@ -225,7 +228,7 @@ def main():
     options = vars(args).copy()
     options["output"] = str(args.output)
     with tempfile.TemporaryDirectory(
-        prefix="hattention-srelu-cuda-", dir=args.output.parent
+        prefix="srelu-cuda-", dir=args.output.parent
     ) as directory:
         mp.spawn(
             _worker,

@@ -18,7 +18,7 @@ from hattention.reference import (
     positive_srelu,
     rsa_attention,
 )
-from hattention.srelu import SReLUProfile
+from srelu import SReLUProfile
 
 
 class ReferencePathTests(unittest.TestCase):
