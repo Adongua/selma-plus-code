@@ -22,10 +22,14 @@ input/output, a Q16 radicand and a Q50 secret reciprocal.  It requires
 
 ## Compared methods
 
-- `crypten_native` (CrypTen-compatible, 2021): correctness-repaired full-width
-  64-bit A2B sign extraction, B2A and secret selection. The vendored CUDA
-  `MPCTensor.relu()` path is excluded because its three-party smoke test
-  returned the input unchanged.
+- `crypten_native` (CrypTen, 2021): the strict unmodified
+  `MPCTensor.relu()` call. If the current CrypTen/CUDA combination returns an
+  incorrect result, the benchmark records the raw result but suppresses its
+  timing claim.
+- `crypten_fullwidth_adapter` (engineering diagnostic): a separate
+  correctness-repaired 64-bit A2B/B2A implementation built from CrypTen
+  primitives. It is not the official `MPCTensor.relu()` implementation and
+  is excluded from the strict native comparison.
 - `bicoptor2_keybits` (Bicoptor 2.0, 2023): a same-backend structural
   adaptation of its key-bit precision policy.  It is not the paper's official
   UBL/RSS two-round protocol and is not an independent security claim.
@@ -106,6 +110,9 @@ its performance cells are replaced by `INVALID` in `summary.md`, and the
 command exits unsuccessfully. The JSON also records error versus identity and
 absolute-value mappings, negative-output leakage and positive-payload error to
 detect fast but semantically incorrect comparison paths.
+
+The benchmark also records `crypten_import` and refuses to run if Python
+resolves `crypten` outside this repository's `CrypTen-main/crypten` directory.
 
 The fairness and claim policy is recorded in
 [`../../plan/experiment-protocol.md`](../../plan/experiment-protocol.md).
