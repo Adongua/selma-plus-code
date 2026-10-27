@@ -299,7 +299,8 @@ def _method_metadata(options):
             "year": 2026,
             "provenance": (
                 "manuscript Ruler-sReLU using the standalone Ring3 adapter on "
-                "the same CrypTen NCCL process group"
+                "the same CrypTen NCCL process group; its square truncation is "
+                "lifted to Q96 during preprocessing to remove one online phase"
             ),
             "implementation_class": "ours_experimental",
             "main_table_scope": (
@@ -653,7 +654,7 @@ def main():
     parser.add_argument(
         "--reveal-mode",
         choices=("all_reduce", "all_gather", "p2p"),
-        default="p2p",
+        default="all_reduce",
     )
     parser.add_argument(
         "--no-progress",

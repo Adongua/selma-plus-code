@@ -1,8 +1,12 @@
 """Recent secure-ReLU baselines for the unified three-party benchmark.
 
-The CrypTen-native path is upstream CrypTen's full-width comparison.  The
-HummingBird paths implement a reduced-ring arithmetic-to-binary conversion so
-the comparison circuit depth and payload depend on the retained bit width.
+The full-width CrypTen path uses CrypTen's binary sharing, B2A conversion and
+Beaver multiplication, but supplies an explicit 64-bit A2B / sign circuit.
+This matters because the vendored CrypTen CUDA ``MPCTensor.relu()`` path
+silently returned the input unchanged in our three-party NCCL smoke test. It
+is therefore retained only as a diagnostic fact, never as a timed baseline.
+The HummingBird paths use the same circuit in a public-bound reduced ring, so
+their circuit depth and payload depend on the retained bit width.
 
 ``bicoptor2_keybits`` deliberately implements only Bicoptor 2.0's public
 key-bit precision policy on the same reduced-ring CrypTen backend.  It is not
@@ -31,8 +35,9 @@ METHOD_YEAR = {
 
 METHOD_PROVENANCE = {
     "crypten_native": (
-        "CrypTen MPCTensor full-width A2B, sign extraction, B2A and secret "
-        "selection"
+        "Correctness-repaired CrypTen full-width 64-bit A2B, sign extraction, "
+        "B2A and Beaver secret selection; direct vendored MPCTensor.relu() "
+        "CUDA is excluded after returning identity"
     ),
     "hummingbird_eco": (
         "HummingBird-eco adapted to three-party CrypTen: reduced-ring DReLU "
@@ -50,7 +55,7 @@ METHOD_PROVENANCE = {
 }
 
 METHOD_IMPLEMENTATION_CLASS = {
-    "crypten_native": "upstream_native",
+    "crypten_native": "crypten_fullwidth_adapter",
     "bicoptor2_keybits": "paper_idea_adapted_3pc",
     "hummingbird_eco": "paper_idea_adapted_3pc",
     "hummingbird_budget": "engineering_ablation",
@@ -58,8 +63,8 @@ METHOD_IMPLEMENTATION_CLASS = {
 
 METHOD_MAIN_TABLE_SCOPE = {
     "crypten_native": (
-        "eligible only after the unmodified upstream output passes the exact-"
-        "ReLU correctness gate"
+        "eligible as a CrypTen-compatible full-width reference; do not label "
+        "it as an unmodified upstream CUDA MPCTensor.relu() measurement"
     ),
     "bicoptor2_keybits": (
         "adapted comparison only; must not be labelled as the official "
@@ -165,7 +170,16 @@ def _requantize(value, fraction_bits: int):
 
 
 def crypten_native_relu(value, **_):
-    return value.relu()
+    """Correct full-width ReLU on CrypTen primitives.
+
+    The direct vendored ``value.relu()`` implementation is intentionally not
+    called here: under CUDA/NCCL three-party execution it passed every negative
+    input through unchanged. A 64-bit version of the exact same A2B/B2A
+    construction used by the reduced-ring adapters gives a meaningful,
+    correctness-gated full-width CrypTen reference.
+    """
+
+    return value * _reduced_ring_drelu(value, bits=64)
 
 
 def hummingbird_eco_relu(value, *, input_bound: float, **_):

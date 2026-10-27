@@ -22,8 +22,10 @@ input/output, a Q16 radicand and a Q50 secret reciprocal.  It requires
 
 ## Compared methods
 
-- `crypten_native` (CrypTen, 2021): upstream full-width A2B sign extraction,
-  B2A and secret selection.
+- `crypten_native` (CrypTen-compatible, 2021): correctness-repaired full-width
+  64-bit A2B sign extraction, B2A and secret selection. The vendored CUDA
+  `MPCTensor.relu()` path is excluded because its three-party smoke test
+  returned the input unchanged.
 - `bicoptor2_keybits` (Bicoptor 2.0, 2023): a same-backend structural
   adaptation of its key-bit precision policy.  It is not the paper's official
   UBL/RSS two-round protocol and is not an independent security claim.
@@ -39,6 +41,11 @@ The reduced-ring methods use the same CrypTen NCCL process group and convert
 the sign bit back to an arithmetic share before selecting the original Q17
 payload.  Their prefix-adder depth is `ceil(log2(k))` for a public `k`-bit
 ring, instead of always converting a full 64-bit word.
+
+The sReLU benchmark defaults to `--reveal-mode all_reduce`: masked
+reconstructions are revealed to all three parties and a collective completes
+that reconstruction in one NCCL phase. `p2p` remains available only as a
+transport ablation and is not the default performance setting.
 
 Mosformer is not included in this same-backend main table: its maliciously
 secure 3PC model and incomplete public offline implementation would make a

@@ -16,14 +16,18 @@ It does not treat adapted code as an official implementation of another paper.
 
 ## Baselines and fairness
 
-- CrypTen-native: unmodified upstream `MPCTensor.relu()`; eligible only when it
-  passes the exact-ReLU correctness gate.
+- CrypTen-compatible full-width: explicit 64-bit A2B/sign/B2A ReLU using
+  CrypTen primitives. The direct vendored CUDA `MPCTensor.relu()` path is a
+  failed diagnostic (identity output), not an eligible timed baseline.
 - Bicoptor2-keybits: same-backend 3PC adaptation of the key-bit precision idea,
   not the official two-round UBL/RSS implementation.
 - HummingBird-eco: same-backend 3PC adaptation of reduced-width DReLU; official
   two-party timing numbers are not reused.
 - HummingBird-budget: accuracy/performance ablation only.
 - sReLU: manuscript Ruler path; its masked-opening security caveat is retained.
+
+The sReLU path uses NCCL `all_reduce` for masked all-party reconstructions by
+default. `p2p` is retained only as a separately labelled transport ablation.
 
 No baseline may be delayed with sleeps, redundant communication, intentionally
 slow kernels or adverse parameters.  Conversely, a baseline may not silently
@@ -48,7 +52,7 @@ reported as a separate optimized-adaptation ablation.
   declared method reference at most `5e-3`.
 - Non-finite output always fails.
 - Failed methods remain in raw JSON for diagnosis, but their time,
-  communication and round values are suppressed from the Markdown comparison.
+communication and round values are suppressed from the Markdown comparison.
 
 ## Allowed claims
 

@@ -19,11 +19,19 @@ import torch
 from sgelu.protocol import (
     extend_online,
     extension_material,
+    logical_shift,
     prob_trunc,
     prob_trunc_material,
     sample_scale,
 )
-from sgelu.wide import isqrt_from_limbs
+from sgelu.wide import (
+    add96,
+    isqrt_from_limbs,
+    limbs_from_uint64,
+    mul96,
+    sub96,
+    to_limbs,
+)
 
 
 @dataclass(frozen=True)
@@ -182,8 +190,7 @@ class SReLUMaterial:
     profile: SReLUProfile
     squared_scale96: torch.Tensor
     reciprocal_scale_q50: torch.Tensor
-    value_extension: tuple
-    value_truncation: tuple
+    value_truncation: "TruncationToWideMaterial"
     sqrt_truncation: tuple
     half_truncation: tuple
     used: bool = False
@@ -198,6 +205,60 @@ class SReLUMaterial:
         if value.dtype != torch.int64 or value.device != base.device:
             raise ValueError(f"expected an int64 Q17 share on {base.device}")
         self.used = True
+
+
+@dataclass
+class TruncationToWideMaterial:
+    """Preprocessed correlation for a truncation whose result stays in Q96.
+
+    ``prob_trunc`` normally reconstructs a masked value and sReLU then performs
+    another masked reconstruction to lift the result from the 64-bit ring to
+    Q96. The high mask and carry bit are independent preprocessing values, so
+    we lift them during preprocessing and form the same truncated share directly
+    in Q96 after the single online reconstruction.
+    """
+
+    truncation: tuple
+    high96: torch.Tensor
+    top96: torch.Tensor
+
+
+def _prepare_truncation_to_wide(base, wide, shape, shift):
+    """Prepare a probabilistic truncation whose online output is Q96."""
+
+    truncation = prob_trunc_material(base, shape, shift)
+    _, high, top = truncation
+    # These lifts consume only fresh random preprocessing masks. Their masked
+    # openings belong to the offline phase and remove one online extension.
+    high96 = extend_online(base, wide, high, extension_material(base, wide, shape))
+    top96 = extend_online(base, wide, top, extension_material(base, wide, shape))
+    return TruncationToWideMaterial(truncation, high96, top96)
+
+
+def _prob_trunc_to_wide(base, wide, value, shift, material):
+    """Apply ``prob_trunc`` and return the exact result as a Q96 sharing."""
+
+    if not 1 <= shift <= 62:
+        raise ValueError("truncation shift must be in [1,62]")
+    mask, _, _ = material.truncation
+    opened = base.reveal(value + base.public(1 << 62) + mask)
+    public_shifted = logical_shift(opened, shift)
+    # ``top`` is secret; the wrap predicate is public after opening the masked
+    # value. Multiplication by its public Q96 constant is local at every party.
+    wrap_multiplier = (1 - logical_shift(opened, 63)) << (64 - shift)
+    public_offset = to_limbs(1 << (62 - shift), device=base.device).expand(
+        tuple(value.shape) + (4,)
+    )
+    return sub96(
+        add96(
+            sub96(
+                wide.public(limbs_from_uint64(public_shifted)),
+                material.high96,
+            ),
+            mul96(material.top96, limbs_from_uint64(wrap_multiplier)),
+        ),
+        wide.public(public_offset),
+    )
 
 
 def prepare_srelu(
@@ -227,8 +288,12 @@ def prepare_srelu(
         profile=profile,
         squared_scale96=squared_scale96,
         reciprocal_scale_q50=reciprocal_scale_q50,
-        value_extension=extension_material(base, wide, shape),
-        value_truncation=prob_trunc_material(base, shape, profile.square_shift),
+        value_truncation=_prepare_truncation_to_wide(
+            base,
+            wide,
+            shape,
+            profile.square_shift,
+        ),
         sqrt_truncation=prob_trunc_material(base, shape, profile.sqrt_shift),
         half_truncation=prob_trunc_material(base, shape, 1),
     )
@@ -247,24 +312,21 @@ def ruler_srelu_shifted(
     material.consume(base, wide, value_q17)
     profile = material.profile
     square_q34 = base.square(value_q17)
-    value_q16 = prob_trunc(
+    value96 = _prob_trunc_to_wide(
         base,
+        wide,
         square_q34,
         profile.square_shift,
         material.value_truncation,
-    ) + base.public(
-        torch.full(
-            material.shape,
-            profile.radius_squared_q16,
-            dtype=torch.int64,
-            device=base.device,
-        )
     )
-    value96 = extend_online(
-        base,
-        wide,
-        value_q16,
-        material.value_extension,
+    value96 = add96(
+        value96,
+        wide.public(
+            to_limbs(
+                profile.radius_squared_q16,
+                device=base.device,
+            ).expand(material.shape + (4,))
+        ),
     )
     opened = wide.reveal(wide.mul(material.squared_scale96, value96))
     root = isqrt_from_limbs(opened).reshape(material.shape)
