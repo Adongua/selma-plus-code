@@ -2,7 +2,8 @@
 
 This runner intentionally calls ``MPCTensor._ltz()``, ``ge(0)`` and
 ``relu()`` separately.  It is useful for distinguishing a binary-sharing
-comparison bug from a ReLU wrapper bug on CPU/Gloo versus CUDA/NCCL.
+comparison bug from a ReLU wrapper bug on CPU/Gloo versus CUDA/Gloo, mirroring
+the CrypTen benchmark launcher rather than creating a separate NCCL group.
 """
 
 import argparse
@@ -10,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import sys
 import tempfile
 
 import torch
@@ -19,12 +21,15 @@ import torch.multiprocessing as mp
 
 def _assert_vendored_crypten(crypten):
     expected = (
-        Path(__file__).resolve().parents[2] / "CrypTen-main" / "crypten"
+        Path(__file__).resolve().parents[2]
+        / "CrypTen-main"
+        / "benchmarks"
+        / "crypten"
     ).resolve()
     actual = Path(crypten.__file__).resolve().parent
     if actual != expected:
         raise RuntimeError(
-            f"Expected repository CrypTen at {expected}, imported {actual}"
+            f"Expected benchmark CrypTen at {expected}, imported {actual}"
         )
     return str(actual / "__init__.py")
 
@@ -86,13 +91,22 @@ def worker(rank, rendezvous, options):
         RANK=str(rank),
         WORLD_SIZE="3",
         RENDEZVOUS=rendezvous,
-        DISTRIBUTED_BACKEND="nccl" if use_cuda else "gloo",
+        # Match the legacy benchmark launcher, which uses CrypTen's default
+        # Gloo communicator even when the input tensors are on CUDA.
+        DISTRIBUTED_BACKEND="gloo",
     )
 
+    benchmark_crypten_parent = (
+        Path(__file__).resolve().parents[2]
+        / "CrypTen-main"
+        / "benchmarks"
+    ).resolve()
+    sys.path.insert(0, str(benchmark_crypten_parent))
     import crypten
 
     crypten_path = _assert_vendored_crypten(crypten)
-    crypten.init(device=device)
+    # Matches MultiProcessLauncher._run_process in the legacy benchmark.
+    crypten.init()
     try:
         plain = _fixture(options["shape"]).to(device)
         encrypted = crypten.cryptensor(
@@ -141,7 +155,7 @@ def worker(rank, rendezvous, options):
                 "status": "diagnostic_complete",
                 "python": platform.python_version(),
                 "torch": torch.__version__,
-                "backend": "NCCL/CUDA" if use_cuda else "Gloo/CPU",
+                "backend": "Gloo/CUDA" if use_cuda else "Gloo/CPU",
                 "world_size": 3,
                 "shape": list(options["shape"]),
                 "rows": gathered,

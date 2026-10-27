@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import statistics
+import sys
 import tempfile
 import time
 
@@ -195,15 +196,18 @@ def _assert_vendored_crypten(crypten):
     """Prevent silently benchmarking a different CrypTen installation."""
 
     expected = (
-        Path(__file__).resolve().parents[2] / "CrypTen-main" / "crypten"
+        Path(__file__).resolve().parents[2]
+        / "CrypTen-main"
+        / "benchmarks"
+        / "crypten"
     ).resolve()
     actual = Path(crypten.__file__).resolve().parent
     if actual != expected:
         raise RuntimeError(
-            "This benchmark requires the repository CrypTen-main package. "
+            "This benchmark requires the benchmark-local CrypTen package. "
             f"Expected {expected}, imported {actual}. Set PYTHONPATH to "
-            "'$PWD/s-vit:$PWD/CrypTen-main' or audit the other installation "
-            "before overriding this check."
+            "'$PWD/s-vit:$PWD/CrypTen-main/benchmarks'; this matches the "
+            "import selected by CrypTen-main/benchmarks/benchmark.py."
         )
     return str(actual / "__init__.py")
 
@@ -419,6 +423,12 @@ def worker(rank, rendezvous, options):
         RENDEZVOUS=rendezvous,
         DISTRIBUTED_BACKEND="nccl",
     )
+    benchmark_crypten_parent = (
+        Path(__file__).resolve().parents[2]
+        / "CrypTen-main"
+        / "benchmarks"
+    ).resolve()
+    sys.path.insert(0, str(benchmark_crypten_parent))
     import crypten
 
     crypten_path = _assert_vendored_crypten(crypten)

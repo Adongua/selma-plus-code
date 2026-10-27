@@ -61,7 +61,7 @@ as a separately labelled security-model experiment.
 From the repository root:
 
 ```bash
-export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main"
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
 python -m unittest discover -s s-vit/srelu/tests -v
 python -m unittest discover -s s-vit/hattention/tests -v
 ```
@@ -69,7 +69,7 @@ python -m unittest discover -s s-vit/hattention/tests -v
 ## Three-GPU smoke test
 
 ```bash
-export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main"
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
 export OMP_NUM_THREADS=1
 
 CUDA_VISIBLE_DEVICES=0,1,2 \
@@ -111,14 +111,18 @@ command exits unsuccessfully. The JSON also records error versus identity and
 absolute-value mappings, negative-output leakage and positive-payload error to
 detect fast but semantically incorrect comparison paths.
 
-The benchmark also records `crypten_import` and refuses to run if Python
-resolves `crypten` outside this repository's `CrypTen-main/crypten` directory.
+The benchmark records `crypten_import` and requires the
+`CrypTen-main/benchmarks/crypten` package, matching the legacy benchmark's
+import resolution. Its native baseline calls `MPCTensor.relu()` directly.
+This microbenchmark retains signed normal inputs to validate negative-value
+behavior; the legacy benchmark's ReLU timing/error inputs are nonnegative.
 
 To isolate a native-ReLU failure, run the diagnostic separately on CPU/Gloo
-and CUDA/NCCL:
+and CUDA/Gloo. CUDA tensor placement is retained, while CrypTen communication
+matches the legacy `MultiProcessLauncher` default:
 
 ```bash
-export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main"
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
 
 python -m srelu.diagnose_crypten_relu \
   --device cpu \
@@ -126,7 +130,6 @@ python -m srelu.diagnose_crypten_relu \
   --output "$HOME/home/tmp/crypten-relu-diagnostic-cpu.json"
 
 CUDA_VISIBLE_DEVICES=0,1,2 \
-TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
 timeout 600 \
 python -m srelu.diagnose_crypten_relu \
   --device cuda \
@@ -136,6 +139,12 @@ python -m srelu.diagnose_crypten_relu \
 
 The diagnostic invokes only CrypTen's native `_ltz()`, `ge(0)` and `relu()`
 methods and reports each result separately.
+
+The unified CUDA microbenchmark still uses an NCCL process group for the custom
+CUDA Ring3 methods; that transport setup differs from the legacy benchmark's
+Gloo launcher. The native call and CrypTen source package now match, but do not
+interpret their runtime as an exact reproduction of the legacy benchmark's
+Gloo timing without accounting for this backend difference.
 
 The fairness and claim policy is recorded in
 [`../../plan/experiment-protocol.md`](../../plan/experiment-protocol.md).
