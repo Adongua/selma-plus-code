@@ -316,6 +316,7 @@ def worker(rank, rendezvous, options):
                 "shape": list(shape),
                 "methods": options["methods"],
                 "repeats": options["repeats"],
+                "seed": options["seed"],
                 "mu": options["mu"],
                 "python": platform.python_version(),
                 "torch": torch.__version__,
