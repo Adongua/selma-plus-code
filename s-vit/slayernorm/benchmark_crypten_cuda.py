@@ -255,6 +255,10 @@ def worker(rank, rendezvous, options):
     import crypten
 
     crypten.cfg.encoder.precision_bits = 17
+    if options["backend"] == "nccl":
+        from crypten_nccl_compat import install_nccl_seed_sync_compat
+
+        install_nccl_seed_sync_compat(crypten)
     if options["progress"]:
         print(json.dumps({"event": "crypten_init_started", "rank": rank,
                           "backend": options["backend"]}), flush=True)

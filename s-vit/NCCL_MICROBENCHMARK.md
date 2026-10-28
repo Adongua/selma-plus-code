@@ -17,6 +17,8 @@ python -m run_microbenchmarks --backend nccl --operator both \
 ```
 
 若先想确认 NCCL 初始化和单算子能跑通，可先执行小型 smoke：
+runner 会在 `crypten.init()` 前把 CrypTen 的初始化 PRNG seed 交换切换到当前 CUDA
+设备，避免 CPU seed 被送入 NCCL；这只作用于初始化，不改变被测算子。
 
 ```bash
 timeout 600 python -m sgelu.benchmark_crypten_cuda --backend nccl \
