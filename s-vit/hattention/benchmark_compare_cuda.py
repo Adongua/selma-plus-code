@@ -57,6 +57,7 @@ def _summary(report):
                   "CrypTen provider work is included in online; Ring3 preparation is offline. "
                   "Framework phase counters and Gloo transport paths differ, so rounds and "
                   "times are engineering measurements, not equal protocol-round definitions.",
+                  "", f"Input Q17; CrypTen standard Q{report['crypten_precision_bits']}; Ring3 Q17.",
                   "", "Scope: Q/K/V to head output; projections and full ViT are excluded. "
                   "Each error is against its own plaintext formula. INVALID rows must not "
                   "be used for speedup claims. Ruler privacy is not validated."])
@@ -120,20 +121,33 @@ def _worker(rank, rendezvous, options):
 
         records = []
         for iteration in range(options["repeats"] + 1):
-            encrypted, sharing = _crypten_measure(device, crypten, lambda: tuple(
-                crypten.cryptensor(value, src=0, precision=17, device=device) for value in (q, k, v)))
-            row = {"warmup": iteration == 0, "input_sharing": sharing, "methods": {}}
+            encrypted = None
+            sharing = _zero_phase()
+            if any(method != "standard" for method in options["methods"]) or options["crypten_precision_bits"] == 17:
+                crypten.cfg.encoder.precision_bits = 17
+                encrypted, sharing = _crypten_measure(device, crypten, lambda: tuple(
+                    crypten.cryptensor(value, src=0, precision=17, device=device) for value in (q, k, v)))
+            standard_encrypted, standard_sharing = encrypted, sharing
+            if "standard" in options["methods"] and options["crypten_precision_bits"] != 17:
+                crypten.cfg.encoder.precision_bits = options["crypten_precision_bits"]
+                standard_encrypted, standard_sharing = _crypten_measure(device, crypten, lambda: tuple(
+                    crypten.cryptensor(value, src=0, precision=options["crypten_precision_bits"], device=device)
+                    for value in (q, k, v)))
+            row = {"warmup": iteration == 0, "input_sharing": sharing,
+                   "standard_input_sharing": standard_sharing, "methods": {}}
             methods = options["methods"]
             ordered = methods[iteration % len(methods):] + methods[:iteration % len(methods)]
             for method in ordered:
                 if method == "standard":
+                    crypten.cfg.encoder.precision_bits = options["crypten_precision_bits"]
                     offline = _zero_phase()
                     output, online = _crypten_measure(device, crypten,
-                                                      lambda: standard_attention(*encrypted))
+                                                      lambda: standard_attention(*standard_encrypted))
                     opened, reconstruction = _crypten_measure(device, crypten,
                                                                lambda: output.get_plain_text())
                     actual = _plain(opened)
                 else:
+                    crypten.cfg.encoder.precision_bits = 17
                     shares = tuple(item.share.data for item in encrypted)
                     material, offline = _ring_measure(device, base, lambda: prepare_hybrid(
                         base, wide, shape, head_types[method], rho, fixed, rsa_profile))
@@ -168,6 +182,8 @@ def _worker(rank, rendezvous, options):
                 "fixture_contract_scope": "public synthetic plaintext only; secret values not checked",
                 "fixture": "same CPU-generated normal Q17 Q/K/V for all methods",
                 "seed": options["seed"], "input_std": options["input_std"],
+                "input_precision_bits": 17, "crypten_precision_bits": options["crypten_precision_bits"],
+                "ring3_precision_bits": 17,
                 "repeats": options["repeats"], "max_abs_error_threshold": options["max_abs_error"],
                 "crypten_import": str(Path(crypten.__file__).resolve()),
                 "python": platform.python_version(), "torch": torch.__version__,
@@ -200,12 +216,18 @@ def main():
     parser.add_argument("--input-std", type=float, default=0.25)
     parser.add_argument("--input-bound", type=float, default=8.0)
     parser.add_argument("--max-abs-error", type=float, default=0.005)
+    parser.add_argument("--crypten-precision-bits", type=int, default=17,
+                        help="fractional precision for standard CrypTen only (default: 17)")
+    parser.add_argument("--allow-invalid-report", action="store_true",
+                        help="write report and exit successfully even when correctness fails")
     args = parser.parse_args()
     if len(set(args.methods)) != len(args.methods):
         parser.error("methods must not contain duplicates")
     if args.repeats < 1 or any(not math.isfinite(x) or x <= 0 for x in
                                (args.input_std, args.input_bound, args.max_abs_error)):
         parser.error("repeats, input-std, input-bound and max-abs-error must be positive")
+    if not 8 <= args.crypten_precision_bits <= 24:
+        parser.error("crypten-precision-bits must be in [8,24]")
     if args.head_types is None:
         args.head_types = [("rsa", "lsa", "mixer")[i % 3] for i in range(args.shape[1])]
     try:
@@ -229,7 +251,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="hattention-compare-", dir=args.output.parent) as directory:
         mp.spawn(_worker, args=(Path(directory, "store").as_uri(), options), nprocs=3, join=True)
     report = json.loads((args.output / "comparison.json").read_text())
-    if report["status"] == "benchmark_failed_correctness":
+    if report["status"] == "benchmark_failed_correctness" and not args.allow_invalid_report:
         parser.exit(1, "correctness check failed; inspect comparison.json and summary.md\n")
 
 

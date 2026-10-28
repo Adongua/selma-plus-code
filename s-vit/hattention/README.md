@@ -171,6 +171,45 @@ methods; `--patch-grid` or `--no-cls-token` controls Mixer token layout.
 The `hybrid` measurement is a grouped attention-core prototype, not end-to-end
 ViT inference or a trained/distilled model.
 
+### Four-shape attention-core microbenchmark
+
+Run `python -m hattention.run_microbenchmark --output-root PATH` to compare
+standard, RSA, LSA and Mixer, with each shape/method in an isolated three-party
+process group. Defaults are `(1,4,197,64)`, `(1,4,257,64)`, `(1,4,577,64)` and
+`(8,4,257,64)` in `(B,H,N,D_head)` order, Gloo, one warmup and three measured
+repetitions. These are attention cores, not mixed hAttention or full ViT.
+
+All paths receive the same synthetic Q17 Q/K/V. CrypTen standard uses Q20
+computation by default (`--crypten-precision-bits 17` selects the original Q17
+baseline); RSA, LSA and Mixer stay Q17. This is a mixed-precision engineering
+comparison and does not establish equal-precision speedup. Standard includes
+CrypTen provider work online; Ring3 preprocessing is measured separately.
+Gloo stages Ring3 via CPU; reported communication and phases are framework
+estimates with differing definitions. The table omits MAE and marks a cell
+INVALID if any measured run fails its own-reference maximum-error gate; raw
+JSON retains correctness and offline measurements.
+
+First use a small smoke case (17 tokens means 16 patches plus CLS):
+
+```bash
+python -m hattention.run_microbenchmark --backend gloo \
+  --shapes 1x1x17x16 --repeats 1 \
+  --output-root "$HOME/home/tmp/hattention-micro-smoke"
+```
+
+If the smoke passes, choose shapes based on available server memory. RSA
+preprocessing scales at least quadratically with token count; `1x4x577x64`
+and especially `8x4x257x64` may need substantial memory and time. Start with
+smaller shapes or run them separately using `--shapes`; `--case-timeout` sets
+the timeout for each shape/method. After interruption, repeat the same command
+with `--resume` to reuse matching completed reports. Existing finished tables
+are never overwritten.
+
+The output root contains one `comparison.json` per shape/method plus
+`hattention_microbenchmark.md` and `hattention_microbenchmark.tex`. Invalid
+cells must not be used for performance claims. These experiments do not prove
+Ruler privacy or measure accuracy against standard attention after distillation.
+
 ### Diagnose CrypTen standard Attention
 
 `diagnose_crypten_softmax.py` intentionally reconstructs intermediate values;
