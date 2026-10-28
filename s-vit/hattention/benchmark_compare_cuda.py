@@ -38,7 +38,7 @@ def _summary(report):
     lines = ["# Attention core comparison", "",
              "Three-party maximum time; mean of non-warmup repetitions. "
              "Communication is system-level sent-payload equivalent in KiB.", "",
-             "| Method | Head paths | Online (s) | Offline (s) | Online (KiB) | Phases/rank | MAE | Max error | Valid |",
+             "| Method | Head paths | Online (s) | Offline (s) | Online (KiB) | Rounds / phases | MAE | Max error | Valid |",
              "|---|---|---:|---:|---:|---:|---:|---:|---|"]
     for method in report["methods"]:
         rows = [r["methods"][method] for r in report["records"] if not r["warmup"]]
@@ -157,9 +157,13 @@ def _worker(rank, rendezvous, options):
                     opened, reconstruction = _ring_measure(device, base, lambda: base.reveal(output))
                     actual = fixed.decode(opened)
                 errors = _error_metrics(actual, references[method])
+                per_head = [dict(head=index, path=path, **_error_metrics(
+                    actual[:, index:index + 1], references[method][:, index:index + 1]))
+                    for index, path in enumerate(head_types[method])]
                 passed = all(math.isfinite(x) for x in errors.values()) and errors["max_abs"] <= options["max_abs_error"]
                 row["methods"][method] = {"offline": offline, "online": online,
                     "output_reconstruction": reconstruction, "error_vs_own_reference": errors,
+                    "per_head_error_vs_own_reference": per_head,
                     "correctness_passed": passed,
                     "online_includes_provider": method == "standard"}
                 if rank == 0:

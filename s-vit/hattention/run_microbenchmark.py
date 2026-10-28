@@ -59,7 +59,7 @@ def render(shapes, values, args):
     header = ["Method"]
     for shape in shapes:
         name = ",".join(map(str, shape))
-        header.extend((f"({name}) Time (s)", "Comm. (KiB)", "Phases/rank"))
+        header.extend((f"({name}) Time (s)", "Comm. (KiB)", "Rounds / phases"))
     lines = ["# Attention core microbenchmark", "",
              f"Backend: {args.backend}; three parties; input Q17; CrypTen standard Q{args.crypten_precision_bits}; "
              f"Ring3 Q17; {args.repeats} measured repetitions, one warmup excluded; seed {args.seed}.", "",
@@ -74,12 +74,13 @@ def render(shapes, values, args):
         lines.append("| " + " | ".join(cells) + " |")
     lines.extend(["", "Online time is the maximum across parties, then averaged over measured repetitions; "
                   "communication is estimated three-party sent-payload equivalent. "
-                  "Phases are the maximum per-party counter, then averaged.", "",
+                  "Rounds / phases are the maximum per-party counter, then averaged.", "",
                   "INVALID means at least one measured output failed its own plaintext reference check; "
                   "details, including error metrics and offline measurements, are in the raw JSON.", "",
                   "Standard uses CrypTen native softmax with provider work included online; the other "
                   "paths use experimental Ring3 with separately generated offline material. When using Gloo, "
-                  "Ring3 stages through CPU. Framework phase counters and communication estimates differ; "
+                  "Ring3 stages through CPU. CrypTen reports communicator rounds; Ring3 reports "
+                  "exchange phases. The counters and communication estimates differ; "
                   "these are implementation measurements, not identical protocol-round definitions.", "",
                   "Each method uses its own attention formula. Scope: Q/K/V to head output; no projections "
                   "or complete ViT. Ruler privacy has not been validated."])
@@ -89,7 +90,7 @@ def render(shapes, values, args):
 def render_latex(shapes, values, args):
     columns = "l" + "ccc" * len(shapes)
     headings = " & ".join(r"\multicolumn{3}{c}{Shape $(" + ",".join(map(str, shape)) + r")$}" for shape in shapes)
-    subheads = " & ".join([r"Time (s) & Comm. (KiB) & Phases"] * len(shapes))
+    subheads = " & ".join([r"Time (s) & Comm. (KiB) & Rounds / phases"] * len(shapes))
     lines = [r"% Requires booktabs and graphicx", r"\begin{table*}[t]", r"\centering",
              r"\caption{Online cost of attention cores on synthetic inputs.}",
              r"\scriptsize", r"\resizebox{\textwidth}{!}{%", r"\begin{tabular}{" + columns + "}",
@@ -106,8 +107,9 @@ def render_latex(shapes, values, args):
     lines.extend([r"\bottomrule", r"\end{tabular}%", "}", r"\vspace{2pt}",
                   r"\parbox{\textwidth}{\footnotesize Input is Q17; CrypTen standard uses Q"
                   + str(args.crypten_precision_bits) + r" and includes provider work online. "
-                  r"Ring3 paths use Q17 with offline preprocessing excluded. Phase counts and "
-                  r"communication are framework-specific estimates. INVALID denotes a failed "
+                  r"Ring3 paths use Q17 with offline preprocessing excluded. CrypTen rounds "
+                  r"and Ring3 exchange phases use different counters; communication is estimated. "
+                  r"INVALID denotes a failed "
                   r"correctness check; see the raw reports for details.}", r"\end{table*}"])
     return "\n".join(lines) + "\n"
 

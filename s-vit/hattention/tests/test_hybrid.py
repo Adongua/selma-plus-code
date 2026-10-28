@@ -49,6 +49,7 @@ class HybridTests(unittest.TestCase):
                   "error_vs_own_reference": {"mae": 0.1, "max_abs": 0.2},
                   "correctness_passed": False}
         report = {"methods": ["standard"], "head_types": {"standard": ["softmax"]},
+                  "crypten_precision_bits": 20,
                   "records": [{"warmup": True, "methods": {"standard": result}},
                               {"warmup": False, "methods": {"standard": result}}]}
         self.assertIn("INVALID", _summary(report))

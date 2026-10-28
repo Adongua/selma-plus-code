@@ -171,6 +171,33 @@ methods; `--patch-grid` or `--no-cls-token` controls Mixer token layout.
 The `hybrid` measurement is a grouped attention-core prototype, not end-to-end
 ViT inference or a trained/distilled model.
 
+### Mixed-head correctness and configuration costs
+
+Each comparison JSON now includes `per_head_error_vs_own_reference` for every
+head. This checks the grouped output against the matching plaintext path,
+including head order; the error is not model accuracy or similarity to softmax.
+
+Run five isolated configurations with a shared fixture: standard softmax,
+four RSA heads, RSA/RSA/LSA/Mixer, RSA/LSA/Mixer/Mixer, and an interleaved
+Mixer/RSA/LSA/Mixer order. The latter two have the same counts and test whether
+head ordering is handled correctly. Start small to control RSA material memory:
+
+```bash
+python -m hattention.run_hybrid_microbenchmark --backend gloo \
+  --shapes 1x4x17x16 --repeats 1 --case-timeout 1800 \
+  --output-root "$HOME/home/tmp/hattention-hybrid-smoke"
+```
+
+If every row passes, increase repetitions or test `1x4x65x16` in a fresh
+output directory. Avoid starting at 197 tokens on a shared GPU. Each case has
+its own `comparison.json`; the combined Markdown table marks failed cases
+`INVALID`. An interrupted run can use the same command with `--resume`.
+Changing precision, seed, shape, configuration or repetitions requires a fresh
+output directory. CrypTen rounds and Ring3 phases have different definitions;
+the standard and mixed paths also differ in preprocessing accounting and
+precision, so their times are engineering measurements, not equal-protocol
+speedup claims.
+
 ### Four-shape attention-core microbenchmark
 
 Run `python -m hattention.run_microbenchmark --output-root PATH` to compare
