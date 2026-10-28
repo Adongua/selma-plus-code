@@ -171,6 +171,26 @@ methods; `--patch-grid` or `--no-cls-token` controls Mixer token layout.
 The `hybrid` measurement is a grouped attention-core prototype, not end-to-end
 ViT inference or a trained/distilled model.
 
+### Diagnose CrypTen standard Attention
+
+`diagnose_crypten_softmax.py` intentionally reconstructs intermediate values;
+it is restricted to its internally generated public synthetic fixture and must
+never be used with private data. It reports errors of QK, row maximum,
+exponential, row sum, reciprocal, attention weights and AV independently.
+It also opens each default Newton reciprocal iteration to inspect Q17 square
+quantization. The extra openings change random consumption and make the run
+unsuitable for timing or performance comparisons.
+
+```bash
+timeout 1800 python -m hattention.diagnose_crypten_softmax \
+  --shape 1x4x197x256 --precision-bits 17 --repeats 1 \
+  --output "$HOME/home/tmp/hattention-softmax-diag-q17.json"
+```
+
+Repeat with `--precision-bits 20` and a distinct output file to investigate
+fixed-point sensitivity. Q20 is a diagnostic setting, not the original Q17
+baseline; do not substitute its timings for the existing benchmark.
+
 ## Standalone sReLU dependency
 
 The secure sReLU protocol no longer lives inside this attention package.  Its
