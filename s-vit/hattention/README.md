@@ -131,7 +131,45 @@ effective quantized epsilon. Formal runs exceeding the maximum-error
 threshold cause `benchmark_failed_correctness` and a nonzero exit. Offline
 material scales with the score matrix (`N^2`); start with the small shape.
 The benchmark uses synthetic data and must not be treated as a privacy proof.
-Neither the Newton reciprocal nor full RSA has been server-validated yet.
+The server's `(1,1,17,16)` Gloo smoke passed its plaintext-reference error
+gate; broader shapes and security remain unvalidated.
+
+## Attention-core comparison
+
+`benchmark_compare_cuda.py` evaluates the same Q17 synthetic Q/K/V with:
+
+* `standard`: CrypTen MPCTensor matrix products and native approximate softmax;
+* `rsa`, `lsa`, `mixer`: all heads assigned to the respective Ring3 path;
+* `hybrid`: RSA, LSA and Mixer heads grouped according to `--head-types`.
+
+All measurements cover only the attention core from shared Q/K/V to per-head
+output. They exclude QKV/output projection, sharing and reconstruction from
+online time. CrypTen provider work is included online; one-use Ring3 materials
+are generated separately. Gloo stages Ring3 CUDA shares via CPU, whereas
+CrypTen has its own transport; the two communication-round counters are not
+identical protocol-round definitions. Error is against each method's own
+plaintext formula, not standard Attention for every method. A failed error
+gate marks the report INVALID and causes a nonzero exit. The public-fixture
+RSA range check does not check secrets. Ruler security remains unvalidated.
+
+Begin with a small shape (RSA material grows with the number of score entries):
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+export CUDA_VISIBLE_DEVICES=0,1,2
+python -m unittest discover -s s-vit/hattention/tests -v
+timeout 1800 python -m hattention.benchmark_compare_cuda \
+  --backend gloo --shape 1x4x17x16 \
+  --head-types rsa lsa mixer mixer --repeats 1 \
+  --output "$HOME/home/tmp/hattention-compare-gloo-smoke"
+```
+
+Inspect `comparison.json` and `summary.md` before running larger shapes or
+making speedup claims. Use `--methods standard rsa lsa mixer hybrid` to select
+methods; `--patch-grid` or `--no-cls-token` controls Mixer token layout.
+The `hybrid` measurement is a grouped attention-core prototype, not end-to-end
+ViT inference or a trained/distilled model.
 
 ## Standalone sReLU dependency
 
