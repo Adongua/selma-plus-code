@@ -53,7 +53,8 @@ class TableTests(unittest.TestCase):
             report.update(status="benchmark_passed", radius=0.0055, input_bound=16.0,
                           input_std=1.0, reveal_mode="all_reduce",
                           hummingbird_fraction_bits=8, bicoptor_fraction_bits=2,
-                          exact_max_abs=1e-3, adapted_max_abs=5e-3)
+                          exact_max_abs=1e-3, adapted_max_abs=5e-3,
+                          quantized_sign_implementation="q17_exact_threshold_v1")
         return report
 
     def write(self, name, obj):

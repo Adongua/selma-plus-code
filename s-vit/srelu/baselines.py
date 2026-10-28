@@ -11,15 +11,15 @@ reported under the name ``crypten_native``.
 The HummingBird paths use the same circuit in a public-bound reduced ring, so
 their circuit depth and payload depend on the retained bit width.
 
-``bicoptor2_keybits`` deliberately implements only Bicoptor 2.0's public
-key-bit precision policy on the same reduced-ring CrypTen backend.  It is not
-the paper's UBL/RSS two-round assistant protocol and is labelled as an adapted
-engineering reference in every report.
+``bicoptor2_keybits`` evaluates a quantized sign criterion using an exact
+public-threshold comparison at the input precision. It is an engineering
+adaptation, not the paper's reduced-bit or UBL/RSS two-round protocol.
 """
 
 import math
 
 import torch
+from .quantized_sign import quantized_sign_offset
 
 
 METHODS = (
@@ -56,11 +56,13 @@ METHOD_PROVENANCE = {
     ),
     "hummingbird_budget": (
         "HummingBird-style accuracy/performance ablation adapted to three-party "
-        "CrypTen: DReLU is requantized to a public fractional-bit budget"
+        "CrypTen: quantized sign criterion evaluated exactly using a public "
+        "threshold at original input precision"
     ),
     "bicoptor2_keybits": (
-        "Bicoptor 2.0 key-bit precision policy evaluated with the reduced-ring "
-        "CrypTen 3PC DReLU backend; not the official two-round UBL/RSS protocol"
+        "Bicoptor-inspired quantized sign criterion evaluated exactly using a "
+        "public threshold at original Q17 precision on the CrypTen 3PC backend; "
+        "not the official two-round UBL/RSS protocol or its reduced-bit implementation"
     ),
 }
 
@@ -185,14 +187,13 @@ def _reduced_ring_drelu(value, bits: int):
     return result
 
 
-def _requantize(value, fraction_bits: int):
-    from crypten.encoder import FixedPointEncoder
-
-    if fraction_bits > value.encoder._precision_bits:
-        raise ValueError("comparison precision cannot exceed input precision")
-    result = value.clone()
-    result._tensor.encode_(FixedPointEncoder(precision_bits=fraction_bits))
-    return result
+def _quantized_sign_selector(value, input_bound: float, fraction_bits: int):
+    """Compare against the exact round-to-even zero threshold at input precision."""
+    input_fraction_bits = value.encoder._precision_bits
+    offset = quantized_sign_offset(input_fraction_bits, fraction_bits)
+    bits = effective_signed_bits(input_bound + offset, input_fraction_bits)
+    shifted = value + offset if offset else value
+    return _reduced_ring_drelu(shifted, bits)
 
 
 def crypten_native_relu(value, **_):
@@ -225,9 +226,7 @@ def hummingbird_budget_relu(
 ):
     """Reduced-precision HummingBird accuracy/performance ablation."""
 
-    probe = _requantize(value, hummingbird_fraction_bits)
-    bits = effective_signed_bits(input_bound, hummingbird_fraction_bits)
-    selector = _reduced_ring_drelu(probe, bits)
+    selector = _quantized_sign_selector(value, input_bound, hummingbird_fraction_bits)
     return value * selector
 
 
@@ -238,11 +237,9 @@ def bicoptor2_keybits_relu(
     bicoptor_fraction_bits: int,
     **_,
 ):
-    """Bicoptor 2.0 key-bit policy on the common CrypTen 3PC backend."""
+    """Bicoptor-inspired quantized sign criterion on the CrypTen 3PC backend."""
 
-    probe = _requantize(value, bicoptor_fraction_bits)
-    bits = effective_signed_bits(input_bound, bicoptor_fraction_bits)
-    selector = _reduced_ring_drelu(probe, bits)
+    selector = _quantized_sign_selector(value, input_bound, bicoptor_fraction_bits)
     return value * selector
 
 

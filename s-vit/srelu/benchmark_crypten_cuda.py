@@ -16,6 +16,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sgelu.runtime_cuda import CudaRing3, CudaRing3Wide
+from .quantized_sign import quantized_sign_offset
 
 from .baselines import (
     METHOD_IMPLEMENTATION_CLASS,
@@ -322,7 +323,9 @@ def _method_metadata(options):
     metadata = {
         "crypten_native": {
             "year": METHOD_YEAR["crypten_native"],
-            "provenance": METHOD_PROVENANCE["crypten_native"],
+            "provenance": METHOD_PROVENANCE["crypten_native"].replace(
+                "NCCL/CUDA", f"{options['backend'].upper()}/CUDA"
+            ),
             "implementation_class": METHOD_IMPLEMENTATION_CLASS[
                 "crypten_native"
             ],
@@ -352,8 +355,9 @@ def _method_metadata(options):
                 "bicoptor2_keybits"
             ],
             "comparison_fraction_bits": options["bicoptor_fraction_bits"],
+            "comparison_implementation": "exact public-threshold comparison at Q17; not reduced-bit truncation",
             "comparison_bits": effective_signed_bits(
-                options["input_bound"], options["bicoptor_fraction_bits"]
+                options["input_bound"] + quantized_sign_offset(17, options["bicoptor_fraction_bits"]), 17
             ),
         },
         "hummingbird_eco": {
@@ -378,8 +382,9 @@ def _method_metadata(options):
                 "hummingbird_budget"
             ],
             "comparison_fraction_bits": options["hummingbird_fraction_bits"],
+            "comparison_implementation": "exact public-threshold comparison at Q17; not reduced-bit truncation",
             "comparison_bits": effective_signed_bits(
-                options["input_bound"], options["hummingbird_fraction_bits"]
+                options["input_bound"] + quantized_sign_offset(17, options["hummingbird_fraction_bits"]), 17
             ),
         },
         "srelu": {
@@ -690,6 +695,7 @@ def worker(rank, rendezvous, options):
                 "input_std": options["input_std"],
                 "hummingbird_fraction_bits": options["hummingbird_fraction_bits"],
                 "bicoptor_fraction_bits": options["bicoptor_fraction_bits"],
+                "quantized_sign_implementation": "q17_exact_threshold_v1",
                 "exact_max_abs": options["exact_max_abs"],
                 "adapted_max_abs": options["adapted_max_abs"],
                 "seed": options["seed"],

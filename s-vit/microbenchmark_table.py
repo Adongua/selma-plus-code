@@ -62,7 +62,8 @@ def load_measurements(paths, operator, distribution, comm_metric):
         config_keys = {"sgelu": ("mu",), "slayernorm": ("epsilon", "scale"),
                        "srelu": ("radius", "input_bound", "input_std", "reveal_mode",
                                  "hummingbird_fraction_bits", "bicoptor_fraction_bits",
-                                 "exact_max_abs", "adapted_max_abs")}[operator]
+                                 "exact_max_abs", "adapted_max_abs",
+                                 "quantized_sign_implementation")}[operator]
         if operator == "srelu" and any(report.get(key) is None for key in config_keys):
             raise ValueError(f"{path}: missing sReLU experiment settings")
         metadata.append(tuple(report.get(key) for key in (
@@ -192,7 +193,9 @@ def render(operator, samples, metadata, distribution, comm_metric):
                  "whenever any measured repetition fails its declared-reference correctness gate; "
                  "MAE versus ReLU remains visible for diagnosis. The adapted-reference gate is "
                  "not an accuracy threshold versus exact ReLU. sReLU uses the corrected smooth "
-                 "formula with public r/2 correction."]
+                 "formula with public r/2 correction. The Bicoptor-inspired sign criterion "
+                 "is evaluated by an exact threshold comparison at Q17, not the original "
+                 "reduced-bit or two-round protocol."]
     return "\n".join(rows) + "\n"
 
 

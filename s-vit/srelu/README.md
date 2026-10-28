@@ -30,18 +30,20 @@ input/output, a Q16 radicand and a Q50 secret reciprocal.  It requires
   correctness-repaired 64-bit A2B/B2A implementation built from CrypTen
   primitives. It is not the official `MPCTensor.relu()` implementation and
   is excluded from the strict native comparison.
-- `bicoptor2_keybits` (Bicoptor 2.0, 2023): a same-backend structural
-  adaptation of its key-bit precision policy.  It is not the paper's official
-  UBL/RSS two-round protocol and is not an independent security claim.
+- `bicoptor2_keybits` (Bicoptor 2.0, 2023): an adaptation of a quantized
+  sign criterion, evaluated as an exact public-threshold comparison at Q17.
+  It no longer uses the former probabilistic reduced-bit truncation; its
+  comparison bit width and performance are therefore different. It is not
+  the paper's official UBL/RSS two-round or reduced-bit protocol.
 - `hummingbird_eco` (HummingBird, 2024): a 3PC adaptation that removes only
   public-bound-proven redundant high bits while retaining all Q17 fractional
   bits.
-- `hummingbird_budget` (HummingBird-style ablation, 2024): also reduces the
-  fractional-bit budget.  This is intended for the accuracy/performance
-  ablation, not the main exact-under-bound comparison.
+- `hummingbird_budget` (HummingBird-style ablation, 2024): applies a
+  quantized-sign criterion using an exact Q17 threshold comparison. It is an
+  accuracy/performance ablation, not the main exact-under-bound comparison.
 - `srelu` (ours, 2026): the standalone Ruler-based smooth ReLU.
 
-The reduced-ring methods use the same CrypTen NCCL process group and convert
+The reduced-ring methods use the selected CrypTen process group and convert
 the sign bit back to an arithmetic share before selecting the original Q17
 payload.  Their prefix-adder depth is `ceil(log2(k))` for a public `k`-bit
 ring, instead of always converting a full 64-bit word.
