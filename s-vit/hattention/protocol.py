@@ -1,7 +1,7 @@
 """Ring3 building blocks for secure hAttention.
 
 This phase implements the linear LSA and public Mixer paths on both the
-CPU/Gloo and CUDA/NCCL Ring3 runtimes.  RSA is intentionally rejected until
+CPU/Gloo and CUDA Ring3 runtimes with Gloo or NCCL. RSA is rejected until
 its sReLU and reciprocal protocols are wired and validated.
 """
 

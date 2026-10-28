@@ -41,7 +41,7 @@ auditability; it must not be normalized before the public `r/2` correction.
 From the repository root, with PyTorch installed:
 
 ```bash
-export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main"
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
 python -m unittest discover -s s-vit/hattention/tests -v
 ```
 
@@ -50,7 +50,7 @@ python -m unittest discover -s s-vit/hattention/tests -v
 `protocol.py` now provides the first secure deployment increment:
 
 - one-round batched Ring3 matrix multiplication shared by CPU/Gloo and
-  CUDA/NCCL runtimes;
+  CUDA runtimes with Gloo or NCCL communication;
 - Q17 encode/decode profiles and one-time probabilistic truncation material;
 - secure reassociated LSA with two secret matrix multiplications;
 - grouped secure LSA plus communication-free public Mixer execution.
@@ -66,16 +66,16 @@ The current three-party benchmark covers LSA and Mixer heads only. From the
 repository root on a server with three visible GPUs:
 
 ```bash
-export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main"
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
 export OMP_NUM_THREADS=1
 
 CUDA_VISIBLE_DEVICES=0,1,2 \
-TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
 python -m hattention.benchmark_cuda \
+  --backend gloo \
   --shape 1x4x17x16 \
   --head-types lsa lsa mixer mixer \
   --repeats 1 \
-  --output "$HOME/home/tmp/hattention-linear-smoke"
+  --output "$HOME/home/tmp/hattention-linear-gloo-smoke"
 ```
 
 For a ViT-style operator case, use for example `--shape 1x4x257x64`; the
@@ -83,6 +83,12 @@ For a ViT-style operator case, use for example `--shape 1x4x257x64`; the
 separates input sharing, offline truncation-material preparation, online
 execution, output reconstruction, sent payload bytes, rounds, and error.  The
 benchmark is experimental and does not claim production security validation.
+
+The default backend is Gloo; use `--backend nccl` to select NCCL explicitly.
+In Gloo mode the Ring3 runtime stages CUDA shares through CPU memory and the
+copies are included in phase timing. Gloo metric gathering uses CPU tensors;
+collective payload counts are estimates. Report the two backends separately.
+The new Gloo/CUDA path requires server validation.
 
 Secure RSA normalization, the grouped three-path benchmark, cost-table-driven
 search, pruning, and distillation remain subsequent phases.
