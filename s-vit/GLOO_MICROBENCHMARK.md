@@ -1,5 +1,8 @@
 # Gloo/CUDA 算子微基准
 
+批量实现现已统一在 `run_microbenchmarks`。运行 NCCL 完整版请使用
+[`NCCL_MICROBENCHMARK.md`](NCCL_MICROBENCHMARK.md)；本文件中的命令仍运行 Gloo。
+
 从仓库根目录启动，使用包含 PyTorch、CrypTen 依赖和三张可用 CUDA GPU 的环境：
 
 ```bash

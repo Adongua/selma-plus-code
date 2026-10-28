@@ -149,8 +149,8 @@ def render(operator, samples, metadata, distribution, comm_metric):
     rows += [r"\bottomrule", r"\end{tabular}%", "}", r"\end{table*}", "```", "",
              "The CrypTen provider work is included in its online time; Ring3 preprocessing "
              "is reported separately. " + ("Ring3 Gloo uses CPU staging, included in its phase time; "
-             if backend == "gloo" else "Ring3 uses the selected backend; ") +
-             "CrypTen uses its own Gloo/CUDA path. Collective byte counts are estimates. "
+             if backend == "gloo" else "Ring3 NCCL exchanges CUDA tensors; ") +
+             f"CrypTen uses its own {backend.upper()}/CUDA path. Collective byte counts are estimates. "
              "Ruler openings are not security validated. Check each method's accuracy before "
              "using its timing as a valid comparison."]
     if operator == "sgelu":
