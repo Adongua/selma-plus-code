@@ -27,7 +27,7 @@ timeout 600 python -m sgelu.benchmark_crypten_cuda --backend nccl \
 
 timeout 600 python -m slayernorm.benchmark_crypten_cuda --backend nccl \
   --shapes 1x17x32 --distributions normal --repeats 1 \
-  --methods fused_ruler secformer_goldschmidt unfused_newton \
+  --methods slayernorm secformer newton_engineering \
   --output "$HOME/home/tmp/nccl-slayernorm-smoke"
 ```
 
