@@ -11,7 +11,9 @@ import sys
 from run_microbenchmarks import _run_case
 
 METHODS = ("standard", "rsa", "lsa", "mixer")
-DEFAULT_SHAPES = ("1x4x197x64", "1x4x257x64", "1x4x577x64", "8x4x257x64")
+# Conservative defaults for shared GPU servers. Increase dimensions explicitly
+# after checking available memory; RSA preprocessing is quadratic in token count.
+DEFAULT_SHAPES = ("1x1x17x32", "1x1x65x32", "1x1x101x32", "1x1x197x32")
 
 
 def parse_shape(value):

@@ -17,6 +17,11 @@ SPEC.loader.exec_module(runner)
 
 
 class ReportTests(unittest.TestCase):
+    def test_default_shapes_are_conservative_and_mixer_compatible(self):
+        self.assertEqual(runner.DEFAULT_SHAPES,
+            ("1x1x17x32", "1x1x65x32", "1x1x101x32", "1x1x197x32"))
+        self.assertTrue(all(runner.parse_shape(shape)[0] == 1 for shape in runner.DEFAULT_SHAPES))
+
     def setUp(self):
         self.args = argparse.Namespace(backend="gloo", repeats=2, seed=7,
                                        crypten_precision_bits=20, max_abs_error=0.005)

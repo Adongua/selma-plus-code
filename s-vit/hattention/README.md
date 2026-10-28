@@ -175,9 +175,11 @@ ViT inference or a trained/distilled model.
 
 Run `python -m hattention.run_microbenchmark --output-root PATH` to compare
 standard, RSA, LSA and Mixer, with each shape/method in an isolated three-party
-process group. Defaults are `(1,4,197,64)`, `(1,4,257,64)`, `(1,4,577,64)` and
-`(8,4,257,64)` in `(B,H,N,D_head)` order, Gloo, one warmup and three measured
-repetitions. These are attention cores, not mixed hAttention or full ViT.
+process group. Defaults are `(1,1,17,32)`, `(1,1,65,32)`, `(1,1,101,32)` and
+`(1,1,197,32)` in `(B,H,N,D_head)` order, Gloo, one warmup and three measured
+repetitions. They use one batch, one head and at most 197 tokens to fit more
+comfortably on shared GPU servers. These are attention cores, not mixed
+hAttention or full ViT.
 
 All paths receive the same synthetic Q17 Q/K/V. CrypTen standard uses Q20
 computation by default (`--crypten-precision-bits 17` selects the original Q17
@@ -197,13 +199,14 @@ python -m hattention.run_microbenchmark --backend gloo \
   --output-root "$HOME/home/tmp/hattention-micro-smoke"
 ```
 
-If the smoke passes, choose shapes based on available server memory. RSA
-preprocessing scales at least quadratically with token count; `1x4x577x64`
-and especially `8x4x257x64` may need substantial memory and time. Start with
-smaller shapes or run them separately using `--shapes`; `--case-timeout` sets
-the timeout for each shape/method. After interruption, repeat the same command
-with `--resume` to reuse matching completed reports. Existing finished tables
-are never overwritten.
+If the smoke passes, choose larger shapes based on available server memory. RSA
+preprocessing scales at least quadratically with token count; increasing batch,
+head count, head dimension or token count can sharply increase memory and
+runtime. Check that the GPUs are not occupied by other jobs. Run larger shapes
+separately using `--shapes`; `--case-timeout` sets the timeout for each
+shape/method. After interruption, repeat the same command with `--resume` to
+reuse matching completed reports. Existing finished tables are never
+overwritten.
 
 The output root contains one `comparison.json` per shape/method plus
 `hattention_microbenchmark.md` and `hattention_microbenchmark.tex`. Invalid
