@@ -19,11 +19,11 @@ python -m run_microbenchmarks --backend nccl --operator both \
 若先想确认 NCCL 初始化和单算子能跑通，可先执行小型 smoke：
 
 ```bash
-python -m sgelu.benchmark_crypten_cuda --backend nccl \
+timeout 600 python -m sgelu.benchmark_crypten_cuda --backend nccl \
   --shape 1x17 --repeats 1 --methods sgelu erf \
   --output "$HOME/home/tmp/nccl-sgelu-smoke"
 
-python -m slayernorm.benchmark_crypten_cuda --backend nccl \
+timeout 600 python -m slayernorm.benchmark_crypten_cuda --backend nccl \
   --shapes 1x17x32 --distributions normal --repeats 1 \
   --methods fused_ruler secformer_goldschmidt unfused_newton \
   --output "$HOME/home/tmp/nccl-slayernorm-smoke"
