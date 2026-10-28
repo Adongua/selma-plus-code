@@ -1,4 +1,4 @@
-"""Build the paper-style GeLU/LayerNorm tables from benchmark JSON reports.
+"""Build paper-style GeLU, LayerNorm and ReLU tables from benchmark JSON reports.
 
 Only actual non-warmup measurements are used. Missing methods, shapes, or
 repetitions are errors rather than being filled with guessed values.
@@ -12,6 +12,16 @@ import statistics
 
 
 CONFIG = {
+    "srelu": {
+        "shapes": ((1, 197), (1, 257), (1, 577), (8, 257)),
+        "methods": (
+            ("crypten_native", "CrypTen-native (2021)", r"CrypTen-native (2021)"),
+            ("bicoptor2_keybits", "Bicoptor 2.0 adapted (2023)*", r"Bicoptor 2.0 (2023)$^{*}$"),
+            ("hummingbird_eco", "HummingBird adapted (2024)*", r"HummingBird (2024)$^{*}$"),
+            ("srelu", "sReLU (ours)", r"sReLU (ours)"),
+        ),
+        "error": "error_vs_relu",
+    },
     "sgelu": {
         "shapes": ((1, 197), (1, 257), (1, 577), (8, 257)),
         "methods": (
@@ -47,9 +57,14 @@ def load_measurements(paths, operator, distribution, comm_metric):
         report = json.loads(path.read_text(encoding="utf-8"))
         if report.get("world_size") != 3:
             raise ValueError(f"{path}: expected world_size=3")
-        if report.get("status") == "benchmark_failed_correctness":
+        if report.get("status") == "benchmark_failed_correctness" and operator != "srelu":
             raise ValueError(f"{path}: correctness gate failed")
-        config_keys = ("mu",) if operator == "sgelu" else ("epsilon", "scale")
+        config_keys = {"sgelu": ("mu",), "slayernorm": ("epsilon", "scale"),
+                       "srelu": ("radius", "input_bound", "input_std", "reveal_mode",
+                                 "hummingbird_fraction_bits", "bicoptor_fraction_bits",
+                                 "exact_max_abs", "adapted_max_abs")}[operator]
+        if operator == "srelu" and any(report.get(key) is None for key in config_keys):
+            raise ValueError(f"{path}: missing sReLU experiment settings")
         metadata.append(tuple(report.get(key) for key in (
             "backend", "crypten_import", "crypten_default_precision_bits",
             "python", "torch", "repeats", "seed", *config_keys,
@@ -63,8 +78,10 @@ def load_measurements(paths, operator, distribution, comm_metric):
             shape = tuple(record.get("shape", report.get("shape", ())))
             for method, result in record["methods"].items():
                 key = (shape, method)
-                if result.get("correctness_gate", {}).get("passed") is False:
+                if operator != "srelu" and result.get("correctness_gate", {}).get("passed") is False:
                     raise ValueError(f"{path}: {key} failed its correctness gate")
+                if operator == "srelu" and "passed" not in result.get("correctness_gate", {}):
+                    raise ValueError(f"{path}: {key} has no correctness gate")
                 online = result["online"]
                 row = (float(online["seconds_max"]),
                        float(online[comm_metric]) / 1024.0,
@@ -72,14 +89,16 @@ def load_measurements(paths, operator, distribution, comm_metric):
                        float(result[config["error"]]["mae"]))
                 if not all(math.isfinite(value) and value >= 0 for value in row):
                     raise ValueError(f"{path}: invalid measurement for {key}")
-                per_case.setdefault(key, []).append(row)
-        for key, rows in per_case.items():
+                valid = result.get("correctness_gate", {}).get("passed", True)
+                per_case.setdefault(key, []).append((row, valid))
+        for key, entries in per_case.items():
             if key in seen_cases:
                 raise ValueError(f"duplicate case {key}: supply one report per case")
-            if len(rows) != report["repeats"]:
-                raise ValueError(f"{path}: {key} has {len(rows)} samples, expected {report['repeats']}")
+            if len(entries) != report["repeats"]:
+                raise ValueError(f"{path}: {key} has {len(entries)} samples, expected {report['repeats']}")
             seen_cases.add(key)
-            samples[key] = tuple(statistics.mean(column) for column in zip(*rows))
+            means = tuple(statistics.mean(column) for column in zip(*(row for row, _ in entries)))
+            samples[key] = means if all(valid for _, valid in entries) else (None, None, None, means[3])
     if len(set(metadata)) != 1:
         raise ValueError("reports use different backend, environment, precision or experiment settings")
     missing = [(shape, method) for shape in config["shapes"]
@@ -92,6 +111,9 @@ def load_measurements(paths, operator, distribution, comm_metric):
 def format_row(values, bold=None, latex=False):
     cells = []
     for index, value in enumerate(values):
+        if value is None:
+            cells.append("INVALID")
+            continue
         text = (f"{value:.5f}" if index == 0 else
                 f"{value:.1f}" if index == 1 else
                 f"{value:.1f}" if index == 2 else f"{value:.5g}")
@@ -113,7 +135,8 @@ def render(operator, samples, metadata, distribution, comm_metric):
     header = ["Method"]
     for shape in shapes:
         header.extend([f"{shape} Time(s)", "Comm.(KiB)", "Rounds", "MAE"])
-    rows = ["# " + ("sGeLU" if operator == "sgelu" else "sLayerNorm") + " microbenchmark",
+    operator_name = {"sgelu": "sGeLU", "slayernorm": "sLayerNorm", "srelu": "sReLU"}[operator]
+    rows = ["# " + operator_name + " microbenchmark",
             "", f"Backend: {backend}; world size: 3; CrypTen: {crypten_path}; default precision: Q{precision}.",
             f"Distribution: {distribution}; communication field: {comm_metric} / 1024 (KiB).",
             "One warmup excluded; measurements are means across reported repetitions. "
@@ -142,8 +165,12 @@ def render(operator, samples, metadata, distribution, comm_metric):
         cells = [label]
         for shape in shapes:
             values = samples[(shape, method)]
-            best = [min(samples[(shape, m)][i] for m, _, _ in methods) for i in range(3)]
-            bold = [math.isclose(values[i], best[i], rel_tol=1e-12, abs_tol=1e-12) for i in range(3)]
+            candidates = [[samples[(shape, m)][i] for m, _, _ in methods
+                           if samples[(shape, m)][i] is not None] for i in range(3)]
+            best = [min(column) if column else None for column in candidates]
+            bold = [values[i] is not None and best[i] is not None and
+                    math.isclose(values[i], best[i], rel_tol=1e-12, abs_tol=1e-12)
+                    for i in range(3)]
             cells.extend(format_row(values, bold, latex=True))
         rows.append("  " + " & ".join(cells) + r" \\")
     rows += [r"\bottomrule", r"\end{tabular}%", "}", r"\end{table*}", "```", "",
@@ -156,9 +183,16 @@ def render(operator, samples, metadata, distribution, comm_metric):
     if operator == "sgelu":
         rows += ["", "* SecFormer is a masked-Fourier engineering reference, not the full official protocol. "
                  "† SEAF is a CrypTen 3PC adaptation, not the original 2PC implementation."]
-    else:
+    elif operator == "slayernorm":
         rows += ["", "SecFormer, PUMA and SPRINT are same-framework 3PC adaptations; "
                  "Newton is an engineering baseline. SHAFT is omitted from this table."]
+    else:
+        rows += ["", "* Bicoptor 2.0 and HummingBird are CrypTen 3PC adaptations, "
+                 "not the papers' complete official protocols. INVALID suppresses performance "
+                 "whenever any measured repetition fails its declared-reference correctness gate; "
+                 "MAE versus ReLU remains visible for diagnosis. The adapted-reference gate is "
+                 "not an accuracy threshold versus exact ReLU. sReLU uses the corrected smooth "
+                 "formula with public r/2 correction."]
     return "\n".join(rows) + "\n"
 
 

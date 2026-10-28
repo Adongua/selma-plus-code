@@ -688,6 +688,10 @@ def worker(rank, rendezvous, options):
                 "radius": options["radius"],
                 "input_bound": options["input_bound"],
                 "input_std": options["input_std"],
+                "hummingbird_fraction_bits": options["hummingbird_fraction_bits"],
+                "bicoptor_fraction_bits": options["bicoptor_fraction_bits"],
+                "exact_max_abs": options["exact_max_abs"],
+                "adapted_max_abs": options["adapted_max_abs"],
                 "seed": options["seed"],
                 "reveal_mode": options["reveal_mode"],
                 "correctness_policy": {
@@ -768,6 +772,10 @@ def main():
     parser.add_argument("--exact-max-abs", type=float, default=1e-3)
     parser.add_argument("--adapted-max-abs", type=float, default=5e-3)
     parser.add_argument(
+        "--allow-invalid-report", action="store_true",
+        help="exit successfully after writing a report with failed gates; invalid timings remain suppressed",
+    )
+    parser.add_argument(
         "--methods",
         nargs="+",
         choices=METHODS,
@@ -822,7 +830,7 @@ def main():
     report_path = args.output / "comparison.json"
     if report_path.exists():
         status = json.loads(report_path.read_text())["status"]
-        if status != "benchmark_passed":
+        if status != "benchmark_passed" and not args.allow_invalid_report:
             raise SystemExit(
                 "benchmark completed but failed correctness gates; inspect "
                 f"{report_path}"

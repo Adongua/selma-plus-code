@@ -63,6 +63,8 @@ def run_operator(operator, backend, root, repeats, distributions, timeout_second
         command.extend(method for method, _, _ in config["methods"])
         if operator == "slayernorm":
             command.extend(["--distributions", *distributions])
+        if operator == "srelu":
+            command.append("--allow-invalid-report")
         command.extend(["--output", str(directory)])
         print(f"\n[{backend.upper()}] {operator} shape {shape_text}", flush=True)
         _run_case(command, timeout_seconds, backend)
@@ -89,7 +91,7 @@ def run_operator(operator, backend, root, repeats, distributions, timeout_second
 def main(default_backend="nccl"):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("nccl", "gloo"), default=default_backend)
-    parser.add_argument("--operator", choices=("sgelu", "slayernorm", "both"),
+    parser.add_argument("--operator", choices=("sgelu", "slayernorm", "srelu", "both"),
                         required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--repeats", type=int, default=3)

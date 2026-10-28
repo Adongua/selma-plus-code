@@ -68,6 +68,44 @@ python -m unittest discover -s s-vit/hattention/tests -v
 
 ## Three-GPU smoke test
 
+For the Gloo/CUDA experiment, first confirm that initialization and the four
+methods work on a small input. The report can contain failed correctness gates;
+`--allow-invalid-report` keeps those results for inspection without allowing
+their performance numbers into the paper table.
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+export CUDA_VISIBLE_DEVICES=0,1,2
+
+timeout 600 python -m srelu.benchmark_crypten_cuda \
+  --backend gloo --shapes 1x17 --repeats 1 \
+  --methods crypten_native bicoptor2_keybits hummingbird_eco srelu \
+  --allow-invalid-report --output "$HOME/home/tmp/srelu-gloo-smoke"
+```
+
+After inspecting the smoke report, run the four-shape experiment and build the
+Markdown/LaTeX table with:
+
+```bash
+python -m run_microbenchmarks --backend gloo --operator srelu \
+  --repeats 3 --case-timeout 1800 \
+  --output-root "$HOME/home/tmp/srelu-gloo-paper-v1"
+```
+
+The resulting `srelu/srelu_microbenchmark_normal.md` excludes warmup and
+reports online seconds, system bytes in KiB, rounds and MAE versus exact ReLU.
+Every shape retains its `comparison.json`. If any measured repetition fails a
+method's correctness gate, that method/shape's timing, bytes and rounds are
+`INVALID`; MAE remains visible. The gate for adapted methods checks their own
+declared reference, so also inspect their MAE versus exact ReLU. The CrypTen
+provider's work is included online; Ring3 preprocessing is separate, and its
+Gloo GPU-to-CPU staging is timed. This is a GPU computation experiment with
+Gloo transport; it is not an all-GPU/NCCL communication result.
+
+The legacy NCCL smoke command below is retained for investigation; native
+CrypTen binary XOR reduction is not supported by the current NCCL backend.
+
 ```bash
 export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
 export OMP_NUM_THREADS=1

@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import microbenchmark_table as table
-import run_gloo_microbenchmarks as runner
+import run_microbenchmarks as runner
 
 
 class TableTests(unittest.TestCase):
@@ -33,9 +33,13 @@ class TableTests(unittest.TestCase):
                                "rounds_per_rank": [index + 1] * 3},
                     config["error"]: {"mae": 0.00001 * (index + 1)},
                 }
+                if operator == "srelu":
+                    methods[name]["correctness_gate"] = {"passed": True}
             row = {"warmup": warmup, "methods": methods}
             if operator == "slayernorm":
                 row.update(shape=list(shape), distribution=distribution)
+            elif operator == "srelu":
+                row.update(shape=list(shape))
             return row
         report = {"world_size": 3, "backend": "gloo", "crypten_import": "/test/crypten",
                   "crypten_default_precision_bits": 17, "python": "test", "torch": "test",
@@ -43,8 +47,13 @@ class TableTests(unittest.TestCase):
                                                               record(False, 2)]}
         if operator == "sgelu":
             report.update(shape=list(shape), mu=1.46)
-        else:
+        elif operator == "slayernorm":
             report.update(epsilon=1e-5, scale=1.0)
+        else:
+            report.update(status="benchmark_passed", radius=0.0055, input_bound=16.0,
+                          input_std=1.0, reveal_mode="all_reduce",
+                          hummingbird_fraction_bits=8, bicoptor_fraction_bits=2,
+                          exact_max_abs=1e-3, adapted_max_abs=5e-3)
         return report
 
     def write(self, name, obj):
@@ -83,8 +92,9 @@ class TableTests(unittest.TestCase):
                                     "slayernorm", "normal", "system_bytes")
 
     def test_batch_runner_uses_all_shapes_and_refuses_overwrite(self):
-        def fake_run(command, check):
-            self.assertTrue(check)
+        def fake_run(command, timeout_seconds, backend):
+            self.assertEqual(timeout_seconds, 10)
+            self.assertEqual(backend, "gloo")
             self.assertEqual(command[command.index("--backend") + 1], "gloo")
             shape = tuple(int(part) for part in command[command.index("--shape") + 1].split("x"))
             output = Path(command[command.index("--output") + 1])
@@ -92,13 +102,50 @@ class TableTests(unittest.TestCase):
             (output / "comparison.json").write_text(json.dumps(self.report("sgelu", shape)))
 
         root = Path(self.tmp.name) / "batch"
-        with patch.object(runner.subprocess, "run", side_effect=fake_run) as invoke:
+        with patch.object(runner, "_run_case", side_effect=fake_run) as invoke:
             with contextlib.redirect_stdout(io.StringIO()):
-                runner.run_operator("sgelu", root, 2, ["normal"])
+                runner.run_operator("sgelu", "gloo", root, 2, ["normal"], 10)
             self.assertEqual(invoke.call_count, 4)
             self.assertTrue((root / "sgelu/sgelu_microbenchmark_normal.md").exists())
             with self.assertRaisesRegex(RuntimeError, "overwritten"):
-                runner.run_operator("sgelu", root, 2, ["normal"])
+                runner.run_operator("sgelu", "gloo", root, 2, ["normal"], 10)
+
+    def test_srelu_invalid_gate_suppresses_performance_and_keeps_mae(self):
+        paths = []
+        for index, shape in enumerate(table.CONFIG["srelu"]["shapes"]):
+            report = self.report("srelu", shape)
+            if index == 0:
+                report["status"] = "benchmark_failed_correctness"
+                report["records"][1]["methods"]["bicoptor2_keybits"]["correctness_gate"]["passed"] = False
+            paths.append(self.write(f"relu-{index}.json", report))
+        values, meta = table.load_measurements(paths, "srelu", "normal", "system_bytes")
+        self.assertEqual(values[((1, 197), "bicoptor2_keybits")][:3], (None, None, None))
+        self.assertEqual(values[((1, 197), "bicoptor2_keybits")][3], 0.00002)
+        output = table.render("srelu", values, meta, "normal", "system_bytes")
+        self.assertIn("INVALID", output)
+        self.assertIn("Bicoptor 2.0 adapted", output)
+        self.assertIn("declared-reference correctness gate", output)
+
+    def test_srelu_batch_uses_gloo_and_keeps_invalid_reports(self):
+        def fake_run(command, timeout_seconds, backend):
+            self.assertEqual(backend, "gloo")
+            self.assertIn("--allow-invalid-report", command)
+            self.assertEqual(command[command.index("--backend") + 1], "gloo")
+            shape = tuple(int(part) for part in command[command.index("--shapes") + 1].split("x"))
+            output = Path(command[command.index("--output") + 1])
+            output.mkdir(parents=True)
+            report = self.report("srelu", shape)
+            report["status"] = "benchmark_failed_correctness"
+            report["records"][1]["methods"]["bicoptor2_keybits"]["correctness_gate"]["passed"] = False
+            (output / "comparison.json").write_text(json.dumps(report))
+
+        root = Path(self.tmp.name) / "srelu-batch"
+        with patch.object(runner, "_run_case", side_effect=fake_run) as invoke:
+            with contextlib.redirect_stdout(io.StringIO()):
+                runner.run_operator("srelu", "gloo", root, 2, ["normal"], 10)
+        self.assertEqual(invoke.call_count, 4)
+        content = (root / "srelu/srelu_microbenchmark_normal.md").read_text()
+        self.assertIn("INVALID", content)
 
 
 if __name__ == "__main__":
