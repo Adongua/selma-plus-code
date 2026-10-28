@@ -90,8 +90,48 @@ copies are included in phase timing. Gloo metric gathering uses CPU tensors;
 collective payload counts are estimates. Report the two backends separately.
 The new Gloo/CUDA path requires server validation.
 
-Secure RSA normalization, the grouped three-path benchmark, cost-table-driven
-search, pruning, and distillation remain subsequent phases.
+Validation and integration of standalone RSA, the grouped three-path benchmark,
+cost-table-driven search, pruning, and distillation remain subsequent phases.
+
+## Experimental standalone RSA
+
+`rsa.py` provides an initial independent RSA path: Q17 `QK^T`, public score
+scaling, standalone Ruler-sReLU with the public `r/2` correction, row sum,
+Q24 Newton reciprocal, secret weight multiplication, and `AV`. It uses
+one-time offline truncation and sReLU material. Its reciprocal is an
+engineering baseline, not a specified manuscript protocol. The grouped
+hAttention entry point still rejects RSA until this standalone implementation
+is validated in three-party runs.
+
+The experimental default profile requires every secret score to satisfy
+`abs(score) < 16` and every secret corrected-sReLU row denominator to be
+within `[0.01, 64]`. It also assumes that all fixed-point intermediate products
+remain within the signed range required by probabilistic truncation. These
+are caller obligations, not secret range checks. In particular, a positive
+epsilon alone does not ensure the denominator satisfies this contract: sReLU
+has a small possible fixed-point negative tail. The input fixture check in
+the benchmark only examines public synthetic plaintext and cannot establish
+the bounds of secret intermediate values.
+
+From the repository root on a server with three GPUs:
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+export CUDA_VISIBLE_DEVICES=0,1,2
+
+python -m unittest discover -s s-vit/hattention/tests -v
+timeout 1800 python -m hattention.benchmark_rsa_cuda \
+  --backend gloo --shape 1x1x17x16 --repeats 1 \
+  --output "$HOME/home/tmp/hattention-rsa-gloo-smoke"
+```
+
+The report compares against plaintext RSA on the same Q17 inputs using the
+effective quantized epsilon. Formal runs exceeding the maximum-error
+threshold cause `benchmark_failed_correctness` and a nonzero exit. Offline
+material scales with the score matrix (`N^2`); start with the small shape.
+The benchmark uses synthetic data and must not be treated as a privacy proof.
+Neither the Newton reciprocal nor full RSA has been server-validated yet.
 
 ## Standalone sReLU dependency
 
