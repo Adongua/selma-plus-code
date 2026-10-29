@@ -190,6 +190,7 @@ def grouped_hattention(
                 epsilon=epsilon,
                 radius=srelu_radius,
                 use_exact_relu=rsa_exact_relu,
+                score_scale=rho,
             )
         elif path == "lsa":
             group_output = lsa_attention(

@@ -257,6 +257,46 @@ Smoke subsets can omit classes; inspect per-class support and run the full
 validation set before interpreting group metrics. Treat this result as an
 evaluation under an explicit mapping hypothesis, not verified ground truth.
 
+### Differentiable head search: building blocks
+
+`hattention.search` supplies a plaintext mixed-path attention layer, a
+ViTLite conversion helper, differentiable grouped-count costs, numerical and
+budget penalties, a first-order alternating-update helper, greedy budget
+repair and fixed-path model export. `HEAD_TYPES` order is RSA, LSA, Mixer.
+All three paths execute during search; these times are not deployment times.
+The initial structure logits are uniform, not the manuscript's MPCViT prior.
+The numerical guard uses observed batches only and does not prove secure
+fixed-point range or privacy. Export currently retains packed QKV projections;
+Mixer Q/K physical pruning remains future work.
+
+`hattention.calibrate_group_costs` runs the existing three-party hybrid
+benchmark for explicit `(number of RSA heads, number of Mixer heads)` pairs.
+For a small server smoke test, for example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 python -m hattention.calibrate_group_costs \
+  --backend gloo --shape 1x2x17x8 --repeats 1 \
+  --pairs 0,0 0,2 --case-timeout 600 \
+  --output-root "$HOME/home/tmp/hattention-cost-smoke-cases" \
+  --table-output "$HOME/home/tmp/hattention-cost-smoke.json"
+```
+
+The table contains only correctness-passed measured cells, input/environment
+metadata and hashes of the source reports. Unmeasured cells are listed and
+never inferred. `load_complete_tables` refuses an incomplete table. Pass
+`--all-counts` instead of `--pairs` to measure all `(H+1)(H+2)/2` cells:
+12 heads require 91 separate cases, and large RSA cases can exhaust GPU memory.
+Use `--resume` to reuse matching completed cases after an interruption, with a
+new table-output filename. Per-count costs assume head order does not affect
+cost; rerun selected permutations and verify this assumption on the target
+system. The tables measure attention core only, not projections or full ViT.
+
+These are search primitives, not yet a complete Tiny-ImageNet training CLI:
+the data splits, pretrained checkpoint loader, teacher logits/feature mapping,
+full training loop, checkpoint/resume and final validation are still needed.
+The legacy MPCViT import depends on its `inference.py` and can fail on modern
+Python; resolve that compatibility path before using the actual checkpoint.
+
 ### Mixed-head correctness and configuration costs
 
 Each comparison JSON now includes `per_head_error_vs_own_reference` for every

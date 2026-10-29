@@ -1,0 +1,326 @@
+"""Plaintext differentiable hAttention search primitives.
+
+Search probabilities and the mixed supernet are not part of secure inference.
+Costs must be supplied from separately measured, compatible grouped executions.
+"""
+
+import copy
+import math
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from .config import HEAD_TYPES, HAttentionConfig
+from .reference import lsa_attention, mixer_attention, rsa_attention
+from .vit_integration import convert_attention
+
+
+class SearchableHAttention(nn.Module):
+    """Mixed RSA/LSA/Mixer paths for one ViT attention layer."""
+
+    def __init__(self, fixed, *, temperature=5.0, score_bound=16.0,
+                 denominator_min=0.01, input_fraction_bits=17):
+        super().__init__()
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("temperature must be positive and finite")
+        if not math.isfinite(score_bound) or score_bound <= 0 or not math.isfinite(denominator_min) or denominator_min <= 0:
+            raise ValueError("numerical bounds must be positive and finite")
+        if not isinstance(input_fraction_bits, int) or not 1 <= input_fraction_bits <= 52:
+            raise ValueError("invalid input fractional precision")
+        self.dim, self.config, self.head_dim = fixed.dim, fixed.config, fixed.head_dim
+        self.qkv, self.proj, self.proj_drop = fixed.qkv, fixed.proj, fixed.proj_drop
+        self.structure_logits = nn.Parameter(torch.zeros(self.config.num_heads, 3,
+                                                        device=self.qkv.weight.device,
+                                                        dtype=self.qkv.weight.dtype))
+        self.temperature = float(temperature)
+        self.score_bound, self.denominator_min = score_bound, denominator_min
+        self.input_fraction_bits = input_fraction_bits
+        self.register_buffer("observed_min_denominator", torch.full(
+            (self.config.num_heads,), float("inf"), device=self.qkv.weight.device,
+            dtype=self.qkv.weight.dtype))
+        self.last_numerical_penalty = None
+
+    def probabilities(self):
+        if not math.isfinite(self.temperature) or self.temperature <= 0:
+            raise ValueError("temperature must be positive and finite")
+        return F.softmax(self.structure_logits / self.temperature, dim=-1)
+
+    def forward(self, value):
+        if value.ndim != 3 or value.shape[-1] != self.dim:
+            raise ValueError(f"input must have (B,N,{self.dim}) layout")
+        batch, tokens, _ = value.shape
+        q, k, v = self.qkv(value).reshape(batch, tokens, 3, self.config.num_heads,
+                                           self.head_dim).permute(2, 0, 3, 1, 4).unbind(0)
+        rho = self.config.resolved_rho(self.head_dim)
+        rsa, aux = rsa_attention(q, k, v, epsilon=self.config.epsilon,
+                                  radius=self.config.srelu_radius, score_scale=rho,
+                                  return_aux=True)
+        lsa = lsa_attention(q, k, v, rho)
+        mixer = mixer_attention(v, self.config.patch_grid, self.config.has_cls_token)
+        probabilities = self.probabilities()
+        paths = torch.stack((rsa, lsa, mixer), dim=-1)
+        mixed = (paths * probabilities[None, :, None, None, :]).sum(dim=-1)
+
+        denominator = aux["positive"].sum(dim=-1)
+        score_penalty = (aux["scores"].abs() - self.score_bound).clamp_min(0).square().mean(dim=(0, 2, 3))
+        denominator_penalty = (self.denominator_min - denominator).clamp_min(0).square().mean(dim=(0, 2))
+        unit = 2.0 ** -self.input_fraction_bits
+        sensitivity = (unit / denominator.clamp_min(unit)).square().mean(dim=(0, 2))
+        self.last_numerical_penalty = ((score_penalty + denominator_penalty + sensitivity)
+                                       * probabilities[:, 0]).mean()
+        with torch.no_grad():
+            observed = denominator.detach().amin(dim=(0, 2))
+            self.observed_min_denominator.copy_(torch.minimum(self.observed_min_denominator, observed))
+        output = mixed.transpose(1, 2).reshape(batch, tokens, self.dim)
+        return self.proj_drop(self.proj(output))
+
+
+def make_search_student(model, configs, *, remove_attention_dropout=False,
+                        temperature=5.0, score_bound=16.0, denominator_min=0.01):
+    """Copy a ViTLite model and replace all attention layers with search layers."""
+    blocks = getattr(getattr(model, "classifier", None), "blocks", None)
+    if not isinstance(blocks, (nn.ModuleList, nn.Sequential)):
+        raise TypeError("model.classifier.blocks must be a ModuleList or Sequential")
+    configs = tuple(configs)
+    if not blocks or len(configs) != len(blocks):
+        raise ValueError("provide one configuration for every block")
+    seq_pool = getattr(model.classifier, "seq_pool", None)
+    if not isinstance(seq_pool, bool):
+        raise TypeError("model.classifier.seq_pool must identify CLS-token usage")
+    replacements = []
+    for block, config in zip(blocks, configs):
+        if not isinstance(config, HAttentionConfig) or config.has_cls_token == seq_pool:
+            raise ValueError("invalid attention config or CLS-token configuration")
+        fixed = convert_attention(block.self_attn, config,
+                                  remove_attention_dropout=remove_attention_dropout)
+        replacement = SearchableHAttention(fixed, temperature=temperature,
+                                           score_bound=score_bound,
+                                           denominator_min=denominator_min)
+        replacement.train(block.self_attn.training)
+        replacements.append(replacement)
+    student = copy.deepcopy(model)
+    for block, replacement in zip(student.classifier.blocks, replacements):
+        block.self_attn = replacement
+    return student
+
+
+def search_layers(model):
+    return [module for module in model.modules() if isinstance(module, SearchableHAttention)]
+
+
+def grouped_count_distribution(probabilities):
+    """Joint probability of (RSA count, Mixer count); path order is HEAD_TYPES."""
+    if probabilities.ndim != 2 or probabilities.shape[1] != 3 or probabilities.shape[0] < 1:
+        raise ValueError("probabilities must have shape (heads, 3)")
+    p = probabilities.new_ones((1, 1))
+    for head in probabilities:
+        # F.pad preserves autograd and expands one count dimension at a time.
+        p = (head[1] * F.pad(p, (0, 1, 0, 1))
+             + head[0] * F.pad(p, (0, 1, 1, 0))
+             + head[2] * F.pad(p, (1, 0, 0, 1)))
+    return p
+
+
+def expected_group_cost(probabilities, cost_table):
+    """Expected cost from a complete [rsa_count,mixer_count] tensor."""
+    heads = probabilities.shape[0]
+    if tuple(cost_table.shape) != (heads + 1, heads + 1):
+        raise ValueError("cost table shape must be (heads+1, heads+1)")
+    valid = torch.arange(heads + 1, device=probabilities.device)
+    mask = valid[:, None] + valid[None, :] <= heads
+    table = cost_table.to(device=probabilities.device, dtype=probabilities.dtype)
+    if not torch.isfinite(table[mask]).all() or (table[mask] < 0).any():
+        raise ValueError("all feasible group costs must be finite and nonnegative")
+    return (grouped_count_distribution(probabilities) * torch.where(mask, table, 0)).sum()
+
+
+def search_objective(layers, task_loss, cost_tables, budgets, *, lambda_num=0.1,
+                     lambda_cost=1.0, lambda_count=0.1, max_rsa=11,
+                     lambda_entropy=0.01, entropy_progress=1.0):
+    """Return structure-stage objective and named components; no implicit costs."""
+    if not layers or any(layer.last_numerical_penalty is None for layer in layers):
+        raise ValueError("run a forward pass on every search layer first")
+    if set(cost_tables) != set(budgets) or not budgets:
+        raise ValueError("cost tables and budgets must have the same nonempty metrics")
+    probs = [layer.probabilities() for layer in layers]
+    num = torch.stack([layer.last_numerical_penalty for layer in layers]).mean()
+    costs = {}
+    for key, budget in budgets.items():
+        if not math.isfinite(budget) or budget <= 0 or len(cost_tables[key]) != len(layers):
+            raise ValueError("budgets must be positive and each metric needs one table per layer")
+        costs[key] = sum(expected_group_cost(p, c) for p, c in zip(probs, cost_tables[key]))
+    budget_loss = sum((costs[key] / budget - 1).clamp_min(0).square()
+                      for key, budget in budgets.items())
+    if not math.isfinite(max_rsa) or max_rsa <= 0:
+        raise ValueError("max_rsa must be positive")
+    count = (sum(p[:, 0].sum() for p in probs) / max_rsa - 1).clamp_min(0).square()
+    entropy = torch.cat([-(p * p.clamp_min(torch.finfo(p.dtype).tiny).log()).sum(-1)
+                         for p in probs]).mean()
+    loss = task_loss + lambda_num * num + lambda_cost * budget_loss + lambda_count * count + lambda_entropy * entropy_progress * entropy
+    return loss, {"task": task_loss, "numerical": num, "budget": budget_loss,
+                  "rsa_count": count, "entropy": entropy, "expected_costs": costs}
+
+
+def weight_parameters(model):
+    """Separate trainable weights from architecture logits for alternating updates."""
+    logits = {id(layer.structure_logits) for layer in search_layers(model)}
+    return [p for p in model.parameters() if p.requires_grad and id(p) not in logits]
+
+
+def architecture_parameters(model):
+    return [layer.structure_logits for layer in search_layers(model)]
+
+
+def alternating_step(model, weight_optimizer, architecture_optimizer, weight_task,
+                     architecture_task, cost_tables, budgets, *, lambda_num=0.1,
+                     lambda_cost=1.0, lambda_count=0.1, max_rsa=11,
+                     lambda_entropy=0.01, entropy_progress=1.0):
+    """One first-order update on each disjoint batch via caller-provided closures.
+
+    Each closure must run a new forward pass and return a scalar task loss.
+    The caller owns data splits, teacher mapping and loss construction.
+    """
+    layers = search_layers(model)
+    weights, architecture = weight_parameters(model), architecture_parameters(model)
+    if not weights or not architecture:
+        raise ValueError("search model requires trainable weights and architecture parameters")
+    for optimizer, params in ((weight_optimizer, weights), (architecture_optimizer, architecture)):
+        actual = [p for group in optimizer.param_groups for p in group["params"]]
+        if len(actual) != len(params) or {id(p) for p in actual} != {id(p) for p in params}:
+            raise ValueError("optimizer parameters do not match their search parameter group")
+
+    def apply(loss, params, optimizer):
+        if loss.ndim != 0 or not torch.isfinite(loss):
+            raise ValueError("loss must be a finite scalar")
+        optimizer.zero_grad(set_to_none=True)
+        grads = torch.autograd.grad(loss, params, allow_unused=True)
+        for param, grad in zip(params, grads):
+            if grad is not None and not torch.isfinite(grad).all():
+                raise ValueError("non-finite search gradient")
+            param.grad = grad
+        optimizer.step()
+
+    for layer in layers:
+        layer.last_numerical_penalty = None
+    weight_loss = weight_task()
+    if any(layer.last_numerical_penalty is None for layer in layers):
+        raise ValueError("weight task must run every search layer")
+    weight_loss = weight_loss + lambda_num * torch.stack(
+        [layer.last_numerical_penalty for layer in layers]).mean()
+    apply(weight_loss, weights, weight_optimizer)
+    for layer in layers:
+        layer.last_numerical_penalty = None
+    task = architecture_task()
+    arch_loss, components = search_objective(
+        layers, task, cost_tables, budgets, lambda_num=lambda_num,
+        lambda_cost=lambda_cost, lambda_count=lambda_count, max_rsa=max_rsa,
+        lambda_entropy=lambda_entropy, entropy_progress=entropy_progress)
+    apply(arch_loss, architecture, architecture_optimizer)
+    return {"weight_loss": float(weight_loss.detach()),
+            "architecture_loss": float(arch_loss.detach()),
+            "expected_costs": {k: float(v.detach()) for k, v in components["expected_costs"].items()}}
+
+
+def temperature_at(epoch, epochs, start=5.0, end=0.1):
+    if epochs < 1 or epoch < 0 or epoch >= epochs or not 0 < start < float("inf") or not 0 < end < float("inf"):
+        raise ValueError("invalid temperature schedule")
+    return start * (end / start) ** (epoch / max(epochs - 1, 1))
+
+
+def discretize(layers, cost_tables, budgets, *, max_steps=10000):
+    """Choose paths and greedily repair budget violations; raises on failure.
+
+    RSA is excluded if any observed denominator is below its configured limit
+    or the head has never been observed. Observations do not prove future safety.
+    """
+    if not layers or not budgets or set(cost_tables) != set(budgets):
+        raise ValueError("layers, budgets and matching cost tables are required")
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive")
+    log_probs, allowed = [], []
+    for layer in layers:
+        p = layer.probabilities().detach().cpu()
+        log_probs.append(p.clamp_min(torch.finfo(p.dtype).tiny).log())
+        observed = layer.observed_min_denominator.detach().cpu()
+        allowed.append(torch.stack((torch.isfinite(observed) & (observed >= layer.denominator_min),
+                                    torch.ones_like(observed, dtype=torch.bool),
+                                    torch.ones_like(observed, dtype=torch.bool)), dim=1))
+    for key, budget in budgets.items():
+        if not math.isfinite(budget) or budget <= 0 or len(cost_tables[key]) != len(layers):
+            raise ValueError("invalid budget or number of cost tables")
+        for layer, table in zip(layers, cost_tables[key]):
+            expected_group_cost(torch.full_like(layer.structure_logits.detach(), 1 / 3), table)
+    selections = [torch.where(mask, p, -torch.inf).argmax(-1).tolist()
+                  for p, mask in zip(log_probs, allowed)]
+
+    def total_costs(config):
+        return {key: sum(float(table[heads.count(0), heads.count(2)])
+                         for heads, table in zip(config, tables))
+                for key, tables in cost_tables.items()}
+
+    def violation(costs):
+        return sum(max(0.0, costs[key] / budget - 1) for key, budget in budgets.items())
+
+    for step in range(max_steps + 1):
+        costs = total_costs(selections)
+        current = violation(costs)
+        if current <= 1e-12:
+            return {"head_types": [[HEAD_TYPES[i] for i in heads] for heads in selections],
+                    "costs": costs, "budgets": dict(budgets),
+                    "rsa_observation_warning": "observed samples only; not a safety proof"}
+        if step == max_steps:
+            break
+        best = None
+        for li, heads in enumerate(selections):
+            for hi, old in enumerate(heads):
+                for new in range(3):
+                    if new == old or not allowed[li][hi, new]:
+                        continue
+                    heads[hi] = new
+                    improvement = current - violation(total_costs(selections))
+                    heads[hi] = old
+                    if improvement > 1e-12:
+                        preference_loss = max(0.0, float(log_probs[li][hi, old] - log_probs[li][hi, new]))
+                        score = improvement / max(preference_loss, 1e-12)
+                        if best is None or score > best[0]:
+                            best = (score, li, hi, new)
+        if best is None:
+            break
+        selections[best[1]][best[2]] = best[3]
+    raise RuntimeError("greedy budget repair failed; this does not prove infeasibility")
+
+
+def export_fixed_student(model, head_types):
+    """Export a separate fixed-path model, preserving learned projections."""
+    layers = search_layers(model)
+    head_types = tuple(head_types)
+    if not layers or len(head_types) != len(layers):
+        raise ValueError("one head path list is required per search layer")
+    configs = [HAttentionConfig(num_heads=layer.config.num_heads, head_types=paths,
+                               rho=layer.config.rho, epsilon=layer.config.epsilon,
+                               srelu_radius=layer.config.srelu_radius,
+                               has_cls_token=layer.config.has_cls_token,
+                               patch_grid=layer.config.patch_grid)
+               for layer, paths in zip(layers, head_types)]
+    # The numerical penalty is a non-leaf tensor from the last forward pass;
+    # omit its ephemeral autograd graph while copying the model.
+    memo = {id(layer.last_numerical_penalty): None for layer in layers
+            if layer.last_numerical_penalty is not None}
+    fixed = copy.deepcopy(model, memo)
+    from .module import FixedHAttention
+    index = 0
+    for block in fixed.classifier.blocks:
+        layer = block.self_attn
+        if isinstance(layer, SearchableHAttention):
+            replacement = FixedHAttention(layer.dim, configs[index],
+                                           qkv_bias=layer.qkv.bias is not None,
+                                           projection_bias=layer.proj.bias is not None)
+            replacement.qkv, replacement.proj = layer.qkv, layer.proj
+            replacement.proj_drop = layer.proj_drop
+            replacement.train(layer.training)
+            block.self_attn = replacement
+            index += 1
+    if index != len(layers):
+        raise ValueError("search layers must reside in classifier.blocks[*].self_attn")
+    return fixed
