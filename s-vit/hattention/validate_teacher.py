@@ -89,8 +89,22 @@ def accuracy_summary(indices, support, correct1, correct5):
 def validation_items(root, wnids):
     images = root / "val" / "images"
     annotations = root / "val" / "val_annotations.txt"
+    if not annotations.is_file():
+        raise FileNotFoundError(f"validation annotations missing: {annotations}")
+    if not images.is_dir():
+        raise FileNotFoundError(f"validation image directory missing: {images}")
+
+    # Tiny-ImageNet normally stores all images directly in val/images. Index
+    # recursively as well so a harmless per-class/nested reorganization still
+    # works, while matching strictly by the filename in val_annotations.txt.
+    image_paths = {}
+    for path in images.rglob("*"):
+        if path.is_file():
+            image_paths.setdefault(path.name, []).append(path)
+
     indices = {wnid: i for i, wnid in enumerate(wnids)}
     result, seen = [], set()
+    missing, ambiguous = [], []
     for line_number, line in enumerate(annotations.read_text(encoding="utf-8").splitlines(), 1):
         parts = line.split("\t")
         if len(parts) < 2 or parts[1] not in indices:
@@ -98,11 +112,26 @@ def validation_items(root, wnids):
         name, wnid = parts[:2]
         if Path(name).name != name or name in seen:
             raise ValueError(f"invalid or duplicate image name at line {line_number}")
-        path = images / name
-        if not path.is_file():
-            raise ValueError(f"validation image missing: {path}")
+        candidates = image_paths.get(name, [])
+        if not candidates:
+            missing.append(name)
+            continue
+        if len(candidates) > 1:
+            ambiguous.append(name)
+            continue
         seen.add(name)
-        result.append((path, indices[wnid]))
+        result.append((candidates[0], indices[wnid]))
+    if ambiguous:
+        raise ValueError("validation image filenames are ambiguous under val/images: "
+                         f"{ambiguous[:5]} (and {max(0, len(ambiguous) - 5)} more)")
+    if missing:
+        sample_files = sorted(image_paths)[:8]
+        raise ValueError(
+            f"{len(missing)} annotated validation images are missing under {images}; "
+            f"first missing: {missing[:8]}; found {len(image_paths)} image files "
+            f"with names such as {sample_files}. Check that val/images and "
+            "val/val_annotations.txt come from the same Tiny-ImageNet archive."
+        )
     if not result:
         raise ValueError("validation annotations are empty")
     return result
