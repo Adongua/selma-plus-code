@@ -222,9 +222,11 @@ python -c 'import os; from huggingface_hub import snapshot_download; snapshot_do
 ```
 
 This server path assumes the documented `~/home/{selma-plus-code,models,datasets,tmp}`
-layout; adjust it if the dataset or models directory is elsewhere. For the
-official Tiny-ImageNet layout (`wnids.txt`, `val/images`, and
-`val/val_annotations.txt`), first run a small local-file-only evaluation:
+layout; adjust it if the dataset or models directory is elsewhere. Validation
+images can be in the official `val/images` directory or reorganized into
+`val/<wnid>/` class folders. Both require `val/val_annotations.txt`; filenames
+must match, and class folder names are checked against annotations. First run
+a small local-file-only evaluation:
 
 ```bash
 python -m hattention.validate_teacher \

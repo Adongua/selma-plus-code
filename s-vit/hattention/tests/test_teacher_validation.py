@@ -42,6 +42,23 @@ class TeacherValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 validator.validation_items(root, self.classes)
 
+    def test_validation_class_folders_agree_with_annotations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            folder = root / "val" / "n00000001"
+            folder.mkdir(parents=True)
+            image = folder / "val_0.JPEG"
+            image.touch()
+            annotations = root / "val" / "val_annotations.txt"
+            annotations.write_text("val_0.JPEG\tn00000001\n")
+            self.assertEqual(validator.validation_items(root, self.classes), [(image, 1)])
+            annotations.write_text("val_0.JPEG\tn00000002\n")
+            with self.assertRaisesRegex(ValueError, "class directory disagrees"):
+                validator.validation_items(root, self.classes)
+            annotations.write_text("missing.JPEG\tn00000001\n")
+            with self.assertRaisesRegex(ValueError, "1 annotated validation images are missing"):
+                validator.validation_items(root, self.classes)
+
     def test_first_name_mapping_records_wordnet_alias(self):
         labels = dict(self.labels)
         original = labels[0]
