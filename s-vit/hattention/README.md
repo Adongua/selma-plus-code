@@ -171,6 +171,77 @@ methods; `--patch-grid` or `--no-cls-token` controls Mixer token layout.
 The `hybrid` measurement is a grouped attention-core prototype, not end-to-end
 ViT inference or a trained/distilled model.
 
+### Fixed hAttention in a plaintext MPCViT student
+
+`hattention.vit_integration.make_fixed_student` accepts an already constructed
+`ViTLite` or `ViTLite_teacher`-style model, after loading any desired checkpoint.
+It deep-copies the model, then replaces the selected `classifier.blocks[*].self_attn`
+modules. The original model remains available as the teacher. QKV and output
+projection weights, dtype, gradient flags and output dropout are copied. Each
+layer requires its own public `HAttentionConfig`; CLS-token handling must match
+the classifier's `seq_pool` setting.
+
+```python
+from hattention import HAttentionConfig, make_fixed_student
+
+# teacher is an already constructed and checkpoint-loaded ViTLite model.
+paths = ("rsa", "lsa", "mixer", "mixer")  # example for a 4-head model
+configs = [HAttentionConfig(num_heads=4, head_types=paths)
+           for _ in teacher.classifier.blocks]
+student = make_fixed_student(teacher, configs, remove_attention_dropout=True)
+# If the teacher was frozen or in evaluation mode, choose student training
+# flags deliberately before constructing its optimizer:
+student.requires_grad_(True)
+student.train()
+```
+
+MPCViT normally uses nonzero dropout on the attention matrix; hAttention does
+not apply this operation to all three paths. `remove_attention_dropout=True`
+is therefore an explicit change to student training, not a weight conversion.
+Projection dropout is retained. Load the original checkpoint before conversion;
+the fixed student has a different attention state dict from the original teacher.
+This adapter is plaintext only: it neither executes 3PC nor performs distillation,
+structure search, Mixer Q/K pruning, or full-model secure benchmarking.
+
+### Candidate pretrained Tiny-ImageNet teacher
+
+The public [`tzhao3/vit-tiny-imagenet`](https://huggingface.co/tzhao3/vit-tiny-imagenet)
+is a candidate teacher, not yet validated in this project. Its 344 MB PyTorch
+weights and accompanying configs are published at revision
+`20235a2bfae4169eb3c9791ad79f7336465c35a5`. Its model card does not document
+training details; verify its license, architecture, labels and validation
+accuracy before use. It is not a confirmed same-architecture MPCViT teacher.
+
+On a machine with network access, install compatible `huggingface_hub`,
+`transformers`, Pillow and PyTorch in a suitable environment, then download
+only the necessary files into the project's external models directory:
+
+```bash
+export TEACHER_DIR="$HOME/home/models/tiny-imagenet-vit-teacher"
+python -c 'import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id="tzhao3/vit-tiny-imagenet", revision="20235a2bfae4169eb3c9791ad79f7336465c35a5", allow_patterns=["config.json", "preprocessor_config.json", "pytorch_model.bin"], local_dir=os.environ["TEACHER_DIR"])'
+```
+
+This server path assumes the documented `~/home/{selma-plus-code,models,datasets,tmp}`
+layout; adjust it if the dataset or models directory is elsewhere. For the
+official Tiny-ImageNet layout (`wnids.txt`, `val/images`, and
+`val/val_annotations.txt`), first run a small local-file-only evaluation:
+
+```bash
+python -m hattention.validate_teacher \
+  --teacher-dir "$HOME/home/models/tiny-imagenet-vit-teacher" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --device cuda --max-samples 32 --batch-size 8 \
+  --output "$HOME/home/tmp/teacher-validation-smoke.json"
+```
+
+For a meaningful top-1/top-5 result, rerun without `--max-samples` and use a
+fresh output file. The evaluator loads only the local tensor state dict with
+`weights_only=True`, records its SHA-256, and rejects missing or ambiguous
+class labels rather than assuming class order. It accepts exact WordNet IDs in
+the teacher's `id2label`; if the teacher uses a different label convention,
+manually verify the mapping against its original training metadata before
+extending the evaluator. It does not train or fine-tune the teacher.
+
 ### Mixed-head correctness and configuration costs
 
 Each comparison JSON now includes `per_head_error_vs_own_reference` for every

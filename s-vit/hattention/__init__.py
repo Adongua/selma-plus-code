@@ -2,6 +2,7 @@
 
 from .config import HAttentionConfig, HEAD_TYPES, normalize_head_types
 from .module import FixedHAttention
+from .vit_integration import convert_attention, make_fixed_student
 from .protocol import (
     FixedPointProfile,
     prepare_grouped_lsa_mixer,
@@ -21,6 +22,8 @@ from .reference import (
 )
 __all__ = [
     "FixedHAttention",
+    "convert_attention",
+    "make_fixed_student",
     "FixedPointProfile",
     "HAttentionConfig",
     "HEAD_TYPES",

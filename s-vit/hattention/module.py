@@ -32,6 +32,7 @@ class FixedHAttention(nn.Module):
         # Keep the original MPCViT parameter names (qkv/proj) so checkpoints
         # can be migrated without renaming their learned projection tensors.
         self.proj = nn.Linear(dim, dim, bias=projection_bias)
+        self.proj_drop = nn.Identity()
 
     def forward_preprojected(
         self,
@@ -65,7 +66,7 @@ class FixedHAttention(nn.Module):
         q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         output = self.forward_preprojected(q, k, v)
         output = output.transpose(1, 2).reshape(batch, tokens, self.dim)
-        return self.proj(output)
+        return self.proj_drop(self.proj(output))
 
     def extra_repr(self) -> str:
         counts = {
