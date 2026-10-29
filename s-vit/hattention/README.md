@@ -291,11 +291,53 @@ new table-output filename. Per-count costs assume head order does not affect
 cost; rerun selected permutations and verify this assumption on the target
 system. The tables measure attention core only, not projections or full ViT.
 
-These are search primitives, not yet a complete Tiny-ImageNet training CLI:
-the data splits, pretrained checkpoint loader, teacher logits/feature mapping,
-full training loop, checkpoint/resume and final validation are still needed.
-The legacy MPCViT import depends on its `inference.py` and can fail on modern
-Python; resolve that compatibility path before using the actual checkpoint.
+### Real checkpoint and one-step search smoke
+
+`student_checkpoint` loads the active weights from an existing `vit_9_12_64`
+checkpoint using restricted deserialization. The older checkpoint contains
+extra experimental layers absent from the current source; known extra keys are
+listed in the report, while unknown extras, missing active keys, or shape
+mismatches are rejected. The original MPCViT source imports its inference CLI
+just to obtain the `linear_gelu` flag; an isolated import compatibility shim
+sets it explicitly to false without modifying that source. The student's binary
+alpha values initialize RSA/LSA preferences and Mixer remains available.
+
+`search_data` uses a seeded per-class shuffle to split the official 500 train
+images into 450 weight-update and 50 structure-update images, preserving the
+validation split. Split manifest hashes are saved. The current smoke uses a
+64x64 bicubic resize and MPCViT Tiny-ImageNet mean/std without augmentation;
+it does not reproduce the original training augmentation recipe.
+
+After installing the existing project dependencies, run from the repository root:
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+export MPCVIT_CHECKPOINT="$PWD/mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.5-kd.pth.tar"
+
+CUDA_VISIBLE_DEVICES=0 python -m hattention.smoke_student \
+  --checkpoint "$MPCVIT_CHECKPOINT" --mpcvit-root "$PWD/mpcvit" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --device cuda --batch-size 1 --output "$HOME/home/tmp/hattention-student-smoke.json"
+
+CUDA_VISIBLE_DEVICES=0 python -m hattention.smoke_search_step \
+  --checkpoint "$MPCVIT_CHECKPOINT" --mpcvit-root "$PWD/mpcvit" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --teacher-dir "$HOME/home/models/tiny-imagenet-vit-teacher" \
+  --mapping first-name --device cuda --batch-size 1 --smoke-synthetic-costs \
+  --output "$HOME/home/tmp/hattention-search-step-smoke.json"
+```
+
+The first command only checks forwards; the second performs one weight step
+and one structure step with CE, teacher-logit KL and CLS-feature MSE. The
+student's 192-dimensional CLS feature is projected to the teacher's feature
+dimension; the teacher uses its own processor and frozen weights. Synthetic
+costs are explicitly restricted to smoke diagnostics and are not evidence of
+MPC performance. Alternatively `--cost-table` requires a *complete measured*
+table of matching `(B,12,257,16)` shape. First-name mapping remains an explicit
+unverified label hypothesis. These commands do not train a finished model or
+export a searched structure. Full multi-epoch training, checkpoint/resume,
+real 12-head cost calibration, validation, and Mixer Q/K pruning remain to do.
 
 ### Mixed-head correctness and configuration costs
 
