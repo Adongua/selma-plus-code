@@ -1,6 +1,7 @@
 """CPU-only label alignment and Tiny-ImageNet annotation checks."""
 
 import importlib.util
+from collections import Counter
 from pathlib import Path
 import tempfile
 import unittest
@@ -40,6 +41,40 @@ class TeacherValidationTests(unittest.TestCase):
             annotations.write_text("a.JPEG\tn00000001\na.JPEG\tn00000002\n")
             with self.assertRaisesRegex(ValueError, "duplicate"):
                 validator.validation_items(root, self.classes)
+
+    def test_first_name_mapping_records_wordnet_alias(self):
+        labels = dict(self.labels)
+        original = labels[0]
+        labels[0] = "n99999999"
+        names = {wnid: f"class {i}" for i, wnid in enumerate(self.classes)}
+        names[labels[0]] = names[original]
+        classes, indices, rows = validator.class_mapping_by_first_name(self.classes, labels, names)
+        self.assertEqual(classes, self.classes)
+        self.assertEqual(indices, list(reversed(range(200))))
+        self.assertEqual(sum(row["different_wnid"] for row in rows), 1)
+        self.assertEqual(rows[-1]["teacher_wnid"], "n99999999")
+        with self.assertRaises(ValueError):
+            validator.class_mapping(self.classes, labels)
+
+    def test_first_name_rejects_ambiguity_and_missing_ids(self):
+        names = {wnid: f"class {i}" for i, wnid in enumerate(self.classes)}
+        names[self.classes[1]] = names[self.classes[0]]
+        with self.assertRaisesRegex(ValueError, "unique"):
+            validator.class_mapping_by_first_name(self.classes, self.labels, names)
+        del names[self.classes[0]]
+        with self.assertRaisesRegex(ValueError, "missing WordNet IDs"):
+            validator.class_mapping_by_first_name(self.classes, self.labels, names)
+
+    def test_summary_includes_empty_and_partial_groups(self):
+        support = Counter({2: 4, 4: 2})
+        top1 = Counter({2: 3, 4: 1})
+        top5 = Counter({2: 4, 4: 2})
+        summary = validator.accuracy_summary([2, 4, 9], support, top1, top5)
+        self.assertEqual(summary["samples"], 6)
+        self.assertEqual(summary["classes_observed"], 2)
+        self.assertEqual(summary["top1"], 4 / 6)
+        self.assertEqual(summary["top5"], 1.0)
+        self.assertIsNone(validator.accuracy_summary([9], support, top1, top5)["top1"])
 
 
 if __name__ == "__main__":

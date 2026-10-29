@@ -237,10 +237,23 @@ python -m hattention.validate_teacher \
 For a meaningful top-1/top-5 result, rerun without `--max-samples` and use a
 fresh output file. The evaluator loads only the local tensor state dict with
 `weights_only=True`, records its SHA-256, and rejects missing or ambiguous
-class labels rather than assuming class order. It accepts exact WordNet IDs in
-the teacher's `id2label`; if the teacher uses a different label convention,
-manually verify the mapping against its original training metadata before
-extending the evaluator. It does not train or fine-tune the teacher.
+class labels rather than assuming class order. The default requires exact
+WordNet IDs in the teacher's `id2label`. It does not train or fine-tune the
+teacher.
+
+The downloaded `tzhao3` configuration uses 18 WordNet IDs different from the
+dataset IDs, while all 200 first names in `words.txt` match uniquely. A small
+training-set diagnostic supports the teacher's name-based index ordering but
+does not establish synset equivalence or validate individual classes. To test
+this explicit hypothesis on the held-out validation set, add
+`--mapping first-name` to the command above. The default `strict-id` mode
+still rejects mismatched IDs. The JSON report records all ID/index mappings,
+the source file hashes, per-class support and top-1/top-5 counts, and separate
+metrics for matching and differing IDs. Missing, duplicated or ambiguous names
+are rejected; identical first names do not prove identical WordNet senses.
+Smoke subsets can omit classes; inspect per-class support and run the full
+validation set before interpreting group metrics. Treat this result as an
+evaluation under an explicit mapping hypothesis, not verified ground truth.
 
 ### Mixed-head correctness and configuration costs
 
