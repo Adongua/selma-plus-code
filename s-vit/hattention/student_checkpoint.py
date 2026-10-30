@@ -100,6 +100,13 @@ def load_student(checkpoint_path, mpcvit_root):
                    "linear_gelu": False, "alpha_convention": "1=RSA, 0=LSA"}
 
 
+def create_random_student(mpcvit_root):
+    """Construct the MPCViT student architecture without loading any weights."""
+    model = import_mpcvit(mpcvit_root)(pretrained=False)
+    return model, {"checkpoint": None, "sha256": None, "architecture": "vit_9_12_64",
+                   "initialization": "random", "linear_gelu": False}
+
+
 def make_checkpoint_search_student(model, *, prior_strength=1.0, temperature=5.0):
     """Initialize path logits from checkpoint's binary RSA/LSA alpha; keep Mixer open."""
     if not 0 <= prior_strength < float("inf"):
@@ -123,7 +130,12 @@ def load_fixed_student(artifact_path, checkpoint_path, mpcvit_root):
     artifact = torch.load(artifact_path, map_location="cpu", weights_only=True)
     if not isinstance(artifact, dict) or artifact.get("format") != "hattention_fixed_student_v1":
         raise ValueError("expected an hAttention fixed-student artifact")
-    source, metadata = load_student(checkpoint_path, mpcvit_root)
+    if artifact.get("student_init", "checkpoint") == "scratch":
+        source, metadata = create_random_student(mpcvit_root)
+    else:
+        if checkpoint_path is None:
+            raise ValueError("checkpoint initialization requires its original checkpoint")
+        source, metadata = load_student(checkpoint_path, mpcvit_root)
     if artifact.get("source_checkpoint_sha256") != metadata["sha256"]:
         raise ValueError("original MPCViT checkpoint hash does not match export")
     search = make_checkpoint_search_student(source)

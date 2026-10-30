@@ -13,7 +13,8 @@ from hattention.config import HAttentionConfig
 from hattention.search import (alternating_step, architecture_parameters, make_search_student,
                                search_layers, weight_parameters)
 from hattention.search_data import SearchDataset, training_splits
-from hattention.student_checkpoint import load_fixed_student, load_student, make_checkpoint_search_student
+from hattention.student_checkpoint import (create_random_student, load_fixed_student, load_student,
+                                          make_checkpoint_search_student)
 from hattention.search import export_fixed_student
 from hattention.teacher_guidance import TeacherGuidance
 
@@ -64,6 +65,24 @@ class Processor:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_scratch_export_reloads_without_a_checkpoint(self):
+        repo = Path(__file__).resolve().parents[3]
+        torch.manual_seed(42)
+        source, metadata = create_random_student(repo / "mpcvit")
+        self.assertIsNone(metadata["sha256"])
+        student = make_checkpoint_search_student(source, prior_strength=0.)
+        student.search_feature_projection = nn.Linear(192, 6)
+        paths = [["mixer"] * 12 for _ in range(9)]
+        fixed = export_fixed_student(student, paths)
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "scratch.pt"
+            torch.save({"format": "hattention_fixed_student_v1", "state_dict": fixed.state_dict(),
+                        "head_types": paths, "source_checkpoint_sha256": None,
+                        "student_init": "scratch"}, artifact)
+            restored, _ = load_fixed_student(artifact, None, repo / "mpcvit")
+            self.assertTrue(torch.equal(restored.classifier.blocks[0].self_attn.qkv.weight,
+                                        fixed.classifier.blocks[0].self_attn.qkv.weight))
+
     def test_balanced_deterministic_disjoint_split_and_image_loading(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

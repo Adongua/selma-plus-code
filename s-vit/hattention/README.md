@@ -346,6 +346,54 @@ real teacher and a complete measured deployment cost table. The original
 Search holdout top-1/top-5 metrics are diagnostic, not official test accuracy.
 The minibatch size can differ from the measured deployment batch of one.
 
+#### Scratch, all-RSA starting point and efficiency-weighted search
+
+`--student-init scratch` creates a new `vit_9_12_64` student without reading a
+student checkpoint. The teacher is still loaded for CE/KD/feature guidance.
+Unless overridden, scratch mode starts with `--architecture-init rsa` and
+`--path-mode straight_through`: each head's forward path initially is exactly
+RSA, while the softmax probabilities supply surrogate architecture gradients.
+All three candidate outputs are still computed in this plaintext search; this
+does not time secure execution. Unlike MPCViT's two-way continuous alpha search,
+this uses three-way logits and a straight-through estimator. Initial *soft*
+probabilities are not one-hot: with margin 2 and temperature 5 the initial RSA
+probability is about 0.427, despite all 108 forward paths selecting RSA.
+
+The scratch defaults prioritize estimated attention-core efficiency with an
+adjustable weighted objective: `0.01 * task + 1.0 * (expected_time / budget)
++ 10.0 * max(expected_time / budget - 1, 0)^2`, plus numerical/count/entropy
+terms. `--lambda-task`, `--lambda-efficiency`, and `--lambda-cost` override
+these coefficients. The final Pareto selection retains the hard budget and
+maximizes mean log probability minus `--selection-cost-preference` times
+normalized cost (default 1 for scratch; 0 for legacy checkpoint runs). This
+is a weighted trade-off, not a guarantee of minimum latency or accuracy. The
+table is measured for a single deployment batch and contains experimental
+noise; validate selected structures by secure benchmark and independent data.
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+CUDA_VISIBLE_DEVICES=0 python -m hattention.train_search \
+  --student-init scratch --mpcvit-root "$PWD/mpcvit" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --teacher-dir "$HOME/home/models/tiny-imagenet-vit-teacher" \
+  --cost-table "$HOME/home/tmp/hattention-cost-12h-full-v2.json" \
+  --output-root "$HOME/home/tmp/hattention-scratch-smoke-v1" \
+  --device cuda --mapping first-name --epochs 1 --batch-size 1 \
+  --max-steps-per-epoch 2 --eval-samples 16 --log-every 1 \
+  --budget-online-seconds 9
+```
+
+This command is an integration smoke, not a trained result. `run.json` records
+initial path counts; epoch reports include task, numerical, budget and
+efficiency components, soft expected cost, and `argmax_structure_online_seconds`
+(lookup estimate for the hard paths). The final selection can differ from the
+argmax paths because of its budget and RSA denominator filter. To recalibrate
+scratch runs use `calibrate_search_denominators` with the same arguments as the
+checkpoint mode but omit `--checkpoint`; its fixed export can be reloaded as
+`load_fixed_student(artifact, None, mpcvit_root)`. Historical minimum denominators
+may be dominated by early random weights, so inspect final-model calibration.
+
 `--architecture-init mpcvit` (default) starts with the binary MPCViT head
 selection as a logit prior. `--architecture-init uniform` keeps the same
 pretrained model weights but starts every head with equal RSA/LSA/Mixer
@@ -378,7 +426,8 @@ CUDA_VISIBLE_DEVICES=0 python -m hattention.train_search \
 `9 s` is an example budget for the **sum of the nine attention cores**, not
 an experimentally justified whole-ViT target. Cost is a soft training penalty;
 the final global Pareto search chooses the highest-probability feasible count
-configuration in the measured tables and reports an error if none fits. This
+configuration in the measured tables and reports an error if none fits (for
+scratch mode the optional cost preference described above also applies). This
 does not establish an optimum for the continuous or true secure system. `--max-rsa` limits the expected total across
 all heads/layers, default 108 (no effective cap for this 9x12 model). The
 temperature schedule is 5.0 to 0.1. `--max-steps-per-epoch 0` processes the

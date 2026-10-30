@@ -34,6 +34,7 @@ class SearchableHAttention(nn.Module):
                                                         device=self.qkv.weight.device,
                                                         dtype=self.qkv.weight.dtype))
         self.temperature = float(temperature)
+        self.path_mode = "soft"
         self.score_bound, self.denominator_min = score_bound, denominator_min
         self.input_fraction_bits = input_fraction_bits
         self.register_buffer("observed_min_denominator", torch.full(
@@ -59,6 +60,11 @@ class SearchableHAttention(nn.Module):
         lsa = lsa_attention(q, k, v, rho)
         mixer = mixer_attention(v, self.config.patch_grid, self.config.has_cls_token)
         probabilities = self.probabilities()
+        if self.path_mode == "straight_through":
+            hard = F.one_hot(probabilities.argmax(dim=-1), num_classes=3).to(probabilities.dtype)
+            probabilities = hard - probabilities.detach() + probabilities
+        elif self.path_mode != "soft":
+            raise ValueError("invalid path mode")
         paths = torch.stack((rsa, lsa, mixer), dim=-1)
         mixed = (paths * probabilities[None, :, None, None, :]).sum(dim=-1)
 
@@ -140,7 +146,8 @@ def expected_group_cost(probabilities, cost_table):
 
 def search_objective(layers, task_loss, cost_tables, budgets, *, lambda_num=0.1,
                      lambda_cost=1.0, lambda_count=0.1, max_rsa=11,
-                     lambda_entropy=0.01, entropy_progress=1.0):
+                     lambda_entropy=0.01, entropy_progress=1.0,
+                     lambda_task=1.0, lambda_efficiency=0.0):
     """Return structure-stage objective and named components; no implicit costs."""
     if not layers or any(layer.last_numerical_penalty is None for layer in layers):
         raise ValueError("run a forward pass on every search layer first")
@@ -160,9 +167,10 @@ def search_objective(layers, task_loss, cost_tables, budgets, *, lambda_num=0.1,
     count = (sum(p[:, 0].sum() for p in probs) / max_rsa - 1).clamp_min(0).square()
     entropy = torch.cat([-(p * p.clamp_min(torch.finfo(p.dtype).tiny).log()).sum(-1)
                          for p in probs]).mean()
-    loss = task_loss + lambda_num * num + lambda_cost * budget_loss + lambda_count * count + lambda_entropy * entropy_progress * entropy
+    efficiency = sum(costs[key] / budget for key, budget in budgets.items())
+    loss = lambda_task * task_loss + lambda_num * num + lambda_cost * budget_loss + lambda_efficiency * efficiency + lambda_count * count + lambda_entropy * entropy_progress * entropy
     return loss, {"task": task_loss, "numerical": num, "budget": budget_loss,
-                  "rsa_count": count, "entropy": entropy, "expected_costs": costs}
+                  "efficiency": efficiency, "rsa_count": count, "entropy": entropy, "expected_costs": costs}
 
 
 def weight_parameters(model):
@@ -178,7 +186,8 @@ def architecture_parameters(model):
 def alternating_step(model, weight_optimizer, architecture_optimizer, weight_task,
                      architecture_task, cost_tables, budgets, *, lambda_num=0.1,
                      lambda_cost=1.0, lambda_count=0.1, max_rsa=11,
-                     lambda_entropy=0.01, entropy_progress=1.0):
+                     lambda_entropy=0.01, entropy_progress=1.0,
+                     lambda_task=1.0, lambda_efficiency=0.0):
     """One first-order update on each disjoint batch via caller-provided closures.
 
     Each closure must run a new forward pass and return a scalar task loss.
@@ -218,10 +227,13 @@ def alternating_step(model, weight_optimizer, architecture_optimizer, weight_tas
     arch_loss, components = search_objective(
         layers, task, cost_tables, budgets, lambda_num=lambda_num,
         lambda_cost=lambda_cost, lambda_count=lambda_count, max_rsa=max_rsa,
-        lambda_entropy=lambda_entropy, entropy_progress=entropy_progress)
+        lambda_entropy=lambda_entropy, entropy_progress=entropy_progress,
+        lambda_task=lambda_task, lambda_efficiency=lambda_efficiency)
     apply(arch_loss, architecture, architecture_optimizer)
     return {"weight_loss": float(weight_loss.detach()),
             "architecture_loss": float(arch_loss.detach()),
+            "architecture_components": {k: float(v.detach()) for k, v in components.items()
+                                        if k != "expected_costs"},
             "expected_costs": {k: float(v.detach()) for k, v in components["expected_costs"].items()}}
 
 
@@ -231,7 +243,7 @@ def temperature_at(epoch, epochs, start=5.0, end=0.1):
     return start * (end / start) ** (epoch / max(epochs - 1, 1))
 
 
-def discretize(layers, cost_tables, budgets, *, max_steps=10000):
+def discretize(layers, cost_tables, budgets, *, max_steps=10000, cost_preference=0.0):
     """Choose the highest-probability feasible structure from measured tables.
 
     RSA is excluded if any observed denominator is below its configured limit
@@ -241,7 +253,7 @@ def discretize(layers, cost_tables, budgets, *, max_steps=10000):
     """
     if not layers or not budgets or set(cost_tables) != set(budgets):
         raise ValueError("layers, budgets and matching cost tables are required")
-    if max_steps < 1:
+    if max_steps < 1 or not math.isfinite(cost_preference) or cost_preference < 0:
         raise ValueError("max_steps must be positive")
     log_probs, allowed = [], []
     for layer in layers:
@@ -315,10 +327,13 @@ def discretize(layers, cost_tables, budgets, *, max_steps=10000):
                             and score >= other[1] - 1e-12)]
             kept.append(candidate)
         frontier = kept
-    costs, score, selections = max(frontier, key=lambda row: row[1])
+    total_heads = sum(layer.config.num_heads for layer in layers)
+    costs, score, selections = max(frontier, key=lambda row: row[1] / total_heads - cost_preference *
+                                   sum(row[0][i] / budgets[key] for i, key in enumerate(keys)))
     return {"head_types": [[HEAD_TYPES[i] for i in heads] for heads in selections],
             "costs": dict(zip(keys, costs)), "budgets": dict(budgets),
             "log_probability_score": score,
+            "cost_preference": cost_preference,
             "discretization": "global measured-cost Pareto dynamic program",
             "rsa_observation_warning": "observed samples only; not a safety proof"}
 

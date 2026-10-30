@@ -15,7 +15,8 @@ from torch.utils.data import Subset
 from .group_costs import load_complete_tables
 from .search import discretize, export_fixed_student, search_layers, temperature_at
 from .search_data import SearchDataset, training_splits
-from .student_checkpoint import file_sha256, load_student, make_checkpoint_search_student
+from .student_checkpoint import (create_random_student, file_sha256, load_student,
+                                 make_checkpoint_search_student)
 from .train_search import evaluate, loader, save_checkpoint, split_architecture_items, write_json
 
 
@@ -67,8 +68,9 @@ def summarize(values, threshold):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("search-checkpoint", "checkpoint", "mpcvit-root", "dataset-root", "cost-table", "output-root"):
+    for name in ("search-checkpoint", "mpcvit-root", "dataset-root", "cost-table", "output-root"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, help="source weights for checkpoint-initialized search")
     parser.add_argument("--calibration-samples", type=int, default=1000)
     parser.add_argument("--eval-samples", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -87,7 +89,8 @@ def main():
     config = checkpoint["config"]
     if checkpoint["completed_epochs"] != config["epochs"]:
         raise ValueError("expected the final completed epoch checkpoint")
-    if file_sha256(args.checkpoint) != config["checkpoint_sha256"] or file_sha256(args.cost_table) != config["cost_table_sha256"]:
+    scratch = config.get("student_init", "checkpoint") == "scratch"
+    if (not scratch and (args.checkpoint is None or file_sha256(args.checkpoint) != config["checkpoint_sha256"])) or file_sha256(args.cost_table) != config["cost_table_sha256"]:
         raise ValueError("source checkpoint or cost-table hash differs from search")
     _, _, architecture_items, split = training_splits(args.dataset_root, seed=config["seed"])
     _, heldout, holdout = split_architecture_items(architecture_items,
@@ -100,7 +103,8 @@ def main():
     dataset = SearchDataset(args.dataset_root, heldout)
     cal = Subset(dataset, range(n_cal))
     evaluation = Subset(dataset, range(n_cal, n_cal + n_eval))
-    source, source_metadata = load_student(args.checkpoint, args.mpcvit_root)
+    source, source_metadata = (create_random_student(args.mpcvit_root) if scratch else
+                               load_student(args.checkpoint, args.mpcvit_root))
     model = make_checkpoint_search_student(source)
     weight = checkpoint["model"]["search_feature_projection.weight"]
     model.search_feature_projection = nn.Linear(weight.shape[1], weight.shape[0])
@@ -110,12 +114,14 @@ def main():
     layers = search_layers(model)
     for layer in layers:
         layer.temperature = temperature_at(config["epochs"] - 1, config["epochs"])
+        layer.path_mode = config.get("path_mode", "soft")
     tables, metadata = load_complete_tables(args.cost_table)
     if metadata["shape_b_h_n_d"] != [1, layers[0].config.num_heads, 257, 16]:
         raise ValueError("cost table has incompatible deployment shape")
     costs = {"online_seconds": [tables["online_seconds"]] * len(layers)}
     budgets = {"online_seconds": config["budget_online_seconds"]}
-    historical = discretize(layers, costs, budgets)
+    cost_preference = config.get("selection_cost_preference", 0.0)
+    historical = discretize(layers, costs, budgets, cost_preference=cost_preference)
     print(json.dumps({"event": "calibration_started", "samples": n_cal}), flush=True)
     observations = collect_denominators(model, cal, device, args.batch_size)
     summaries = [summarize(x, layer.denominator_min) for x, layer in zip(observations, layers)]
@@ -126,7 +132,7 @@ def main():
             minima = values.min(dim=1).values
             minima[~torch.isfinite(values).all(dim=1)] = float("nan")
             layer.observed_min_denominator.copy_(minima.to(layer.observed_min_denominator.device))
-        calibrated = discretize(layers, costs, budgets)
+        calibrated = discretize(layers, costs, budgets, cost_preference=cost_preference)
     finally:
         for layer, old in zip(layers, historical_min):
             layer.observed_min_denominator.copy_(old)
@@ -164,6 +170,7 @@ def main():
         save_checkpoint(root / f"fixed-student-{name}.pt", {
             "format": "hattention_fixed_student_v1", "state_dict": fixed_models[name].state_dict(),
             "head_types": results[name]["selection"]["head_types"],
+            "student_init": config.get("student_init", "checkpoint"),
             "source_checkpoint_sha256": source_metadata["sha256"]})
     print(json.dumps({"report": str(root / "report.json"), "changed_heads": changed, "mixed": mixed_eval,
                       "historical": results["historical"]["validation"],

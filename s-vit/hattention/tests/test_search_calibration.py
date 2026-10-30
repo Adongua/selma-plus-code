@@ -75,6 +75,25 @@ class CalibrationTests(unittest.TestCase):
             self.assertEqual(report["comparisons"]["calibrated"]["validation"]["samples"], 2)
             self.assertTrue((root / "output/fixed-student-calibrated.pt").exists())
 
+            config.update(student_init="scratch", checkpoint_sha256=None,
+                          path_mode="straight_through", selection_cost_preference=1.)
+            torch.save({"format": "hattention_search_checkpoint_v1", "config": config,
+                        "completed_epochs": 1, "model": model.state_dict()}, search_checkpoint)
+            scratch_argv = [x for x in argv if x not in ("--checkpoint", str(root / "model"))]
+            scratch_argv[scratch_argv.index(str(root / "output"))] = str(root / "scratch-output")
+            with patch("sys.argv", scratch_argv), \
+                 patch.object(calibration, "file_sha256", side_effect=lambda p: "cost" if Path(p).name == "cost" else "source"), \
+                 patch.object(calibration, "training_splits", return_value=([], [], items, {"seed": 1})), \
+                 patch.object(calibration, "create_random_student", return_value=(None, {"sha256": None})), \
+                 patch.object(calibration, "load_student", side_effect=AssertionError("loaded checkpoint")), \
+                 patch.object(calibration, "make_checkpoint_search_student", side_effect=make_model), \
+                 patch.object(calibration, "load_complete_tables", return_value=({"online_seconds": table},
+                     {"shape_b_h_n_d": [1, 12, 257, 16]})), \
+                 patch.object(calibration, "SearchDataset", WideFixture), redirect_stdout(io.StringIO()):
+                calibration.main()
+            scratch = torch.load(root / "scratch-output/fixed-student-calibrated.pt", weights_only=True)
+            self.assertEqual(scratch["student_init"], "scratch")
+
 
 if __name__ == "__main__":
     unittest.main()

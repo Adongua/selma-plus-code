@@ -22,7 +22,8 @@ from .search import (alternating_step, architecture_parameters, discretize,
                      export_fixed_student, search_layers,
                      temperature_at, weight_parameters)
 from .search_data import SearchDataset, collate_search, training_splits
-from .student_checkpoint import file_sha256, load_student, make_checkpoint_search_student
+from .student_checkpoint import (create_random_student, file_sha256, load_student,
+                                 make_checkpoint_search_student)
 from .teacher_guidance import load_teacher
 
 
@@ -62,7 +63,8 @@ def loader(dataset, batch_size, *, shuffle, seed):
 
 def train_epoch(model, teacher, weight_loader, architecture_loader, weight_optimizer,
                 architecture_optimizer, table, budget, device, *, epoch, epochs,
-                max_steps=0, max_rsa=108.0, lambda_cost=1.0, log_every=0):
+                max_steps=0, max_rsa=108.0, lambda_cost=1.0, log_every=0,
+                lambda_task=1.0, lambda_efficiency=0.0):
     model.train()
     layers = search_layers(model)
     temperature = temperature_at(epoch, epochs)
@@ -88,9 +90,13 @@ def train_epoch(model, teacher, weight_loader, architecture_loader, weight_optim
                                    {"online_seconds": [table] * len(layers)},
                                    {"online_seconds": budget}, max_rsa=max_rsa,
                                    lambda_cost=lambda_cost,
+                                   lambda_task=lambda_task, lambda_efficiency=lambda_efficiency,
                                    entropy_progress=epoch / max(epochs - 1, 1))
         for key in ("weight_loss", "architecture_loss"):
             totals[key] = totals.get(key, 0.0) + metrics[key]
+        for key, value in metrics["architecture_components"].items():
+            name = "architecture_" + key
+            totals[name] = totals.get(name, 0.0) + value
         totals["expected_online_seconds"] = (totals.get("expected_online_seconds", 0.0)
                                                + metrics["expected_costs"]["online_seconds"])
         steps += 1
@@ -173,10 +179,21 @@ def summarize_architecture(layers):
             "per_layer": per_layer}
 
 
+def selected_group_cost(layers, table):
+    """Cost-table estimate for the argmax assignments actually used by hard mode."""
+    total = 0.0
+    for layer in layers:
+        paths = layer.probabilities().detach().argmax(dim=-1)
+        total += float(table[int((paths == 0).sum()), int((paths == 2).sum())])
+    return total
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("checkpoint", "mpcvit-root", "dataset-root", "teacher-dir", "cost-table", "output-root"):
+    for name in ("mpcvit-root", "dataset-root", "teacher-dir", "cost-table", "output-root"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, help="MPCViT weights, required for checkpoint initialization")
+    parser.add_argument("--student-init", choices=("checkpoint", "scratch"), default="checkpoint")
     parser.add_argument("--resume", type=Path, help="resume a completed epoch checkpoint")
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--budget-online-seconds", type=float, required=True)
@@ -186,21 +203,40 @@ def main():
     parser.add_argument("--max-steps-per-epoch", type=int, default=0, help="0 uses the entire weight split")
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--validation-per-class", type=int, default=10)
-    parser.add_argument("--weight-lr", type=float, default=1e-5)
+    parser.add_argument("--weight-lr", type=float)
     parser.add_argument("--architecture-lr", type=float, default=3e-3)
-    parser.add_argument("--architecture-init", choices=("mpcvit", "uniform"), default="mpcvit",
-                        help="initial path logits: MPCViT head prior or equal probabilities")
-    parser.add_argument("--lambda-cost", type=float, default=1.0)
+    parser.add_argument("--architecture-init", choices=("mpcvit", "uniform", "rsa"))
+    parser.add_argument("--path-mode", choices=("soft", "straight_through"))
+    parser.add_argument("--rsa-logit-margin", type=float, default=2.0)
+    parser.add_argument("--lambda-cost", type=float)
+    parser.add_argument("--lambda-task", type=float)
+    parser.add_argument("--lambda-efficiency", type=float)
+    parser.add_argument("--selection-cost-preference", type=float)
     parser.add_argument("--max-rsa", type=float, default=108.0, help="soft total RSA count limit across all layers")
     parser.add_argument("--seed", type=int, default=20261030)
     parser.add_argument("--mapping", choices=("strict-id", "first-name"), default="first-name")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     args = parser.parse_args()
+    scratch = args.student_init == "scratch"
+    args.architecture_init = args.architecture_init or ("rsa" if scratch else "mpcvit")
+    args.path_mode = args.path_mode or ("straight_through" if scratch else "soft")
+    args.weight_lr = args.weight_lr if args.weight_lr is not None else (3e-4 if scratch else 1e-5)
+    args.lambda_cost = args.lambda_cost if args.lambda_cost is not None else (10.0 if scratch else 1.0)
+    args.lambda_task = args.lambda_task if args.lambda_task is not None else (0.01 if scratch else 1.0)
+    args.lambda_efficiency = args.lambda_efficiency if args.lambda_efficiency is not None else (1.0 if scratch else 0.0)
+    args.selection_cost_preference = (args.selection_cost_preference if args.selection_cost_preference is not None
+                                      else (1.0 if scratch else 0.0))
+    if scratch and (args.checkpoint is not None or args.architecture_init == "mpcvit"):
+        parser.error("scratch initialization cannot use a checkpoint or MPCViT architecture prior")
+    if not scratch and args.checkpoint is None:
+        parser.error("checkpoint initialization requires --checkpoint")
     if (args.epochs < 1 or args.batch_size < 1 or args.eval_batch_size < 1 or
         args.eval_samples < 1 or args.max_steps_per_epoch < 0 or args.log_every < 0 or
         any(not math.isfinite(x) or x <= 0 for x in
             (args.budget_online_seconds, args.weight_lr, args.architecture_lr, args.max_rsa)) or
-        not math.isfinite(args.lambda_cost) or args.lambda_cost < 0):
+        any(not math.isfinite(x) or x < 0 for x in (args.lambda_cost, args.lambda_task,
+            args.lambda_efficiency, args.selection_cost_preference)) or
+        not math.isfinite(args.rsa_logit_margin) or args.rsa_logit_margin <= 0):
         parser.error("invalid training, budget, or learning-rate arguments")
     if args.device == "cuda" and not torch.cuda.is_available():
         parser.error("CUDA requested but unavailable")
@@ -218,9 +254,16 @@ def main():
         architecture_items, validation_per_class=args.validation_per_class, seed=args.seed)
     if args.eval_samples > len(arch_val):
         parser.error("eval-samples exceeds the held-out search split")
-    source, checkpoint_metadata = load_student(args.checkpoint, args.mpcvit_root)
+    source, checkpoint_metadata = (create_random_student(args.mpcvit_root) if scratch else
+                                   load_student(args.checkpoint, args.mpcvit_root))
     model = make_checkpoint_search_student(
         source, prior_strength=1.0 if args.architecture_init == "mpcvit" else 0.0)
+    for layer in search_layers(model):
+        layer.path_mode = args.path_mode
+        if args.architecture_init == "rsa":
+            with torch.no_grad():
+                layer.structure_logits.zero_()
+                layer.structure_logits[:, 0] = args.rsa_logit_margin
     del source
     teacher, teacher_metadata = load_teacher(args.teacher_dir, args.dataset_root, mapping=args.mapping)
     model.search_feature_projection = nn.Linear(192, teacher_metadata["teacher_hidden_size"])
@@ -241,6 +284,10 @@ def main():
               "validation_per_class": args.validation_per_class, "weight_lr": args.weight_lr,
               "architecture_lr": args.architecture_lr, "lambda_cost": args.lambda_cost,
               "architecture_init": args.architecture_init,
+              "student_init": args.student_init, "path_mode": args.path_mode,
+              "rsa_logit_margin": args.rsa_logit_margin, "lambda_task": args.lambda_task,
+              "lambda_efficiency": args.lambda_efficiency,
+              "selection_cost_preference": args.selection_cost_preference,
               "max_rsa": args.max_rsa, "seed": args.seed, "mapping": args.mapping,
               "device": args.device, "cost_table_sha256": file_sha256(args.cost_table),
               "checkpoint_sha256": checkpoint_metadata["sha256"],
@@ -256,6 +303,10 @@ def main():
         saved_config = dict(checkpoint.get("config", {}))
         # Runs predating this option always used the MPCViT prior.
         saved_config.setdefault("architecture_init", "mpcvit")
+        for key, default in (("student_init", "checkpoint"), ("path_mode", "soft"),
+                             ("rsa_logit_margin", 2.0), ("lambda_task", 1.0),
+                             ("lambda_efficiency", 0.0), ("selection_cost_preference", 0.0)):
+            saved_config.setdefault(key, default)
         if checkpoint.get("format") != "hattention_search_checkpoint_v1" or saved_config != config:
             raise ValueError("resume checkpoint configuration or data/model hashes differ")
         start = checkpoint["completed_epochs"]
@@ -286,9 +337,11 @@ def main():
                               weight_opt, arch_opt, table, args.budget_online_seconds, device,
                               epoch=epoch, epochs=args.epochs, max_steps=args.max_steps_per_epoch,
                               max_rsa=args.max_rsa, lambda_cost=args.lambda_cost,
+                              lambda_task=args.lambda_task, lambda_efficiency=args.lambda_efficiency,
                               log_every=args.log_every)
         metrics["validation_mixed"] = evaluate(model, val_data, device, args.eval_batch_size, args.eval_samples)
         metrics["architecture"] = summarize_architecture(layers)
+        metrics["argmax_structure_online_seconds"] = selected_group_cost(layers, table)
         metrics["epoch"] = epoch + 1
         payload = {"format": "hattention_search_checkpoint_v1", "config": config,
                    "completed_epochs": epoch + 1, "model": model.state_dict(),
@@ -302,7 +355,7 @@ def main():
     # Temperature is an ordinary attribute, so restore the final schedule on resume.
     for layer in layers:
         layer.temperature = temperature_at(args.epochs - 1, args.epochs)
-    selection = discretize(layers, costs, budgets)
+    selection = discretize(layers, costs, budgets, cost_preference=args.selection_cost_preference)
     fixed = export_fixed_student(model, selection["head_types"])
     selection["validation_fixed"] = evaluate(fixed, val_data, device, args.eval_batch_size, args.eval_samples)
     selection["source_checkpoint"] = str((root / f"epoch-{args.epochs:04d}.pt").resolve())
@@ -311,6 +364,7 @@ def main():
                          "RSA range observations and Ruler are not a security proof.")
     save_checkpoint(root / "fixed-student.pt", {"format": "hattention_fixed_student_v1",
                     "state_dict": fixed.state_dict(), "head_types": selection["head_types"],
+                    "student_init": args.student_init,
                     "source_checkpoint_sha256": checkpoint_metadata["sha256"]})
     write_json(root / "selection.json", selection)
     print(json.dumps({"event": "search_complete", "selection": str(root / "selection.json"),

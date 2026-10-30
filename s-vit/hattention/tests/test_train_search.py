@@ -21,6 +21,8 @@ from hattention.train_search import (evaluate, loader, save_checkpoint,
                                     split_architecture_items, train_epoch)
 from hattention import train_search
 from hattention.student_checkpoint import make_checkpoint_search_student
+from hattention.reference import rsa_attention
+from hattention.search import discretize, search_objective
 
 
 class Attention(nn.Module):
@@ -110,6 +112,43 @@ class WideFixture(Dataset):
 
 
 class SearchRunnerTests(unittest.TestCase):
+    def test_straight_through_starts_with_rsa_and_has_search_gradients(self):
+        torch.manual_seed(4)
+        model = make_search_student(Student(), [HAttentionConfig(2, ("rsa", "rsa"), patch_grid=(2, 2))])
+        layer = search_layers(model)[0]
+        layer.path_mode = "straight_through"
+        with torch.no_grad():
+            layer.structure_logits[:, 0] = 2.0
+        value = torch.randn(1, 5, 8) * .2
+        q, k, v = layer.qkv(value).reshape(1, 5, 3, 2, 4).permute(2, 0, 3, 1, 4).unbind(0)
+        expected = rsa_attention(q, k, v, epsilon=layer.config.epsilon,
+                                 radius=layer.config.srelu_radius,
+                                 score_scale=layer.config.resolved_rho(layer.head_dim))
+        expected = layer.proj_drop(layer.proj(expected.transpose(1, 2).reshape(1, 5, 8)))
+        self.assertTrue(torch.allclose(layer(value), expected, atol=1e-7))
+        grad = torch.autograd.grad(layer(value).square().sum(), layer.structure_logits)[0]
+        self.assertTrue(torch.isfinite(grad).all())
+        self.assertGreater(float(grad.abs().sum()), 0)
+
+    def test_efficiency_objective_and_selection_reward_lower_cost(self):
+        model = make_search_student(Student(), [HAttentionConfig(2, ("rsa", "rsa"), patch_grid=(2, 2))])
+        layer = search_layers(model)[0]
+        layer.observed_min_denominator.fill_(1)
+        model(torch.randn(1, 5, 8) * .1)
+        table = torch.tensor([[2., 1., 0.], [4., 3., float("nan")], [6., float("nan"), float("nan")]])
+        loss, parts = search_objective([layer], torch.tensor(0.), {"time": [table]}, {"time": 10.},
+                                       lambda_task=0., lambda_cost=0., lambda_efficiency=1.,
+                                       lambda_num=0., lambda_count=0., lambda_entropy=0.)
+        grad = torch.autograd.grad(loss, layer.structure_logits)[0]
+        self.assertGreater(float(grad[:, 0].mean()), float(grad[:, 2].mean()))
+        self.assertGreater(float(parts["efficiency"]), 0)
+        with torch.no_grad():
+            layer.structure_logits[:, 1] = 1.
+        likely = discretize([layer], {"time": [table]}, {"time": 10.})
+        efficient = discretize([layer], {"time": [table]}, {"time": 10.}, cost_preference=20.)
+        self.assertEqual(likely["head_types"], [["lsa", "lsa"]])
+        self.assertEqual(efficient["head_types"], [["mixer", "mixer"]])
+
     def test_uniform_prior_preserves_weights_and_equalizes_probabilities(self):
         torch.manual_seed(5)
         source = Student()
@@ -223,6 +262,47 @@ class SearchRunnerTests(unittest.TestCase):
             selection = json.loads((output / "selection.json").read_text())
             self.assertEqual(len(selection["head_types"]), 1)
             self.assertTrue((output / "fixed-student.pt").exists())
+
+    def test_scratch_entrypoint_uses_no_checkpoint_and_exports(self):
+        items = [(f"{c}/{i}", c) for c in range(2) for i in range(2)]
+        teacher = TeacherGuidance(Teacher(), Processor(), list(range(200)))
+        meta = {"teacher_hidden_size": 6, "weights_sha256": "w", "config_sha256": "c",
+                "processor_sha256": "p"}
+        table = torch.zeros(13, 13, dtype=torch.float64)
+        def make_model(source, **kwargs):
+            return make_search_student(WideStudent(), [HAttentionConfig(12, ("lsa",) * 12,
+                                                                         patch_grid=(2, 2))])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cost = root / "cost.json"
+            cost.write_text("{}")
+            output = root / "output"
+            argv = ["train_search", "--student-init", "scratch", "--mpcvit-root", str(root),
+                    "--dataset-root", str(root), "--teacher-dir", str(root), "--cost-table", str(cost),
+                    "--output-root", str(output), "--epochs", "1", "--budget-online-seconds", "9",
+                    "--validation-per-class", "1", "--eval-samples", "2", "--max-steps-per-epoch", "1",
+                    "--device", "cpu"]
+            with patch("sys.argv", argv), \
+                 patch.object(train_search, "training_splits", return_value=(
+                     ["class0", "class1"], [("w0", 0), ("w1", 1)], items, {"seed": 1})), \
+                 patch.object(train_search, "create_random_student", return_value=(None, {"sha256": None})), \
+                 patch.object(train_search, "load_student", side_effect=AssertionError("loaded checkpoint")), \
+                 patch.object(train_search, "make_checkpoint_search_student", side_effect=make_model), \
+                 patch.object(train_search, "load_teacher", return_value=(teacher, meta)), \
+                 patch.object(train_search, "load_complete_tables", return_value=(
+                     {"online_seconds": table}, {"shape_b_h_n_d": [1, 12, 257, 16]})), \
+                 patch.object(train_search, "SearchDataset", WideFixture), redirect_stdout(io.StringIO()):
+                with patch.object(train_search, "discretize", side_effect=RuntimeError("interrupted export")):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted export"):
+                        train_search.main()
+                with patch("sys.argv", argv + ["--resume", str(output / "epoch-0001.pt")]):
+                    train_search.main()
+            run = json.loads((output / "run.json").read_text())
+            self.assertIsNone(run["config"]["checkpoint_sha256"])
+            self.assertEqual(run["config"]["path_mode"], "straight_through")
+            self.assertEqual(run["initial_architecture"]["per_layer"][0]["unique_preferred_counts"]["rsa"], 12)
+            saved = torch.load(output / "fixed-student.pt", weights_only=True)
+            self.assertEqual(saved["student_init"], "scratch")
 
 
 if __name__ == "__main__":
