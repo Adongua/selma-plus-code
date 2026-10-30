@@ -153,16 +153,28 @@ def main():
     start = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
-        if checkpoint.get("format") != "hattention_rsa_warmup_v1" or checkpoint.get("config") != config:
+        saved_config = checkpoint.get("config")
+        # The requested final epoch is a continuation target, not a training
+        # hyperparameter. Permit extending a run while keeping its data,
+        # optimizer, and objective settings identical.
+        saved_compatible_config = dict(saved_config or {})
+        current_compatible_config = dict(config)
+        saved_compatible_config.pop("epochs", None)
+        current_compatible_config.pop("epochs", None)
+        if (checkpoint.get("format") != "hattention_rsa_warmup_v1"
+                or saved_compatible_config != current_compatible_config):
             raise ValueError("warmup resume configuration or model/data hashes differ")
         start = checkpoint["completed_epochs"]
-        if not 0 < start <= args.epochs or args.resume.name != f"epoch-{start:04d}.pt":
-            raise ValueError("invalid warmup resume epoch or filename")
+        if not 0 < start < args.epochs or args.resume.name != f"epoch-{start:04d}.pt":
+            raise ValueError("resume target must be later than the checkpoint epoch; check its filename")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
         torch.set_rng_state(checkpoint["cpu_rng"].cpu())
         if device.type == "cuda":
             torch.cuda.set_rng_state(checkpoint["cuda_rng"].cpu(), device)
+        write_json(root / "run.json", {"config": config, "source": source_metadata,
+                                       "teacher": teacher_metadata,
+                                       "resumed_from": str(args.resume.resolve())})
     else:
         root.mkdir(parents=True, exist_ok=False)
         write_json(root / "run.json", {"config": config, "source": source_metadata,
