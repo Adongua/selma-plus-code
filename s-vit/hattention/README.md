@@ -335,9 +335,57 @@ dimension; the teacher uses its own processor and frozen weights. Synthetic
 costs are explicitly restricted to smoke diagnostics and are not evidence of
 MPC performance. Alternatively `--cost-table` requires a *complete measured*
 table of matching `(B,12,257,16)` shape. First-name mapping remains an explicit
-unverified label hypothesis. These commands do not train a finished model or
-export a searched structure. Full multi-epoch training, checkpoint/resume,
-real 12-head cost calibration, validation, and Mixer Q/K pruning remain to do.
+unverified label hypothesis. These smoke commands do not export a structure.
+
+### Multi-epoch architecture search
+
+`hattention.train_search` alternates weight and architecture updates using the
+real teacher and a complete measured deployment cost table. The original
+450/50 per-class split is refined into 450 weight, 40 architecture-update and
+10 search-holdout images; official validation is kept for final evaluation.
+Search holdout top-1/top-5 metrics are diagnostic, not official test accuracy.
+The minibatch size can differ from the measured deployment batch of one.
+
+Run a short integration check first, using a **new output directory**:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hattention.train_search \
+  --checkpoint "$MPCVIT_CHECKPOINT" --mpcvit-root "$PWD/mpcvit" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --teacher-dir "$HOME/home/models/tiny-imagenet-vit-teacher" \
+  --cost-table "$HOME/home/tmp/hattention-cost-12h-full-v2.json" \
+  --output-root "$HOME/home/tmp/hattention-search-run-smoke" \
+  --device cuda --mapping first-name --epochs 1 --batch-size 1 \
+  --max-steps-per-epoch 2 --eval-samples 16 --log-every 1 \
+  --budget-online-seconds 9
+```
+
+`9 s` is an example budget for the **sum of the nine attention cores**, not
+an experimentally justified whole-ViT target. Cost is a soft training penalty;
+the final greedy discretization attempts to meet the budget but may fail, and
+does not establish the optimum. `--max-rsa` limits the expected total across
+all heads/layers, default 108 (no effective cap for this 9x12 model). The
+temperature schedule is 5.0 to 0.1. `--max-steps-per-epoch 0` processes the
+full weight split and can take a long time; choose epochs, budget and training
+length explicitly for an actual search. Evaluation samples are interleaved by
+class, but small subsets are only smoke checks.
+
+Each completed epoch saves `epoch-NNNN.pt` and its metrics JSON. After
+interruption, repeat the identical arguments and add `--resume` pointing to
+the latest completed epoch checkpoint in the same output directory. A partial
+epoch is rerun; the checkpoint verifies configuration, split manifests, cost
+table and initial model/teacher file hashes. The output includes
+`selection.json` and `fixed-student.pt` only after successful discretization.
+The latter can be reloaded for later distillation with
+`hattention.student_checkpoint.load_fixed_student(artifact, original_checkpoint, mpcvit_root)`.
+Only trusted local checkpoints should be loaded.
+
+The fixed export keeps QKV projections, and the model is not yet distilled.
+Costs assume grouping depends on head counts and sum across layers; the table
+uses one measured repetition and differs in preprocessing accounting from some
+baselines. Search uses approximate plaintext paths and observed denominators;
+neither search accuracy nor measured costs prove secure inference correctness
+or privacy. Mixer Q/K pruning and final validation remain future work.
 
 ### Mixed-head correctness and configuration costs
 

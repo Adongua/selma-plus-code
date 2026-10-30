@@ -13,7 +13,8 @@ from hattention.config import HAttentionConfig
 from hattention.search import (alternating_step, architecture_parameters, make_search_student,
                                search_layers, weight_parameters)
 from hattention.search_data import SearchDataset, training_splits
-from hattention.student_checkpoint import load_student, make_checkpoint_search_student
+from hattention.student_checkpoint import load_fixed_student, load_student, make_checkpoint_search_student
+from hattention.search import export_fixed_student
 from hattention.teacher_guidance import TeacherGuidance
 
 
@@ -120,6 +121,18 @@ class PipelineTests(unittest.TestCase):
             alpha = block.self_attn.alpha.reshape(-1)
             self.assertTrue(torch.equal(layer.structure_logits[:, 0].detach(), alpha))
             self.assertTrue(torch.equal(layer.structure_logits[:, 1].detach(), 1 - alpha))
+        student.search_feature_projection = nn.Linear(192, 6)
+        paths = [["mixer"] * 12 for _ in range(9)]
+        fixed = export_fixed_student(student, paths)
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "fixed.pt"
+            torch.save({"format": "hattention_fixed_student_v1", "state_dict": fixed.state_dict(),
+                        "head_types": paths, "source_checkpoint_sha256": metadata["sha256"]}, artifact)
+            restored, info = load_fixed_student(artifact, checkpoint, repo / "mpcvit")
+            self.assertEqual(info["head_types"], paths)
+            self.assertEqual(restored.classifier.blocks[0].self_attn.config.head_types, tuple(paths[0]))
+            self.assertTrue(torch.equal(restored.classifier.blocks[0].self_attn.qkv.weight,
+                                        fixed.classifier.blocks[0].self_attn.qkv.weight))
 
 
 if __name__ == "__main__":

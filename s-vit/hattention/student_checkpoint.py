@@ -15,7 +15,7 @@ import types
 import torch
 
 from .config import HAttentionConfig
-from .search import make_search_student, search_layers
+from .search import export_fixed_student, make_search_student, search_layers
 
 
 LEGACY_EXTRA = re.compile(
@@ -116,3 +116,26 @@ def make_checkpoint_search_student(model, *, prior_strength=1.0, temperature=5.0
             layer.structure_logits[:, 0] = alpha * prior_strength
             layer.structure_logits[:, 1] = (1 - alpha) * prior_strength
     return student
+
+
+def load_fixed_student(artifact_path, checkpoint_path, mpcvit_root):
+    """Restore a search export using the exact original MPCViT initialization."""
+    artifact = torch.load(artifact_path, map_location="cpu", weights_only=True)
+    if not isinstance(artifact, dict) or artifact.get("format") != "hattention_fixed_student_v1":
+        raise ValueError("expected an hAttention fixed-student artifact")
+    source, metadata = load_student(checkpoint_path, mpcvit_root)
+    if artifact.get("source_checkpoint_sha256") != metadata["sha256"]:
+        raise ValueError("original MPCViT checkpoint hash does not match export")
+    search = make_checkpoint_search_student(source)
+    state = artifact.get("state_dict")
+    if not isinstance(state, dict) or "search_feature_projection.weight" not in state:
+        raise ValueError("fixed-student artifact is missing its feature projection")
+    weight = state["search_feature_projection.weight"]
+    if weight.ndim != 2 or weight.shape[1] != 192:
+        raise ValueError("invalid search feature projection shape")
+    search.search_feature_projection = torch.nn.Linear(192, weight.shape[0])
+    fixed = export_fixed_student(search, artifact.get("head_types", []))
+    fixed.load_state_dict(state, strict=True)
+    return fixed, {"artifact": str(Path(artifact_path).resolve()),
+                   "sha256": file_sha256(artifact_path), "source": metadata,
+                   "head_types": artifact["head_types"]}
