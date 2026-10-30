@@ -149,6 +149,27 @@ class SearchRunnerTests(unittest.TestCase):
         self.assertEqual(likely["head_types"], [["lsa", "lsa"]])
         self.assertEqual(efficient["head_types"], [["mixer", "mixer"]])
 
+    def test_budget_constrained_objective_does_not_reward_extra_slack(self):
+        model = make_search_student(Student(), [HAttentionConfig(2, ("rsa", "rsa"), patch_grid=(2, 2))])
+        layer = search_layers(model)[0]
+        layer.observed_min_denominator.fill_(1)
+        model(torch.randn(1, 5, 8) * .1)
+        table = torch.tensor([[2., 1., 0.], [4., 3., float("nan")], [6., float("nan"), float("nan")]])
+        task = torch.tensor(40.)
+        under_loss, under = search_objective(
+            [layer], task, {"time": [table]}, {"time": 10.}, task_loss_scale=50.,
+            lambda_task=1., lambda_cost=10., lambda_efficiency=0.,
+            lambda_num=0., lambda_count=0., lambda_entropy=0.)
+        self.assertAlmostEqual(float(under["task_normalized"]), .8)
+        self.assertEqual(float(under["budget"]), 0.)
+        self.assertAlmostEqual(float(under_loss), .8)
+        over_loss, over = search_objective(
+            [layer], task, {"time": [table]}, {"time": 1.}, task_loss_scale=50.,
+            lambda_task=1., lambda_cost=10., lambda_efficiency=0.,
+            lambda_num=0., lambda_count=0., lambda_entropy=0.)
+        self.assertGreater(float(over["budget"]), 0.)
+        self.assertGreater(float(over_loss), float(under_loss))
+
     def test_uniform_prior_preserves_weights_and_equalizes_probabilities(self):
         torch.manual_seed(5)
         source = Student()

@@ -346,7 +346,7 @@ real teacher and a complete measured deployment cost table. The original
 Search holdout top-1/top-5 metrics are diagnostic, not official test accuracy.
 The minibatch size can differ from the measured deployment batch of one.
 
-#### Scratch, all-RSA starting point and efficiency-weighted search
+#### Scratch, all-RSA starting point and budget-constrained search
 
 `--student-init scratch` creates a new `vit_9_12_64` student without reading a
 student checkpoint. The teacher is still loaded for CE/KD/feature guidance.
@@ -359,16 +359,26 @@ this uses three-way logits and a straight-through estimator. Initial *soft*
 probabilities are not one-hot: with margin 2 and temperature 5 the initial RSA
 probability is about 0.427, despite all 108 forward paths selecting RSA.
 
-The scratch defaults prioritize estimated attention-core efficiency with an
-adjustable weighted objective: `0.01 * task + 1.0 * (expected_time / budget)
-+ 10.0 * max(expected_time / budget - 1, 0)^2`, plus numerical/count/entropy
-terms. `--lambda-task`, `--lambda-efficiency`, and `--lambda-cost` override
-these coefficients. The final Pareto selection retains the hard budget and
-maximizes mean log probability minus `--selection-cost-preference` times
-normalized cost (default 1 for scratch; 0 for legacy checkpoint runs). This
-is a weighted trade-off, not a guarantee of minimum latency or accuracy. The
-table is measured for a single deployment batch and contains experimental
-noise; validate selected structures by secure benchmark and independent data.
+Scratch search treats latency as a budget constraint rather than rewarding
+lower latency without limit. Its architecture objective defaults to
+`task / 50 + 10 * max(expected_time / budget - 1, 0)^2`, plus numerical, RSA
+count, and entropy terms. `--task-loss-scale` (default 50 for scratch),
+`--lambda-task`, and `--lambda-cost` control these terms. There is no positive
+efficiency reward below the budget (`--lambda-efficiency` defaults to 0).
+After training, the Pareto selector chooses the highest learned path
+probability among structures that satisfy the measured hard budget; it has no
+extra cost preference by default (`--selection-cost-preference 0`). The
+intended priority is to meet the latency budget, then preserve learned task
+utility—not to choose the absolute cheapest structure. This is still a
+penalty-based differentiable search, not a formal constrained-optimization
+guarantee; check selected-model quality and measured runtime. The table is
+measured for a single deployment batch and contains experimental noise.
+
+The earlier scratch objective used a small task coefficient, a continuous
+efficiency reward, and a cost-biased final selector. It could collapse to an
+all-Mixer structure with near-zero latency and unusable accuracy. Runs created
+with that objective are not valid search results; start a fresh output
+directory after updating the code rather than resuming their checkpoints.
 
 ```bash
 export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"

@@ -64,7 +64,7 @@ def loader(dataset, batch_size, *, shuffle, seed):
 def train_epoch(model, teacher, weight_loader, architecture_loader, weight_optimizer,
                 architecture_optimizer, table, budget, device, *, epoch, epochs,
                 max_steps=0, max_rsa=108.0, lambda_cost=1.0, log_every=0,
-                lambda_task=1.0, lambda_efficiency=0.0):
+                lambda_task=1.0, lambda_efficiency=0.0, task_loss_scale=1.0):
     model.train()
     layers = search_layers(model)
     temperature = temperature_at(epoch, epochs)
@@ -91,6 +91,7 @@ def train_epoch(model, teacher, weight_loader, architecture_loader, weight_optim
                                    {"online_seconds": budget}, max_rsa=max_rsa,
                                    lambda_cost=lambda_cost,
                                    lambda_task=lambda_task, lambda_efficiency=lambda_efficiency,
+                                   task_loss_scale=task_loss_scale,
                                    entropy_progress=epoch / max(epochs - 1, 1))
         for key in ("weight_loss", "architecture_loss"):
             totals[key] = totals.get(key, 0.0) + metrics[key]
@@ -211,6 +212,8 @@ def main():
     parser.add_argument("--lambda-cost", type=float)
     parser.add_argument("--lambda-task", type=float)
     parser.add_argument("--lambda-efficiency", type=float)
+    parser.add_argument("--task-loss-scale", type=float,
+                        help="normalizer for the teacher task loss in architecture optimization")
     parser.add_argument("--selection-cost-preference", type=float)
     parser.add_argument("--max-rsa", type=float, default=108.0, help="soft total RSA count limit across all layers")
     parser.add_argument("--seed", type=int, default=20261030)
@@ -222,10 +225,11 @@ def main():
     args.path_mode = args.path_mode or ("straight_through" if scratch else "soft")
     args.weight_lr = args.weight_lr if args.weight_lr is not None else (3e-4 if scratch else 1e-5)
     args.lambda_cost = args.lambda_cost if args.lambda_cost is not None else (10.0 if scratch else 1.0)
-    args.lambda_task = args.lambda_task if args.lambda_task is not None else (0.01 if scratch else 1.0)
-    args.lambda_efficiency = args.lambda_efficiency if args.lambda_efficiency is not None else (1.0 if scratch else 0.0)
+    args.lambda_task = args.lambda_task if args.lambda_task is not None else 1.0
+    args.lambda_efficiency = args.lambda_efficiency if args.lambda_efficiency is not None else 0.0
+    args.task_loss_scale = args.task_loss_scale if args.task_loss_scale is not None else (50.0 if scratch else 1.0)
     args.selection_cost_preference = (args.selection_cost_preference if args.selection_cost_preference is not None
-                                      else (1.0 if scratch else 0.0))
+                                      else 0.0)
     if scratch and (args.checkpoint is not None or args.architecture_init == "mpcvit"):
         parser.error("scratch initialization cannot use a checkpoint or MPCViT architecture prior")
     if not scratch and args.checkpoint is None:
@@ -236,6 +240,7 @@ def main():
             (args.budget_online_seconds, args.weight_lr, args.architecture_lr, args.max_rsa)) or
         any(not math.isfinite(x) or x < 0 for x in (args.lambda_cost, args.lambda_task,
             args.lambda_efficiency, args.selection_cost_preference)) or
+        not math.isfinite(args.task_loss_scale) or args.task_loss_scale <= 0 or
         not math.isfinite(args.rsa_logit_margin) or args.rsa_logit_margin <= 0):
         parser.error("invalid training, budget, or learning-rate arguments")
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -287,6 +292,7 @@ def main():
               "student_init": args.student_init, "path_mode": args.path_mode,
               "rsa_logit_margin": args.rsa_logit_margin, "lambda_task": args.lambda_task,
               "lambda_efficiency": args.lambda_efficiency,
+              "task_loss_scale": args.task_loss_scale,
               "selection_cost_preference": args.selection_cost_preference,
               "max_rsa": args.max_rsa, "seed": args.seed, "mapping": args.mapping,
               "device": args.device, "cost_table_sha256": file_sha256(args.cost_table),
@@ -305,7 +311,8 @@ def main():
         saved_config.setdefault("architecture_init", "mpcvit")
         for key, default in (("student_init", "checkpoint"), ("path_mode", "soft"),
                              ("rsa_logit_margin", 2.0), ("lambda_task", 1.0),
-                             ("lambda_efficiency", 0.0), ("selection_cost_preference", 0.0)):
+                             ("lambda_efficiency", 0.0), ("task_loss_scale", 1.0),
+                             ("selection_cost_preference", 0.0)):
             saved_config.setdefault(key, default)
         if checkpoint.get("format") != "hattention_search_checkpoint_v1" or saved_config != config:
             raise ValueError("resume checkpoint configuration or data/model hashes differ")
@@ -338,6 +345,7 @@ def main():
                               epoch=epoch, epochs=args.epochs, max_steps=args.max_steps_per_epoch,
                               max_rsa=args.max_rsa, lambda_cost=args.lambda_cost,
                               lambda_task=args.lambda_task, lambda_efficiency=args.lambda_efficiency,
+                              task_loss_scale=args.task_loss_scale,
                               log_every=args.log_every)
         metrics["validation_mixed"] = evaluate(model, val_data, device, args.eval_batch_size, args.eval_samples)
         metrics["architecture"] = summarize_architecture(layers)

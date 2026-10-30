@@ -147,12 +147,15 @@ def expected_group_cost(probabilities, cost_table):
 def search_objective(layers, task_loss, cost_tables, budgets, *, lambda_num=0.1,
                      lambda_cost=1.0, lambda_count=0.1, max_rsa=11,
                      lambda_entropy=0.01, entropy_progress=1.0,
-                     lambda_task=1.0, lambda_efficiency=0.0):
+                     lambda_task=1.0, lambda_efficiency=0.0,
+                     task_loss_scale=1.0):
     """Return structure-stage objective and named components; no implicit costs."""
     if not layers or any(layer.last_numerical_penalty is None for layer in layers):
         raise ValueError("run a forward pass on every search layer first")
     if set(cost_tables) != set(budgets) or not budgets:
         raise ValueError("cost tables and budgets must have the same nonempty metrics")
+    if not math.isfinite(task_loss_scale) or task_loss_scale <= 0:
+        raise ValueError("task_loss_scale must be positive and finite")
     probs = [layer.probabilities() for layer in layers]
     num = torch.stack([layer.last_numerical_penalty for layer in layers]).mean()
     costs = {}
@@ -168,9 +171,13 @@ def search_objective(layers, task_loss, cost_tables, budgets, *, lambda_num=0.1,
     entropy = torch.cat([-(p * p.clamp_min(torch.finfo(p.dtype).tiny).log()).sum(-1)
                          for p in probs]).mean()
     efficiency = sum(costs[key] / budget for key, budget in budgets.items())
-    loss = lambda_task * task_loss + lambda_num * num + lambda_cost * budget_loss + lambda_efficiency * efficiency + lambda_count * count + lambda_entropy * entropy_progress * entropy
+    normalized_task = task_loss / task_loss_scale
+    loss = (lambda_task * normalized_task + lambda_num * num + lambda_cost * budget_loss
+            + lambda_efficiency * efficiency + lambda_count * count
+            + lambda_entropy * entropy_progress * entropy)
     return loss, {"task": task_loss, "numerical": num, "budget": budget_loss,
-                  "efficiency": efficiency, "rsa_count": count, "entropy": entropy, "expected_costs": costs}
+                  "task_normalized": normalized_task, "efficiency": efficiency,
+                  "rsa_count": count, "entropy": entropy, "expected_costs": costs}
 
 
 def weight_parameters(model):
@@ -187,7 +194,8 @@ def alternating_step(model, weight_optimizer, architecture_optimizer, weight_tas
                      architecture_task, cost_tables, budgets, *, lambda_num=0.1,
                      lambda_cost=1.0, lambda_count=0.1, max_rsa=11,
                      lambda_entropy=0.01, entropy_progress=1.0,
-                     lambda_task=1.0, lambda_efficiency=0.0):
+                     lambda_task=1.0, lambda_efficiency=0.0,
+                     task_loss_scale=1.0):
     """One first-order update on each disjoint batch via caller-provided closures.
 
     Each closure must run a new forward pass and return a scalar task loss.
@@ -228,7 +236,8 @@ def alternating_step(model, weight_optimizer, architecture_optimizer, weight_tas
         layers, task, cost_tables, budgets, lambda_num=lambda_num,
         lambda_cost=lambda_cost, lambda_count=lambda_count, max_rsa=max_rsa,
         lambda_entropy=lambda_entropy, entropy_progress=entropy_progress,
-        lambda_task=lambda_task, lambda_efficiency=lambda_efficiency)
+        lambda_task=lambda_task, lambda_efficiency=lambda_efficiency,
+        task_loss_scale=task_loss_scale)
     apply(arch_loss, architecture, architecture_optimizer)
     return {"weight_loss": float(weight_loss.detach()),
             "architecture_loss": float(arch_loss.detach()),
