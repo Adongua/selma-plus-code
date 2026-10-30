@@ -63,6 +63,9 @@ class SearchableHAttention(nn.Module):
         mixed = (paths * probabilities[None, :, None, None, :]).sum(dim=-1)
 
         denominator = aux["positive"].sum(dim=-1)
+        observer = getattr(self, "denominator_observer", None)
+        if observer is not None:
+            observer(denominator.detach())
         score_penalty = (aux["scores"].abs() - self.score_bound).clamp_min(0).square().mean(dim=(0, 2, 3))
         denominator_penalty = (self.denominator_min - denominator).clamp_min(0).square().mean(dim=(0, 2))
         unit = 2.0 ** -self.input_fraction_bits

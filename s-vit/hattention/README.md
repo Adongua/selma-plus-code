@@ -382,6 +382,25 @@ The latter can be reloaded for later distillation with
 Only trusted local checkpoints should be loaded.
 
 The fixed export keeps QKV projections, and the model is not yet distilled.
+
+### Final-search RSA denominator diagnostic
+
+`python -m hattention.calibrate_search_denominators` reloads a completed search
+checkpoint and measures final mixed-model plaintext RSA row denominators on a
+class-interleaved held-out training subset. It preserves the historical training
+minima, runs the same strict minimum threshold and budget selection with both
+historical and newly measured minima, then compares both fixed exports and the
+mixed model on a disjoint subset. The report records per-head minima, row
+quantiles and below-threshold fractions, path assignments, and costs.
+
+Use `--search-checkpoint`, `--checkpoint` (original MPCViT), `--mpcvit-root`,
+`--dataset-root`, `--cost-table`, and a new `--output-root`. Calibration and
+evaluation default to 1000 samples each; reduce both for a smoke test. The
+checkpoint's split, source and cost-table hashes must match. The held-out split
+was already monitored during search; this diagnostic uses part of it for
+selection, and neither metric replaces a separate final test. Mixed-model
+denominators do not prove the fixed model satisfies the Q17 3PC range contract.
+Check fixed-model inputs and run secure numerical tests before using a result.
 Costs assume grouping depends on head counts and sum across layers; the table
 uses one measured repetition and differs in preprocessing accounting from some
 baselines. Search uses approximate plaintext paths and observed denominators;
