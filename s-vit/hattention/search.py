@@ -229,10 +229,12 @@ def temperature_at(epoch, epochs, start=5.0, end=0.1):
 
 
 def discretize(layers, cost_tables, budgets, *, max_steps=10000):
-    """Choose paths and greedily repair budget violations; raises on failure.
+    """Choose the highest-probability feasible structure from measured tables.
 
     RSA is excluded if any observed denominator is below its configured limit
     or the head has never been observed. Observations do not prove future safety.
+    Per-layer path-count choices are solved by dynamic programming; a global
+    Pareto search handles non-monotone measured group costs across layers.
     """
     if not layers or not budgets or set(cost_tables) != set(budgets):
         raise ValueError("layers, budgets and matching cost tables are required")
@@ -251,44 +253,71 @@ def discretize(layers, cost_tables, budgets, *, max_steps=10000):
             raise ValueError("invalid budget or number of cost tables")
         for layer, table in zip(layers, cost_tables[key]):
             expected_group_cost(torch.full_like(layer.structure_logits.detach(), 1 / 3), table)
-    selections = [torch.where(mask, p, -torch.inf).argmax(-1).tolist()
-                  for p, mask in zip(log_probs, allowed)]
-
-    def total_costs(config):
-        return {key: sum(float(table[heads.count(0), heads.count(2)])
-                         for heads, table in zip(config, tables))
-                for key, tables in cost_tables.items()}
-
-    def violation(costs):
-        return sum(max(0.0, costs[key] / budget - 1) for key, budget in budgets.items())
-
-    for step in range(max_steps + 1):
-        costs = total_costs(selections)
-        current = violation(costs)
-        if current <= 1e-12:
-            return {"head_types": [[HEAD_TYPES[i] for i in heads] for heads in selections],
-                    "costs": costs, "budgets": dict(budgets),
-                    "rsa_observation_warning": "observed samples only; not a safety proof"}
-        if step == max_steps:
-            break
-        best = None
-        for li, heads in enumerate(selections):
-            for hi, old in enumerate(heads):
-                for new in range(3):
-                    if new == old or not allowed[li][hi, new]:
+    keys = tuple(budgets)
+    layer_options = []
+    for layer_index, (scores, masks) in enumerate(zip(log_probs, allowed)):
+        # For each feasible (RSA count, Mixer count), retain its most probable
+        # head assignment. The dynamic program is O(heads^3), not 3**heads.
+        states = {(0, 0): (0.0, ())}
+        for head_index in range(scores.shape[0]):
+            updated = {}
+            for (rsa_count, mixer_count), (score, assignment) in states.items():
+                for path in range(3):
+                    if not bool(masks[head_index, path]):
                         continue
-                    heads[hi] = new
-                    improvement = current - violation(total_costs(selections))
-                    heads[hi] = old
-                    if improvement > 1e-12:
-                        preference_loss = max(0.0, float(log_probs[li][hi, old] - log_probs[li][hi, new]))
-                        score = improvement / max(preference_loss, 1e-12)
-                        if best is None or score > best[0]:
-                            best = (score, li, hi, new)
-        if best is None:
-            break
-        selections[best[1]][best[2]] = best[3]
-    raise RuntimeError("greedy budget repair failed; this does not prove infeasibility")
+                    next_rsa = rsa_count + (path == 0)
+                    next_mixer = mixer_count + (path == 2)
+                    candidate = (score + float(scores[head_index, path]), assignment + (path,))
+                    key = (next_rsa, next_mixer)
+                    if key not in updated or candidate[0] > updated[key][0]:
+                        updated[key] = candidate
+            states = updated
+        options = []
+        for (rsa_count, mixer_count), (score, assignment) in states.items():
+            cost = tuple(float(cost_tables[key][layer_index][rsa_count, mixer_count])
+                         for key in keys)
+            if any(not math.isfinite(value) or value < 0 for value in cost):
+                continue
+            options.append((cost, score, assignment))
+        if not options:
+            raise RuntimeError(f"layer {layer_index} has no feasible measured path counts")
+        layer_options.append(options)
+
+    # States are (cost vector, summed log probability, per-layer assignment).
+    frontier = [((0.0,) * len(keys), 0.0, ())]
+    for layer_index, options in enumerate(layer_options):
+        candidates = []
+        for old_cost, old_score, assignment in frontier:
+            for cost, score, paths in options:
+                total = tuple(a + b for a, b in zip(old_cost, cost))
+                if all(total[i] <= budgets[key] + 1e-12 for i, key in enumerate(keys)):
+                    candidates.append((total, old_score + score, assignment + (paths,)))
+        if not candidates:
+            minimum = {key: min(option[0][i] for option in layer_options[:layer_index + 1])
+                       for i, key in enumerate(keys)}
+            raise RuntimeError(f"no structure meets all budgets after layer {layer_index}; "
+                               f"per-layer minimum costs are {minimum}")
+        # Pareto-prune: a state is useful only if no state is both cheaper in
+        # every metric and at least as likely under the learned path logits.
+        candidates.sort(key=lambda row: (sum(row[0]), row[0], -row[1]))
+        kept = []
+        for candidate in candidates:
+            cost, score, _ = candidate
+            dominated = any(all(other[0][i] <= cost[i] + 1e-12 for i in range(len(keys)))
+                            and other[1] >= score - 1e-12 for other in kept)
+            if dominated:
+                continue
+            kept = [other for other in kept
+                    if not (all(cost[i] <= other[0][i] + 1e-12 for i in range(len(keys)))
+                            and score >= other[1] - 1e-12)]
+            kept.append(candidate)
+        frontier = kept
+    costs, score, selections = max(frontier, key=lambda row: row[1])
+    return {"head_types": [[HEAD_TYPES[i] for i in heads] for heads in selections],
+            "costs": dict(zip(keys, costs)), "budgets": dict(budgets),
+            "log_probability_score": score,
+            "discretization": "global measured-cost Pareto dynamic program",
+            "rsa_observation_warning": "observed samples only; not a safety proof"}
 
 
 def export_fixed_student(model, head_types):

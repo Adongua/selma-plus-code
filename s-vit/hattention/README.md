@@ -362,8 +362,9 @@ CUDA_VISIBLE_DEVICES=0 python -m hattention.train_search \
 
 `9 s` is an example budget for the **sum of the nine attention cores**, not
 an experimentally justified whole-ViT target. Cost is a soft training penalty;
-the final greedy discretization attempts to meet the budget but may fail, and
-does not establish the optimum. `--max-rsa` limits the expected total across
+the final global Pareto search chooses the highest-probability feasible count
+configuration in the measured tables and reports an error if none fits. This
+does not establish an optimum for the continuous or true secure system. `--max-rsa` limits the expected total across
 all heads/layers, default 108 (no effective cap for this 9x12 model). The
 temperature schedule is 5.0 to 0.1. `--max-steps-per-epoch 0` processes the
 full weight split and can take a long time; choose epochs, budget and training

@@ -127,8 +127,24 @@ class SearchTests(unittest.TestCase):
     def test_impossible_budget_reports_repair_failure(self):
         config = HAttentionConfig(2, ("rsa", "rsa"), patch_grid=(2, 2))
         layer = search_layers(make_search_student(Model(), [config]))[0]
-        with self.assertRaisesRegex(RuntimeError, "does not prove infeasibility"):
+        with self.assertRaisesRegex(RuntimeError, "no structure meets all budgets"):
             discretize([layer], {"time": [table() + 1]}, {"time": 0.1})
+
+    def test_global_discretization_escapes_non_monotone_single_head_trap(self):
+        config = HAttentionConfig(2, ("rsa", "rsa"), patch_grid=(2, 2))
+        layer = search_layers(make_search_student(Model(), [config]))[0]
+        with torch.no_grad():
+            layer.observed_min_denominator.fill_(1.0)
+            layer.structure_logits[:, 0] = 8.0
+            layer.structure_logits[:, 1:] = -8.0
+        non_monotone = torch.tensor([
+            [0.0, 20.0, 20.0],
+            [6.0, 100.0, float("nan")],
+            [5.0, float("nan"), float("nan")],
+        ])
+        selected = discretize([layer], {"time": [non_monotone]}, {"time": 1.0})
+        self.assertEqual(selected["head_types"], [["lsa", "lsa"]])
+        self.assertEqual(selected["costs"]["time"], 0.0)
 
 
 class GroupCostTests(unittest.TestCase):
