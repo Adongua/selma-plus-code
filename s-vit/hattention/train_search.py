@@ -81,23 +81,37 @@ def train_epoch(model, teacher, weight_loader, architecture_loader, weight_optim
             architecture_iterator = iter(architecture_loader)
             architecture_batch = next(architecture_iterator)
 
-        def task(batch):
+        task_components = {}
+
+        def task(batch, stage):
             inputs, images, labels = batch
-            return teacher.loss(model, images, inputs.to(device), labels.to(device))[0]
+            loss, components = teacher.loss(model, images, inputs.to(device), labels.to(device))
+            task_components[stage] = {key: float(value.detach()) for key, value in components.items()}
+            return loss
 
         metrics = alternating_step(model, weight_optimizer, architecture_optimizer,
-                                   lambda: task(weight_batch), lambda: task(architecture_batch),
+                                   lambda: task(weight_batch, "weight"),
+                                   lambda: task(architecture_batch, "architecture"),
                                    {"online_seconds": [table] * len(layers)},
                                    {"online_seconds": budget}, max_rsa=max_rsa,
                                    lambda_cost=lambda_cost,
                                    lambda_task=lambda_task, lambda_efficiency=lambda_efficiency,
                                    task_loss_scale=task_loss_scale,
                                    entropy_progress=epoch / max(epochs - 1, 1))
+        if (getattr(model.classifier, "seq_pool", None) is False
+                and all(layer.config.has_cls_token and layer.path_mode == "straight_through" for layer in layers)
+                and all(bool((layer.structure_logits.argmax(dim=-1) == 2).all()) for layer in layers)):
+            raise RuntimeError("architecture collapsed to all-Mixer: CLS cannot receive patch information")
+        metrics["task_components"] = task_components
         for key in ("weight_loss", "architecture_loss"):
             totals[key] = totals.get(key, 0.0) + metrics[key]
         for key, value in metrics["architecture_components"].items():
             name = "architecture_" + key
             totals[name] = totals.get(name, 0.0) + value
+        for stage, components in task_components.items():
+            for key, value in components.items():
+                name = f"{stage}_{key}"
+                totals[name] = totals.get(name, 0.0) + value
         totals["expected_online_seconds"] = (totals.get("expected_online_seconds", 0.0)
                                                + metrics["expected_costs"]["online_seconds"])
         steps += 1
@@ -189,12 +203,45 @@ def selected_group_cost(layers, table):
     return total
 
 
+def load_rsa_warmup_weights(model, path, classes, split, teacher_metadata=None):
+    """Load a full-split fixed-RSA warmup; keep new search logits and observations."""
+    artifact = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(artifact, dict) or artifact.get("format") != "hattention_rsa_warmup_v1":
+        raise ValueError("expected an all-RSA warmup checkpoint")
+    config = artifact.get("config", {})
+    if config.get("overfit_diagnostic") is not False:
+        raise ValueError("overfit diagnostic checkpoints cannot initialize a search")
+    if config.get("class_order") != classes or config.get("training_split") != split:
+        raise ValueError("warmup dataset split or class order differs from search")
+    if config.get("loss") == "distill":
+        if teacher_metadata is None or any(
+                config.get("teacher_" + key) != teacher_metadata.get(key)
+                for key in ("weights_sha256", "config_sha256", "processor_sha256")):
+            raise ValueError("warmup teacher differs from the search teacher")
+    state = artifact.get("model")
+    if not isinstance(state, dict):
+        raise ValueError("warmup checkpoint has no model state")
+    own = model.state_dict()
+    expected_missing = {key for key in own if key.endswith(".structure_logits")
+                        or key.endswith(".observed_min_denominator")}
+    if "search_feature_projection.weight" not in state:
+        expected_missing |= {key for key in own if key.startswith("search_feature_projection.")}
+    missing = set(own) - set(state)
+    unexpected = set(state) - set(own)
+    if missing != expected_missing or unexpected:
+        raise ValueError(f"warmup model mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
+    model.load_state_dict(state, strict=False)
+    return artifact.get("metrics")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("mpcvit-root", "dataset-root", "teacher-dir", "cost-table", "output-root"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, help="MPCViT weights, required for checkpoint initialization")
     parser.add_argument("--student-init", choices=("checkpoint", "scratch"), default="checkpoint")
+    parser.add_argument("--warmup-checkpoint", type=Path,
+                        help="full-split all-RSA warmup weights for scratch search")
     parser.add_argument("--resume", type=Path, help="resume a completed epoch checkpoint")
     parser.add_argument("--epochs", type=int, required=True)
     parser.add_argument("--budget-online-seconds", type=float, required=True)
@@ -234,6 +281,8 @@ def main():
         parser.error("scratch initialization cannot use a checkpoint or MPCViT architecture prior")
     if not scratch and args.checkpoint is None:
         parser.error("checkpoint initialization requires --checkpoint")
+    if args.warmup_checkpoint is not None and (not scratch or args.architecture_init != "rsa"):
+        parser.error("warmup weights require scratch initialization and the RSA architecture prior")
     if (args.epochs < 1 or args.batch_size < 1 or args.eval_batch_size < 1 or
         args.eval_samples < 1 or args.max_steps_per_epoch < 0 or args.log_every < 0 or
         any(not math.isfinite(x) or x <= 0 for x in
@@ -272,6 +321,9 @@ def main():
     del source
     teacher, teacher_metadata = load_teacher(args.teacher_dir, args.dataset_root, mapping=args.mapping)
     model.search_feature_projection = nn.Linear(192, teacher_metadata["teacher_hidden_size"])
+    warmup_metrics = (load_rsa_warmup_weights(model, args.warmup_checkpoint, classes, split,
+                                              teacher_metadata=teacher_metadata)
+                      if args.warmup_checkpoint is not None else None)
     device = torch.device(args.device)
     model, teacher = model.to(device), teacher.to(device).eval()
     layers = search_layers(model)
@@ -297,6 +349,8 @@ def main():
               "max_rsa": args.max_rsa, "seed": args.seed, "mapping": args.mapping,
               "device": args.device, "cost_table_sha256": file_sha256(args.cost_table),
               "checkpoint_sha256": checkpoint_metadata["sha256"],
+              "warmup_checkpoint_sha256": (file_sha256(args.warmup_checkpoint)
+                                           if args.warmup_checkpoint is not None else None),
               "teacher_weights_sha256": teacher_metadata["weights_sha256"],
               "teacher_config_sha256": teacher_metadata["config_sha256"],
               "teacher_processor_sha256": teacher_metadata["processor_sha256"],
@@ -309,6 +363,7 @@ def main():
         saved_config = dict(checkpoint.get("config", {}))
         # Runs predating this option always used the MPCViT prior.
         saved_config.setdefault("architecture_init", "mpcvit")
+        saved_config.setdefault("warmup_checkpoint_sha256", None)
         for key, default in (("student_init", "checkpoint"), ("path_mode", "soft"),
                              ("rsa_logit_margin", 2.0), ("lambda_task", 1.0),
                              ("lambda_efficiency", 0.0), ("task_loss_scale", 1.0),
@@ -329,7 +384,8 @@ def main():
             torch.cuda.set_rng_state(checkpoint["cuda_rng"].cpu(), device)
     else:
         write_json(root / "run.json", {"config": config, "checkpoint": checkpoint_metadata,
-                   "teacher": teacher_metadata, "cost_table": str(args.cost_table.resolve()),
+                   "teacher": teacher_metadata, "warmup_metrics": warmup_metrics,
+                   "cost_table": str(args.cost_table.resolve()),
                    "cost_metadata": cost_metadata, "class_order": classes,
                    "initial_architecture": summarize_architecture(layers),
                    "note": "Search is plaintext. Official validation is reserved for final evaluation."})

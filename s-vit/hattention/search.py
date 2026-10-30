@@ -252,7 +252,8 @@ def temperature_at(epoch, epochs, start=5.0, end=0.1):
     return start * (end / start) ** (epoch / max(epochs - 1, 1))
 
 
-def discretize(layers, cost_tables, budgets, *, max_steps=10000, cost_preference=0.0):
+def discretize(layers, cost_tables, budgets, *, max_steps=10000, cost_preference=0.0,
+               require_cls_mixing=None):
     """Choose the highest-probability feasible structure from measured tables.
 
     RSA is excluded if any observed denominator is below its configured limit
@@ -264,6 +265,8 @@ def discretize(layers, cost_tables, budgets, *, max_steps=10000, cost_preference
         raise ValueError("layers, budgets and matching cost tables are required")
     if max_steps < 1 or not math.isfinite(cost_preference) or cost_preference < 0:
         raise ValueError("max_steps must be positive")
+    if require_cls_mixing is None:
+        require_cls_mixing = any(layer.config.has_cls_token for layer in layers)
     log_probs, allowed = [], []
     for layer in layers:
         p = layer.probabilities().detach().cpu()
@@ -307,15 +310,17 @@ def discretize(layers, cost_tables, budgets, *, max_steps=10000, cost_preference
             raise RuntimeError(f"layer {layer_index} has no feasible measured path counts")
         layer_options.append(options)
 
-    # States are (cost vector, summed log probability, per-layer assignment).
-    frontier = [((0.0,) * len(keys), 0.0, ())]
+    # Track whether a head can convey patch information to CLS. A disconnected
+    # state must not dominate a connected state during Pareto pruning.
+    frontier = [((0.0,) * len(keys), 0.0, (), False)]
     for layer_index, options in enumerate(layer_options):
         candidates = []
-        for old_cost, old_score, assignment in frontier:
+        for old_cost, old_score, assignment, connected in frontier:
             for cost, score, paths in options:
                 total = tuple(a + b for a, b in zip(old_cost, cost))
                 if all(total[i] <= budgets[key] + 1e-12 for i, key in enumerate(keys)):
-                    candidates.append((total, old_score + score, assignment + (paths,)))
+                    candidates.append((total, old_score + score, assignment + (paths,),
+                                       connected or any(path != 2 for path in paths)))
         if not candidates:
             minimum = {key: min(option[0][i] for option in layer_options[:layer_index + 1])
                        for i, key in enumerate(keys)}
@@ -326,33 +331,42 @@ def discretize(layers, cost_tables, budgets, *, max_steps=10000, cost_preference
         candidates.sort(key=lambda row: (sum(row[0]), row[0], -row[1]))
         kept = []
         for candidate in candidates:
-            cost, score, _ = candidate
-            dominated = any(all(other[0][i] <= cost[i] + 1e-12 for i in range(len(keys)))
+            cost, score, _, connected = candidate
+            dominated = any(other[3] == connected and all(other[0][i] <= cost[i] + 1e-12 for i in range(len(keys)))
                             and other[1] >= score - 1e-12 for other in kept)
             if dominated:
                 continue
             kept = [other for other in kept
-                    if not (all(cost[i] <= other[0][i] + 1e-12 for i in range(len(keys)))
+                    if not (other[3] == connected and all(cost[i] <= other[0][i] + 1e-12 for i in range(len(keys)))
                             and score >= other[1] - 1e-12)]
             kept.append(candidate)
         frontier = kept
     total_heads = sum(layer.config.num_heads for layer in layers)
-    costs, score, selections = max(frontier, key=lambda row: row[1] / total_heads - cost_preference *
+    if require_cls_mixing:
+        frontier = [state for state in frontier if state[3]]
+        if not frontier:
+            raise RuntimeError("no budget-feasible structure connects CLS to patch tokens")
+    costs, score, selections, _ = max(frontier, key=lambda row: row[1] / total_heads - cost_preference *
                                    sum(row[0][i] / budgets[key] for i, key in enumerate(keys)))
     return {"head_types": [[HEAD_TYPES[i] for i in heads] for heads in selections],
             "costs": dict(zip(keys, costs)), "budgets": dict(budgets),
             "log_probability_score": score,
             "cost_preference": cost_preference,
+            "requires_cls_mixing": require_cls_mixing,
             "discretization": "global measured-cost Pareto dynamic program",
             "rsa_observation_warning": "observed samples only; not a safety proof"}
 
 
-def export_fixed_student(model, head_types):
+def export_fixed_student(model, head_types, *, allow_disconnected_cls=False):
     """Export a separate fixed-path model, preserving learned projections."""
     layers = search_layers(model)
     head_types = tuple(head_types)
     if not layers or len(head_types) != len(layers):
         raise ValueError("one head path list is required per search layer")
+    if (not allow_disconnected_cls and getattr(model.classifier, "seq_pool", None) is False
+            and all(layer.config.has_cls_token for layer in layers)
+            and all(path == "mixer" for paths in head_types for path in paths)):
+        raise ValueError("all-Mixer CLS classifier cannot receive image patch information")
     configs = [HAttentionConfig(num_heads=layer.config.num_heads, head_types=paths,
                                rho=layer.config.rho, epsilon=layer.config.epsilon,
                                srelu_radius=layer.config.srelu_radius,

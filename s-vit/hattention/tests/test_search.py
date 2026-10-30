@@ -146,6 +146,19 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(selected["head_types"], [["lsa", "lsa"]])
         self.assertEqual(selected["costs"]["time"], 0.0)
 
+    def test_cls_constraint_preserves_connected_pareto_state(self):
+        config = HAttentionConfig(2, ("mixer", "mixer"), patch_grid=(2, 2))
+        layer = search_layers(make_search_student(Model(), [config]))[0]
+        with torch.no_grad():
+            layer.structure_logits[:] = torch.tensor([[-10., -5., 10.], [-10., -5., 10.]])
+        selected = discretize([layer, layer], {"time": [table(), table()]}, {"time": 0.5})
+        self.assertEqual(sum(path != "mixer" for paths in selected["head_types"] for path in paths), 1)
+        self.assertEqual(selected["costs"]["time"], 0.5)
+        with self.assertRaisesRegex(RuntimeError, "connects CLS"):
+            discretize([layer], {"time": [table()]}, {"time": 0.1})
+        with self.assertRaisesRegex(ValueError, "all-Mixer"):
+            export_fixed_student(make_search_student(Model(), [config]), [["mixer", "mixer"]])
+
 
 class GroupCostTests(unittest.TestCase):
     def test_calibration_configuration_checks_shape_grid_and_order(self):

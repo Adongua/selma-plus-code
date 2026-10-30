@@ -23,6 +23,9 @@ from hattention import train_search
 from hattention.student_checkpoint import make_checkpoint_search_student
 from hattention.reference import rsa_attention
 from hattention.search import discretize, search_objective
+from hattention.search import export_fixed_student
+from hattention.train_rsa_warmup import balanced_subset, train_epoch as warmup_epoch
+from hattention.train_search import load_rsa_warmup_weights
 
 
 class Attention(nn.Module):
@@ -112,6 +115,45 @@ class WideFixture(Dataset):
 
 
 class SearchRunnerTests(unittest.TestCase):
+    def test_rsa_warmup_learns_and_rejects_overfit_checkpoint_for_search(self):
+        torch.manual_seed(3)
+        items = [(f"{c}/{i}", c) for c in range(3) for i in range(4)]
+        self.assertEqual(balanced_subset(items, 2, 2, 5), balanced_subset(items, 2, 2, 5))
+        search = make_search_student(Student(), [HAttentionConfig(2, ("rsa", "rsa"), patch_grid=(2, 2))])
+        fixed = export_fixed_student(search, [["rsa", "rsa"]])
+        optimizer = torch.optim.AdamW(fixed.parameters(), lr=.01)
+        losses = [warmup_epoch(fixed, None, Fixture(), optimizer, torch.device("cpu"),
+                               batch_size=4, seed=1)["loss"]["ce"] for _ in range(15)]
+        self.assertLess(losses[-1], losses[0])
+        search.search_feature_projection = nn.Linear(8, 6)
+        split = {"weight_manifest_sha256": "fixture"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "warmup.pt"
+            artifact = {"format": "hattention_rsa_warmup_v1", "config": {
+                "overfit_diagnostic": True, "class_order": ["a"], "training_split": split},
+                "model": fixed.state_dict(), "metrics": {"epoch": 1}}
+            torch.save(artifact, path)
+            with self.assertRaisesRegex(ValueError, "overfit diagnostic"):
+                load_rsa_warmup_weights(search, path, ["a"], split)
+            artifact["config"]["overfit_diagnostic"] = False
+            torch.save(artifact, path)
+            load_rsa_warmup_weights(search, path, ["a"], split)
+            self.assertTrue(torch.equal(search.classifier.blocks[0].self_attn.qkv.weight,
+                                        fixed.classifier.blocks[0].self_attn.qkv.weight))
+            with self.assertRaisesRegex(ValueError, "dataset split"):
+                load_rsa_warmup_weights(search, path, ["other"], split)
+
+    def test_rsa_warmup_distillation_logs_components(self):
+        search = make_search_student(Student(), [HAttentionConfig(2, ("rsa", "rsa"), patch_grid=(2, 2))])
+        fixed = export_fixed_student(search, [["rsa", "rsa"]])
+        fixed.search_feature_projection = nn.Linear(8, 6)
+        teacher = TeacherGuidance(Teacher(), Processor(), list(range(200)))
+        optimizer = torch.optim.AdamW(fixed.parameters(), lr=.001)
+        metrics = warmup_epoch(fixed, teacher, Fixture(), optimizer, torch.device("cpu"),
+                               batch_size=2, seed=2, max_steps=1)
+        self.assertEqual(set(metrics["loss"]), {"total", "ce", "kd", "feature"})
+        self.assertTrue(all(not p.requires_grad and p.grad is None for p in teacher.parameters()))
+
     def test_straight_through_starts_with_rsa_and_has_search_gradients(self):
         torch.manual_seed(4)
         model = make_search_student(Student(), [HAttentionConfig(2, ("rsa", "rsa"), patch_grid=(2, 2))])
@@ -145,7 +187,8 @@ class SearchRunnerTests(unittest.TestCase):
         with torch.no_grad():
             layer.structure_logits[:, 1] = 1.
         likely = discretize([layer], {"time": [table]}, {"time": 10.})
-        efficient = discretize([layer], {"time": [table]}, {"time": 10.}, cost_preference=20.)
+        efficient = discretize([layer], {"time": [table]}, {"time": 10.}, cost_preference=20.,
+                               require_cls_mixing=False)
         self.assertEqual(likely["head_types"], [["lsa", "lsa"]])
         self.assertEqual(efficient["head_types"], [["mixer", "mixer"]])
 

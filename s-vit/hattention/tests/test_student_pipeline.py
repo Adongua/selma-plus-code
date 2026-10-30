@@ -65,6 +65,21 @@ class Processor:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_all_mixer_cls_is_image_independent(self):
+        repo = Path(__file__).resolve().parents[3]
+        torch.manual_seed(123)
+        source, _ = create_random_student(repo / "mpcvit")
+        search = make_checkpoint_search_student(source)
+        all_mixer = [["mixer"] * 12 for _ in range(9)]
+        with self.assertRaisesRegex(ValueError, "all-Mixer"):
+            export_fixed_student(search, all_mixer)
+        model = export_fixed_student(search, all_mixer, allow_disconnected_cls=True).eval()
+        images = torch.randn(2, 3, 64, 64, requires_grad=True)
+        logits, _ = model(images)
+        self.assertTrue(torch.equal(logits[0], logits[1]))
+        gradient, = torch.autograd.grad(logits.sum(), images)
+        self.assertEqual(float(gradient.abs().max()), 0.0)
+
     def test_scratch_export_reloads_without_a_checkpoint(self):
         repo = Path(__file__).resolve().parents[3]
         torch.manual_seed(42)
@@ -73,6 +88,7 @@ class PipelineTests(unittest.TestCase):
         student = make_checkpoint_search_student(source, prior_strength=0.)
         student.search_feature_projection = nn.Linear(192, 6)
         paths = [["mixer"] * 12 for _ in range(9)]
+        paths[0][0] = "lsa"
         fixed = export_fixed_student(student, paths)
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "scratch.pt"
@@ -142,6 +158,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(torch.equal(layer.structure_logits[:, 1].detach(), 1 - alpha))
         student.search_feature_projection = nn.Linear(192, 6)
         paths = [["mixer"] * 12 for _ in range(9)]
+        paths[0][0] = "lsa"
         fixed = export_fixed_student(student, paths)
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "fixed.pt"

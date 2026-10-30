@@ -339,6 +339,60 @@ unverified label hypothesis. These smoke commands do not export a structure.
 
 ### Multi-epoch architecture search
 
+#### Fixed-RSA learning and CLS connectivity checks
+
+For this CLS-token classifier, an all-Mixer network cannot transfer image
+patch information to the classifier. Discretization now requires at least
+one RSA or LSA head across the entire model; Pareto pruning keeps connected
+and disconnected states separate. Export rejects all-Mixer CLS classifiers,
+and hard-path training stops if its argmax collapses to all Mixer. This is a
+necessary connectivity check, not a guarantee of useful accuracy. Individual
+all-Mixer layers remain allowed, as do standalone Mixer microbenchmarks.
+
+Before architecture search, check that a randomly initialized student can
+learn using fixed all-RSA heads. This short diagnostic trains and evaluates
+on the same 20 training images; its accuracy is an overfit check, not
+generalization. It does not load a teacher:
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+CUDA_VISIBLE_DEVICES=0 python -m hattention.train_rsa_warmup \
+  --mpcvit-root "$PWD/mpcvit" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --output-root "$HOME/home/tmp/hattention-rsa-overfit-v1" \
+  --device cuda --loss ce --epochs 40 --batch-size 4 \
+  --overfit-classes 5 --overfit-per-class 4 --log-every 5
+```
+
+Examine the CE loss and training-set accuracy by epoch. If they do not improve,
+diagnose learning before launching a large run. Diagnostic checkpoints cannot
+initialize architecture search. To train on the full weight split, omit both
+overfit options and choose a new output directory. With no `--max-steps-per-epoch`,
+each epoch uses the entire 90,000-image weight split; this can take substantial
+time. The evaluation is a disjoint subset of training images, not the official
+validation set. `--loss distill --teacher-dir ...` additionally logs `kd` and
+`feature`, besides `ce` and `total`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hattention.train_rsa_warmup \
+  --mpcvit-root "$PWD/mpcvit" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --output-root "$HOME/home/tmp/hattention-rsa-warmup-v1" \
+  --device cuda --loss ce --epochs 10 --batch-size 8 \
+  --max-steps-per-epoch 1000 --eval-samples 1000 --log-every 100
+```
+
+Every epoch writes a checkpoint. An interrupted run can use the same arguments
+plus `--resume .../epoch-XXXX.pt` (the `--epochs` value must remain unchanged).
+After inspecting warmup accuracy, its normal checkpoint can initialize scratch
+search by adding `--warmup-checkpoint .../epoch-XXXX.pt` to `train_search`. The
+dataset split and class order must match; KD warmup also requires the same
+teacher. This initializes only student weights (and the feature projection if
+trained); architecture logits and RSA observations start fresh. The existing
+search remains experimental: it uses hard straight-through paths and a soft
+expected-cost surrogate, and can still collapse or fail the accuracy check.
+
 `hattention.train_search` alternates weight and architecture updates using the
 real teacher and a complete measured deployment cost table. The original
 450/50 per-class split is refined into 450 weight, 40 architecture-update and
