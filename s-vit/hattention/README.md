@@ -346,6 +346,21 @@ real teacher and a complete measured deployment cost table. The original
 Search holdout top-1/top-5 metrics are diagnostic, not official test accuracy.
 The minibatch size can differ from the measured deployment batch of one.
 
+`--architecture-init mpcvit` (default) starts with the binary MPCViT head
+selection as a logit prior. `--architecture-init uniform` keeps the same
+pretrained model weights but starts every head with equal RSA/LSA/Mixer
+probabilities. Compare runs using the same checkpoint, seed, data split,
+teacher, cost table, budget and training schedule; only change this option and
+the output directory. Both modes share pretrained projection weights, so equal
+probabilities do not establish equal path quality or performance. Repeat with
+multiple seeds before drawing conclusions.
+
+Each new run records initial path probabilities in `run.json` and per-epoch
+mean probabilities and unique preferred path counts in `epoch-NNNN.json`.
+Tied heads are counted separately instead of being assigned to the first path.
+Architecture initialization is checked on resume. Legacy checkpoints without
+this field are interpreted as `mpcvit` initialization.
+
 Run a short integration check first, using a **new output directory**:
 
 ```bash

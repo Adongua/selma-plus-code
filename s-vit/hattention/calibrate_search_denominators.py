@@ -151,6 +151,7 @@ def main():
     root.mkdir(parents=True, exist_ok=False)
     report = {"status": "plaintext_diagnostic_not_security_validated",
               "search_checkpoint_sha256": file_sha256(args.search_checkpoint),
+              "architecture_init": config.get("architecture_init", "mpcvit"),
               "cost_table_sha256": config["cost_table_sha256"],
               "calibration_samples": n_cal, "evaluation_samples": n_eval,
               "split": "disjoint subsets of search-held-out training images; official validation unused",

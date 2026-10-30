@@ -153,6 +153,26 @@ def save_checkpoint(path, payload):
         raise
 
 
+def summarize_architecture(layers):
+    """Summarize path probabilities without treating equal logits as RSA votes."""
+    names = ("rsa", "lsa", "mixer")
+    per_layer = []
+    all_probabilities = []
+    for layer in layers:
+        p = layer.probabilities().detach().cpu()
+        maxima = p.max(dim=-1, keepdim=True).values
+        tied = torch.isclose(p, maxima, rtol=1e-6, atol=1e-8).sum(dim=-1) != 1
+        choice = p.argmax(dim=-1)
+        per_layer.append({"mean_probability": dict(zip(names, p.mean(dim=0).tolist())),
+                          "unique_preferred_counts": {name: int(((choice == i) & ~tied).sum())
+                                                      for i, name in enumerate(names)},
+                          "tied_heads": int(tied.sum())})
+        all_probabilities.append(p)
+    p = torch.cat(all_probabilities, dim=0)
+    return {"mean_probability": dict(zip(names, p.mean(dim=0).tolist())),
+            "per_layer": per_layer}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("checkpoint", "mpcvit-root", "dataset-root", "teacher-dir", "cost-table", "output-root"):
@@ -168,6 +188,8 @@ def main():
     parser.add_argument("--validation-per-class", type=int, default=10)
     parser.add_argument("--weight-lr", type=float, default=1e-5)
     parser.add_argument("--architecture-lr", type=float, default=3e-3)
+    parser.add_argument("--architecture-init", choices=("mpcvit", "uniform"), default="mpcvit",
+                        help="initial path logits: MPCViT head prior or equal probabilities")
     parser.add_argument("--lambda-cost", type=float, default=1.0)
     parser.add_argument("--max-rsa", type=float, default=108.0, help="soft total RSA count limit across all layers")
     parser.add_argument("--seed", type=int, default=20261030)
@@ -197,7 +219,8 @@ def main():
     if args.eval_samples > len(arch_val):
         parser.error("eval-samples exceeds the held-out search split")
     source, checkpoint_metadata = load_student(args.checkpoint, args.mpcvit_root)
-    model = make_checkpoint_search_student(source)
+    model = make_checkpoint_search_student(
+        source, prior_strength=1.0 if args.architecture_init == "mpcvit" else 0.0)
     del source
     teacher, teacher_metadata = load_teacher(args.teacher_dir, args.dataset_root, mapping=args.mapping)
     model.search_feature_projection = nn.Linear(192, teacher_metadata["teacher_hidden_size"])
@@ -217,6 +240,7 @@ def main():
               "eval_samples": args.eval_samples, "max_steps_per_epoch": args.max_steps_per_epoch,
               "validation_per_class": args.validation_per_class, "weight_lr": args.weight_lr,
               "architecture_lr": args.architecture_lr, "lambda_cost": args.lambda_cost,
+              "architecture_init": args.architecture_init,
               "max_rsa": args.max_rsa, "seed": args.seed, "mapping": args.mapping,
               "device": args.device, "cost_table_sha256": file_sha256(args.cost_table),
               "checkpoint_sha256": checkpoint_metadata["sha256"],
@@ -229,7 +253,10 @@ def main():
     start = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
-        if checkpoint.get("format") != "hattention_search_checkpoint_v1" or checkpoint.get("config") != config:
+        saved_config = dict(checkpoint.get("config", {}))
+        # Runs predating this option always used the MPCViT prior.
+        saved_config.setdefault("architecture_init", "mpcvit")
+        if checkpoint.get("format") != "hattention_search_checkpoint_v1" or saved_config != config:
             raise ValueError("resume checkpoint configuration or data/model hashes differ")
         start = checkpoint["completed_epochs"]
         if not 0 < start <= args.epochs:
@@ -246,6 +273,7 @@ def main():
         write_json(root / "run.json", {"config": config, "checkpoint": checkpoint_metadata,
                    "teacher": teacher_metadata, "cost_table": str(args.cost_table.resolve()),
                    "cost_metadata": cost_metadata, "class_order": classes,
+                   "initial_architecture": summarize_architecture(layers),
                    "note": "Search is plaintext. Official validation is reserved for final evaluation."})
     weight_data = SearchDataset(args.dataset_root, weight_items)
     arch_data = SearchDataset(args.dataset_root, arch_train)
@@ -260,6 +288,7 @@ def main():
                               max_rsa=args.max_rsa, lambda_cost=args.lambda_cost,
                               log_every=args.log_every)
         metrics["validation_mixed"] = evaluate(model, val_data, device, args.eval_batch_size, args.eval_samples)
+        metrics["architecture"] = summarize_architecture(layers)
         metrics["epoch"] = epoch + 1
         payload = {"format": "hattention_search_checkpoint_v1", "config": config,
                    "completed_epochs": epoch + 1, "model": model.state_dict(),

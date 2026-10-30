@@ -20,6 +20,7 @@ from hattention.teacher_guidance import TeacherGuidance
 from hattention.train_search import (evaluate, loader, save_checkpoint,
                                     split_architecture_items, train_epoch)
 from hattention import train_search
+from hattention.student_checkpoint import make_checkpoint_search_student
 
 
 class Attention(nn.Module):
@@ -109,6 +110,21 @@ class WideFixture(Dataset):
 
 
 class SearchRunnerTests(unittest.TestCase):
+    def test_uniform_prior_preserves_weights_and_equalizes_probabilities(self):
+        torch.manual_seed(5)
+        source = Student()
+        source.classifier.blocks[0].self_attn.alpha = torch.tensor([1., 0.])
+        prior = make_checkpoint_search_student(source, prior_strength=1)
+        uniform = make_checkpoint_search_student(source, prior_strength=0)
+        a, b = search_layers(prior)[0], search_layers(uniform)[0]
+        self.assertTrue(torch.equal(a.qkv.weight, b.qkv.weight))
+        self.assertTrue(torch.allclose(b.probabilities(), torch.full((2, 3), 1 / 3)))
+        self.assertTrue(torch.equal(a.structure_logits.detach(), torch.tensor([[1., 0., 0.], [0., 1., 0.]])))
+        summary = train_search.summarize_architecture([b])
+        self.assertEqual(summary["per_layer"][0]["tied_heads"], 2)
+        self.assertEqual(summary["per_layer"][0]["unique_preferred_counts"],
+                         {"rsa": 0, "lsa": 0, "mixer": 0})
+
     def test_balanced_holdout_is_disjoint_deterministic_and_interleaved(self):
         items = [(f"{c}/{i}", c) for c in range(3) for i in range(5)]
         train, val, metadata = split_architecture_items(items, validation_per_class=2, seed=1)
@@ -163,7 +179,7 @@ class SearchRunnerTests(unittest.TestCase):
         teacher = TeacherGuidance(Teacher(), Processor(), list(range(200)))
         teacher_meta = {"teacher_hidden_size": 6, "weights_sha256": "w",
                         "config_sha256": "c", "processor_sha256": "p"}
-        def make_model(source):
+        def make_model(source, **kwargs):
             return make_search_student(WideStudent(), [HAttentionConfig(12, ("lsa",) * 12,
                                                                          patch_grid=(2, 2))])
         table = torch.zeros(13, 13, dtype=torch.float64)
@@ -195,6 +211,13 @@ class SearchRunnerTests(unittest.TestCase):
                         train_search.main()
                 checkpoint = output / "epoch-0001.pt"
                 self.assertTrue(checkpoint.exists())
+                saved = torch.load(checkpoint, weights_only=True)
+                self.assertEqual(saved["config"]["architecture_init"], "mpcvit")
+                saved["config"].pop("architecture_init")
+                torch.save(saved, checkpoint)  # emulate a legacy checkpoint
+                with patch("sys.argv", argv + ["--architecture-init", "uniform", "--resume", str(checkpoint)]):
+                    with self.assertRaisesRegex(ValueError, "configuration"):
+                        train_search.main()
                 with patch("sys.argv", argv + ["--resume", str(checkpoint)]):
                     train_search.main()
             selection = json.loads((output / "selection.json").read_text())
