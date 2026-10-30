@@ -153,10 +153,17 @@ def evaluate(model, dataset, device, batch_size, max_samples):
             "scope": "held-out training images, not official validation"}
 
 
-def write_json(path, value):
-    with path.open("x", encoding="utf-8") as output:
+def write_json(path, value, *, overwrite=False):
+    if overwrite:
+        temporary = path.with_suffix(path.suffix + ".partial")
+        output_path = temporary
+    else:
+        output_path = path
+    with output_path.open("x", encoding="utf-8") as output:
         json.dump(value, output, indent=2, allow_nan=False)
         output.write("\n")
+    if overwrite:
+        output_path.replace(path)
 
 
 def save_checkpoint(path, payload):

@@ -174,7 +174,8 @@ def main():
             torch.cuda.set_rng_state(checkpoint["cuda_rng"].cpu(), device)
         write_json(root / "run.json", {"config": config, "source": source_metadata,
                                        "teacher": teacher_metadata,
-                                       "resumed_from": str(args.resume.resolve())})
+                                       "resumed_from": str(args.resume.resolve())},
+                   overwrite=True)
     else:
         root.mkdir(parents=True, exist_ok=False)
         write_json(root / "run.json", {"config": config, "source": source_metadata,
