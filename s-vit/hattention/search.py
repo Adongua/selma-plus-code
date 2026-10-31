@@ -33,6 +33,11 @@ class SearchableHAttention(nn.Module):
         self.structure_logits = nn.Parameter(torch.zeros(self.config.num_heads, 3,
                                                         device=self.qkv.weight.device,
                                                         dtype=self.qkv.weight.dtype))
+        # Non-persistent so historical checkpoints remain loadable; search mode
+        # reconstructs this constraint from the original checkpoint on resume.
+        self.register_buffer("allowed_paths", torch.ones(self.config.num_heads, 3, dtype=torch.bool,
+                                                          device=self.qkv.weight.device), persistent=False)
+        self.fixed_rsa_positions = False
         self.temperature = float(temperature)
         self.path_mode = "soft"
         self.score_bound, self.denominator_min = score_bound, denominator_min
@@ -45,7 +50,8 @@ class SearchableHAttention(nn.Module):
     def probabilities(self):
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("temperature must be positive and finite")
-        return F.softmax(self.structure_logits / self.temperature, dim=-1)
+        return F.softmax((self.structure_logits / self.temperature).masked_fill(
+            ~self.allowed_paths, float("-inf")), dim=-1)
 
     def forward(self, value):
         if value.ndim != 3 or value.shape[-1] != self.dim:
@@ -195,7 +201,7 @@ def alternating_step(model, weight_optimizer, architecture_optimizer, weight_tas
                      lambda_cost=1.0, lambda_count=0.1, max_rsa=11,
                      lambda_entropy=0.01, entropy_progress=1.0,
                      lambda_task=1.0, lambda_efficiency=0.0,
-                     task_loss_scale=1.0):
+                     task_loss_scale=1.0, update_architecture=True):
     """One first-order update on each disjoint batch via caller-provided closures.
 
     Each closure must run a new forward pass and return a scalar task loss.
@@ -238,7 +244,8 @@ def alternating_step(model, weight_optimizer, architecture_optimizer, weight_tas
         lambda_entropy=lambda_entropy, entropy_progress=entropy_progress,
         lambda_task=lambda_task, lambda_efficiency=lambda_efficiency,
         task_loss_scale=task_loss_scale)
-    apply(arch_loss, architecture, architecture_optimizer)
+    if update_architecture:
+        apply(arch_loss, architecture, architecture_optimizer)
     return {"weight_loss": float(weight_loss.detach()),
             "architecture_loss": float(arch_loss.detach()),
             "architecture_components": {k: float(v.detach()) for k, v in components.items()
@@ -272,9 +279,13 @@ def discretize(layers, cost_tables, budgets, *, max_steps=10000, cost_preference
         p = layer.probabilities().detach().cpu()
         log_probs.append(p.clamp_min(torch.finfo(p.dtype).tiny).log())
         observed = layer.observed_min_denominator.detach().cpu()
-        allowed.append(torch.stack((torch.isfinite(observed) & (observed >= layer.denominator_min),
-                                    torch.ones_like(observed, dtype=torch.bool),
-                                    torch.ones_like(observed, dtype=torch.bool)), dim=1))
+        safe_rsa = torch.isfinite(observed) & (observed >= layer.denominator_min)
+        # Fixed RSA must remain fixed; retain warnings separately in the report.
+        if layer.fixed_rsa_positions:
+            safe_rsa = torch.ones_like(safe_rsa)
+        allowed.append(layer.allowed_paths.detach().cpu() & torch.stack(
+            (safe_rsa, torch.ones_like(observed, dtype=torch.bool),
+             torch.ones_like(observed, dtype=torch.bool)), dim=1))
     for key, budget in budgets.items():
         if not math.isfinite(budget) or budget <= 0 or len(cost_tables[key]) != len(layers):
             raise ValueError("invalid budget or number of cost tables")

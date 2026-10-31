@@ -17,6 +17,7 @@ from hattention.search import (alternating_step, architecture_parameters, discre
                                expected_group_cost, export_fixed_student,
                                grouped_count_distribution, make_search_student,
                                search_layers, temperature_at, weight_parameters)
+from hattention.student_checkpoint import configure_fixed_rsa_search
 
 
 class Attention(nn.Module):
@@ -57,6 +58,36 @@ def table():
 
 
 class SearchTests(unittest.TestCase):
+    def test_fixed_rsa_search_masks_gradients_warmup_and_export(self):
+        torch.manual_seed(7)
+        source = Model()
+        source.classifier.blocks[0].self_attn.alpha = nn.Parameter(torch.tensor([[[[1.]], [[0.]]]]))
+        model = make_search_student(source, [HAttentionConfig(2, ("rsa", "lsa"), patch_grid=(2, 2))])
+        paths = configure_fixed_rsa_search(model, source, mixer_probability=.05)
+        layer = search_layers(model)[0]
+        self.assertEqual(paths, [["rsa", "lsa"]])
+        self.assertTrue(torch.allclose(layer.probabilities(), torch.tensor([[1., 0., 0.], [0., .95, .05]])))
+        weights = torch.optim.AdamW(weight_parameters(model), lr=1e-3)
+        architecture = torch.optim.Adam(architecture_parameters(model), lr=1e-2)
+        value = torch.randn(2, 5, 8) * .2
+        closure = lambda: model(value).square().mean()
+        before = layer.structure_logits.detach().clone()
+        alternating_step(model, weights, architecture, closure, closure,
+                         {"time": [table()]}, {"time": 10.}, update_architecture=False)
+        self.assertTrue(torch.equal(before, layer.structure_logits))
+        alternating_step(model, weights, architecture, closure, closure,
+                         {"time": [table()]}, {"time": 10.})
+        self.assertFalse(torch.equal(before[1], layer.structure_logits[1]))
+        self.assertTrue(torch.equal(before[0], layer.structure_logits[0]))
+        # A low observed RSA denominator must be reported, not cause the fixed
+        # RSA head to be silently replaced by an unrelated path.
+        layer.observed_min_denominator.fill_(0)
+        result = discretize([layer], {"time": [table()]}, {"time": 2.})
+        self.assertEqual(result["head_types"], [["rsa", "mixer"]])
+        fixed = export_fixed_student(model, result["head_types"])
+        self.assertTrue(torch.isfinite(fixed(value)).all())
+        self.assertNotIn("classifier.blocks.0.self_attn.allowed_paths", model.state_dict())
+
     def test_group_distribution_matches_enumeration_and_has_gradients(self):
         logits = torch.tensor([[0.2, -0.3, 0.1], [-0.4, 0.3, 0.7]], requires_grad=True)
         probs = logits.softmax(-1)

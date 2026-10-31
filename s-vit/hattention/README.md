@@ -1,5 +1,48 @@
 # hAttention
 
+## Differentiable second-stage LSA/Mixer search
+
+`hattention.train_search --search-space fixed_rsa_lsa_mixer` initializes from
+the binary RSA/LSA MPCViT checkpoint. The original RSA head positions remain
+RSA throughout search and export; each original LSA head learns a two-way
+LSA/Mixer soft gate. QKV, projections and other student weights remain
+trainable. Mixer begins with probability 0.05 and a fixed temperature of 1.
+`--architecture-warmup-epochs` freezes the gates while updating weights with
+the frozen teacher's CE, logit KD and feature losses; subsequent epochs
+alternate weight and gate updates on the existing disjoint training splits.
+
+The measured grouped-cost table provides the optimization objective and a
+hard cost budget for export. The CLI checks the minimum table cost under the
+fixed RSA assignments before training. The search objective has no hard
+accuracy floor and the resulting argmax or budget-constrained fixed model can
+lose accuracy; compare `baseline.json`, mixed metrics, `selection.json`, and
+evaluate final candidates on the official validation set. Setting an
+aggressive budget can force low-probability Mixer choices. `fixed_rsa_observations`
+reports RSA heads whose observed denominators violate the numerical profile:
+the fixed constraint retains these heads, so this warning must be investigated
+before secure inference. No RSA-range or privacy guarantee is implied.
+
+For a smoke run, use a new output directory, two epochs and one gate warmup
+epoch. The large budget below only tests the training/export pipeline:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hattention.train_search \
+  --checkpoint "$PWD/mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.5-kd.pth.tar" \
+  --mpcvit-root "$PWD/mpcvit" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --teacher-dir "$HOME/home/models/tiny-imagenet-vit-teacher" \
+  --cost-table "$HOME/home/tmp/hattention-cost-12h-full-v2.json" \
+  --output-root "$HOME/home/tmp/hattention-fixed-rsa-smoke-v1" \
+  --search-space fixed_rsa_lsa_mixer --architecture-warmup-epochs 1 \
+  --epochs 2 --max-steps-per-epoch 2 --eval-samples 16 --batch-size 1 \
+  --budget-online-seconds 100 --device cuda --mapping first-name --log-every 1
+```
+
+The search is plaintext. Cost table values describe three-party attention
+cores, not measured end-to-end ViT runtime. The teacher's first-name mapping is
+a hypothesis. Search holdout examples are from the training split and might
+have been seen by the original MPCViT checkpoint.
+
 This directory contains the isolated implementation of the heterogeneous secure
 attention method.  The original `mpcvit` sources remain unchanged.
 

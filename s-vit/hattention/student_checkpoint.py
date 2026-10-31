@@ -7,6 +7,7 @@ that one option during import in this process, then restore sys.path/modules.
 import argparse
 import hashlib
 import importlib
+import math
 from pathlib import Path
 import re
 import sys
@@ -123,6 +124,33 @@ def make_checkpoint_search_student(model, *, prior_strength=1.0, temperature=5.0
             layer.structure_logits[:, 0] = alpha * prior_strength
             layer.structure_logits[:, 1] = (1 - alpha) * prior_strength
     return student
+
+
+def configure_fixed_rsa_search(student, source, *, mixer_probability=0.05):
+    """Freeze checkpoint RSA positions; learn LSA/Mixer choices elsewhere."""
+    if not math.isfinite(mixer_probability) or not 0 < mixer_probability < 0.5:
+        raise ValueError("initial Mixer probability must be between 0 and 0.5")
+    layers = search_layers(student)
+    blocks = source.classifier.blocks
+    if len(layers) != len(blocks):
+        raise ValueError("source and student layer counts differ")
+    paths = []
+    with torch.no_grad():
+        for block, layer in zip(blocks, layers):
+            alpha = block.self_attn.alpha.detach().reshape(-1).to(layer.structure_logits.device)
+            if alpha.numel() != layer.config.num_heads or not torch.all((alpha == 0) | (alpha == 1)):
+                raise ValueError("fixed RSA search requires binary checkpoint alpha")
+            rsa = alpha == 1
+            layer.allowed_paths.zero_()
+            layer.allowed_paths[:, 0] = rsa
+            layer.allowed_paths[:, 1] = ~rsa
+            layer.allowed_paths[:, 2] = ~rsa
+            layer.structure_logits.zero_()
+            layer.structure_logits[:, 2] = math.log(mixer_probability / (1 - mixer_probability))
+            layer.temperature = 1.0
+            layer.fixed_rsa_positions = True
+            paths.append(["rsa" if value else "lsa" for value in rsa.tolist()])
+    return paths
 
 
 def load_fixed_student(artifact_path, checkpoint_path, mpcvit_root):
