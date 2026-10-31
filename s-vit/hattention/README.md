@@ -1,5 +1,34 @@
 # hAttention
 
+## Remeasure selected Mixer candidate costs
+
+`hattention.benchmark_candidate_costs` reads the ranked Mixer report, extracts
+each selected candidate's actual layer path counts, and deduplicates identical
+`(RSA, Mixer)` combinations. Each round measures each combination independently
+with one warmup and one measured repetition; successive rounds reverse the
+order. The summary preserves per-round source paths and hashes and sums the
+same measured group cost for layers with equal counts. This is an estimate of
+attention-core cost, not a timed ViT forward or a paired confidence interval.
+Head ordering is canonicalized, so verify its timing impact before a final claim.
+The original candidate accuracy and model checkpoints are not changed.
+
+```bash
+# Set this to the actual ranked_mixer report containing 0, 4 and 24 candidates.
+export CANDIDATE_REPORT="$HOME/home/tmp/hattention-ranked-main-v1/report.json"
+CUDA_VISIBLE_DEVICES=0,1,2 python -m hattention.benchmark_candidate_costs \
+  --candidate-report "$CANDIDATE_REPORT" --mixer-counts 0 4 24 \
+  --backend gloo --shape 1x12x257x16 --rounds 3 \
+  --output-root "$HOME/home/tmp/hattention-candidate-costs-v1" --dry-run
+```
+
+Remove `--dry-run` to measure. This particular report uses 15 combinations,
+so 3 rounds require 45 separate three-party runs, each with its own offline
+preprocessing; reserve suitable GPUs and sufficient time. `summary.json` is
+written only on success. To continue an interrupted run, rerun the exact same
+command with `--resume`; existing cases are validated before reuse. A failed or
+incompatible case is not silently overwritten. Timing is online-only and the
+Gloo CPU staging is included; privacy and RSA ranges remain unvalidated.
+
 ## Diagnose hybrid path timings
 
 `benchmark_compare_cuda --profile-hybrid` first measures the usual uninstrumented
