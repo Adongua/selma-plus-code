@@ -3,6 +3,65 @@
 This directory contains the isolated implementation of the heterogeneous secure
 attention method.  The original `mpcvit` sources remain unchanged.
 
+## Incremental Mixer search from an MPCViT checkpoint
+
+`python -m hattention.search_mixer` begins with the checkpoint's RSA/LSA
+head choices, converting RSA to the project's corrected sReLU. It measures
+the new fixed baseline, then screens single-head Mixer replacements. Per stage,
+it evaluates the best `--top-k` screened candidates, optionally recovers each
+with CE or teacher distillation, and accepts one only if its selection Top-1
+is at least both `baseline_top1 - --max-top1-drop` and `--min-top1`. It also
+requires total estimated grouped attention-core cost to remain no greater than
+the original baseline plus `--max-cost-increase`, and at least
+`--minimum-non-mixer` heads to remain. The absolute-drop argument is in
+fractional units: `0.05` means five percentage points, not five percent of the
+baseline. The `--target-mixers` flag reports whether a goal was reached; it
+never overrides the accuracy and cost requirements.
+
+The sensitivity/selection set and holdout are disjoint for this search and
+recovery uses a separate weight split. However, the original MPCViT checkpoint
+may itself have seen those training images. These are not official validation
+results; holdout is shown at completion and must not be presented as a fresh
+test set. Screening, top-k truncation and greedy one-head replacement do not
+guarantee the globally best structure or a target number of Mixer heads.
+Estimated costs sum the measured same-shape group table, exclude other ViT
+operators, and do not constitute a secure end-to-end benchmark. RSA range and
+Ruler privacy remain unvalidated. Teacher first-name mapping is an unverified
+hypothesis for 18 mismatched WordNet IDs.
+
+Start with a small smoke run; its tiny sample and relaxed constraints are only
+for verifying plumbing:
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+CUDA_VISIBLE_DEVICES=0 python -m hattention.search_mixer \
+  --checkpoint "$PWD/mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.5-kd.pth.tar" \
+  --mpcvit-root "$PWD/mpcvit" \
+  --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --cost-table "$HOME/home/tmp/hattention-cost-12h-full-v2.json" \
+  --output-root "$HOME/home/tmp/hattention-mixer-smoke-v1" \
+  --device cuda --max-stages 1 --candidate-limit 2 --top-k 1 \
+  --sensitivity-samples 8 --selection-samples 16 --holdout-samples 16 \
+  --batch-size 4 --recovery-steps 1 --max-top1-drop 1 --max-cost-increase 100
+```
+
+For a real experiment choose a new output directory and explicitly set an
+acceptable accuracy drop and optional absolute floor, for example
+`--max-top1-drop 0.05 --min-top1 0.80 --max-stages 3 --target-mixers 3`.
+`--budget-online-seconds 9` optionally records whether the final estimated
+attention-core cost meets a 9-second goal; intermediate stages may exceed it.
+By default all eligible heads are screened, which can be expensive. Use
+`--recovery-loss distill --teacher-dir ...` to opt into CE+KD+feature recovery;
+default recovery uses CE only. Every stage is saved with zero-based layer/head
+indices. `report.json` explains any early stop and `final.pt` holds the fixed
+model. A completed run that stopped at the stage limit may be extended with
+the same arguments, `--resume`, and a larger total `--max-stages`; it preserves
+the original baseline and constraints. Incomplete interrupted runs are not
+resumable automatically; completed per-stage artifacts remain available.
+Use `load_mixer_search_model` in `hattention.search_mixer` to load the exported
+artifact with its original MPCViT checkpoint.
+
 ## Plaintext reference scope
 
 The current code provides plaintext, differentiable references for:
