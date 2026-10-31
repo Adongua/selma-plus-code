@@ -13,7 +13,7 @@ from torch import nn
 from hattention.config import HAttentionConfig
 from hattention.calibrate_group_costs import all_pairs, parse_pair, validate_report
 from hattention.group_costs import assemble_reports, load_complete_tables, METADATA
-from hattention.search import (alternating_step, architecture_parameters, discretize,
+from hattention.search import (alternating_step, joint_alpha_step, architecture_parameters, discretize,
                                expected_group_cost, export_fixed_student,
                                grouped_count_distribution, make_search_student,
                                search_layers, temperature_at, weight_parameters)
@@ -58,6 +58,31 @@ def table():
 
 
 class SearchTests(unittest.TestCase):
+    def test_joint_alpha_mixes_paths_and_lasso_promotes_mixer(self):
+        torch.manual_seed(13)
+        source = Model()
+        source.classifier.blocks[0].self_attn.alpha = nn.Parameter(torch.tensor([1., 0.]))
+        model = make_search_student(source, [HAttentionConfig(2, ("rsa", "lsa"), patch_grid=(2, 2))])
+        configure_fixed_rsa_search(model, source, mixer_probability=.2, direct_alpha=True)
+        layer = search_layers(model)[0]
+        self.assertTrue(torch.allclose(layer.probabilities(), torch.tensor([[1., 0., 0.], [0., .8, .2]])))
+        weight_opt = torch.optim.AdamW(weight_parameters(model), lr=.001)
+        alpha_opt = torch.optim.AdamW(architecture_parameters(model), lr=.01, weight_decay=0)
+        value = torch.randn(2, 5, 8) * .2
+        before = layer.lsa_alpha.detach().clone()
+        weight_before = layer.qkv.weight.detach().clone()
+        result = joint_alpha_step(model, weight_opt, alpha_opt, lambda: model(value).square().mean(),
+                                  {"time": [table()]}, {"time": 10.},
+                                  lambda_lasso=100., lambda_num=0., lambda_cost=0.)
+        self.assertEqual(float(layer.lsa_alpha[0]), float(before[0]))
+        self.assertLess(float(layer.lsa_alpha[1]), float(before[1]))
+        self.assertFalse(torch.equal(weight_before, layer.qkv.weight))
+        self.assertAlmostEqual(result["architecture_components"]["lsa_alpha_l1"], .8, places=5)
+        self.assertTrue(torch.allclose(layer.probabilities().sum(-1), torch.ones(2)))
+        layer.observed_min_denominator.fill_(1.)
+        selected = discretize([layer], {"time": [table()]}, {"time": 10.})
+        self.assertEqual(selected["head_types"][0][0], "rsa")
+
     def test_fixed_rsa_search_masks_gradients_warmup_and_export(self):
         torch.manual_seed(7)
         source = Model()

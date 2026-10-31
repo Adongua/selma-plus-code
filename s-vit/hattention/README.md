@@ -4,12 +4,24 @@
 
 `hattention.train_search --search-space fixed_rsa_lsa_mixer` initializes from
 the binary RSA/LSA MPCViT checkpoint. The original RSA head positions remain
-RSA throughout search and export; each original LSA head learns a two-way
-LSA/Mixer soft gate. QKV, projections and other student weights remain
-trainable. Mixer begins with probability 0.05 and a fixed temperature of 1.
-`--architecture-warmup-epochs` freezes the gates while updating weights with
-the frozen teacher's CE, logit KD and feature losses; subsequent epochs
-alternate weight and gate updates on the existing disjoint training splits.
+RSA throughout search and export. Every original LSA head has a direct,
+trainable alpha in [0,1] and computes `alpha * LSA + (1-alpha) * Mixer`.
+Alpha starts at 0.95 by default. QKV, projections and other student weights
+remain trainable. After optional `--architecture-warmup-epochs`, the model
+weights and alpha are updated from the same batch and the same combined loss,
+using separate AdamW optimizers and learning rates. The loss is teacher
+guidance (CE, logit KD and feature loss), plus `--lambda-lasso * sum(abs(alpha))`
+over searchable LSA heads, a measured-budget penalty, and the RSA numerical
+penalty. The default L1 coefficient is 0.001; larger values encourage Mixer but
+do not guarantee accuracy. `--lambda-task`, `--task-loss-scale`,
+`--lambda-cost` and `--lambda-efficiency` also affect this combined loss.
+
+This follows MPCViT's joint task-plus-L1 search pattern, adapted to a fixed
+RSA set, a Mixer path and measured grouped costs. Alpha is projected into [0,1]
+after each update. The exported structure uses the measured-cost dynamic
+program, not MPCViT's global top-k rule. Checkpoints from the old alternating
+fixed-RSA search cannot resume this changed optimization; use a new output
+directory. Export does not perform a separate fixed-structure distillation.
 
 The measured grouped-cost table provides the optimization objective and a
 hard cost budget for export. The CLI checks the minimum table cost under the

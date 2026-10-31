@@ -33,6 +33,7 @@ class SearchableHAttention(nn.Module):
         self.structure_logits = nn.Parameter(torch.zeros(self.config.num_heads, 3,
                                                         device=self.qkv.weight.device,
                                                         dtype=self.qkv.weight.dtype))
+        self.register_parameter("lsa_alpha", None)
         # Non-persistent so historical checkpoints remain loadable; search mode
         # reconstructs this constraint from the original checkpoint on resume.
         self.register_buffer("allowed_paths", torch.ones(self.config.num_heads, 3, dtype=torch.bool,
@@ -48,6 +49,10 @@ class SearchableHAttention(nn.Module):
         self.last_numerical_penalty = None
 
     def probabilities(self):
+        if self.lsa_alpha is not None:
+            rsa = self.allowed_paths[:, 0].to(self.lsa_alpha.dtype)
+            alpha = self.lsa_alpha.clamp(0, 1) * (1 - rsa)
+            return torch.stack((rsa, alpha, (1 - self.lsa_alpha.clamp(0, 1)) * (1 - rsa)), dim=-1)
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("temperature must be positive and finite")
         return F.softmax((self.structure_logits / self.temperature).masked_fill(
@@ -188,12 +193,55 @@ def search_objective(layers, task_loss, cost_tables, budgets, *, lambda_num=0.1,
 
 def weight_parameters(model):
     """Separate trainable weights from architecture logits for alternating updates."""
-    logits = {id(layer.structure_logits) for layer in search_layers(model)}
+    logits = {id(p) for p in architecture_parameters(model)}
     return [p for p in model.parameters() if p.requires_grad and id(p) not in logits]
 
 
 def architecture_parameters(model):
-    return [layer.structure_logits for layer in search_layers(model)]
+    return [layer.lsa_alpha if layer.lsa_alpha is not None else layer.structure_logits
+            for layer in search_layers(model)]
+
+
+def joint_alpha_step(model, weight_optimizer, architecture_optimizer, task,
+                     cost_tables, budgets, *, lambda_lasso=0.001, lambda_cost=1.0,
+                     lambda_num=0.1, lambda_task=1.0, task_loss_scale=1.0,
+                     lambda_efficiency=0.0, update_architecture=True):
+    """Update weights and fixed-RSA LSA/Mixer alpha from one combined loss."""
+    layers = search_layers(model)
+    if not layers or any(layer.lsa_alpha is None for layer in layers):
+        raise ValueError("joint alpha search requires fixed-RSA alpha layers")
+    if not math.isfinite(lambda_lasso) or lambda_lasso < 0:
+        raise ValueError("lambda_lasso must be finite and nonnegative")
+    for layer in layers:
+        layer.last_numerical_penalty = None
+    weight_optimizer.zero_grad(set_to_none=True)
+    architecture_optimizer.zero_grad(set_to_none=True)
+    task_loss = task()
+    objective, parts = search_objective(
+        layers, task_loss, cost_tables, budgets, lambda_num=lambda_num,
+        lambda_cost=lambda_cost, lambda_count=0.0, lambda_entropy=0.0,
+        lambda_task=lambda_task, task_loss_scale=task_loss_scale,
+        lambda_efficiency=lambda_efficiency)
+    # Alpha is the LSA weight; its L1 penalty encourages replacement by Mixer.
+    lasso = sum(layer.lsa_alpha[layer.allowed_paths[:, 1]].abs().sum() for layer in layers)
+    loss = objective + lambda_lasso * lasso
+    if loss.ndim != 0 or not torch.isfinite(loss):
+        raise ValueError("combined search loss must be a finite scalar")
+    loss.backward()
+    for p in weight_parameters(model) + architecture_parameters(model):
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            raise ValueError("non-finite search gradient")
+    weight_optimizer.step()
+    if update_architecture:
+        architecture_optimizer.step()
+        with torch.no_grad():
+            for layer in layers:
+                layer.lsa_alpha.clamp_(0, 1)
+    return {"weight_loss": float(loss.detach()), "architecture_loss": float(loss.detach()),
+            "architecture_components": {**{k: float(v.detach()) for k, v in parts.items()
+                                            if k != "expected_costs"},
+                                        "lsa_alpha_l1": float(lasso.detach())},
+            "expected_costs": {k: float(v.detach()) for k, v in parts["expected_costs"].items()}}
 
 
 def alternating_step(model, weight_optimizer, architecture_optimizer, weight_task,

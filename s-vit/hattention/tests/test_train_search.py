@@ -161,6 +161,13 @@ class SearchRunnerTests(unittest.TestCase):
             self.assertEqual(selection["head_types"][0][:6], ["rsa"] * 6)
             self.assertTrue(all(p in ("lsa", "mixer") for p in selection["head_types"][0][6:]))
             self.assertEqual(len(selection["fixed_rsa_observations"]), 1)
+            self.assertEqual(selection["path_counts"]["rsa"], 6)
+            self.assertEqual(selection["alpha_lsa_by_layer"][0][:6], [None] * 6)
+            checkpoint1 = torch.load(output / "epoch-0001.pt", weights_only=True)
+            checkpoint2 = torch.load(output / "epoch-0002.pt", weights_only=True)
+            key = "classifier.blocks.0.self_attn.lsa_alpha"
+            self.assertTrue(torch.allclose(checkpoint1["model"][key], torch.full((12,), .95)))
+            self.assertFalse(torch.equal(checkpoint1["model"][key][6:], checkpoint2["model"][key][6:]))
 
     def test_rsa_warmup_learns_and_rejects_overfit_checkpoint_for_search(self):
         torch.manual_seed(3)

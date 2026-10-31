@@ -18,7 +18,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from .group_costs import load_complete_tables
-from .search import (alternating_step, architecture_parameters, discretize,
+from .search import (alternating_step, joint_alpha_step, architecture_parameters, discretize,
                      export_fixed_student, search_layers,
                      temperature_at, weight_parameters)
 from .search_data import SearchDataset, collate_search, training_splits
@@ -65,7 +65,8 @@ def train_epoch(model, teacher, weight_loader, architecture_loader, weight_optim
                 architecture_optimizer, table, budget, device, *, epoch, epochs,
                 max_steps=0, max_rsa=108.0, lambda_cost=1.0, log_every=0,
                 lambda_task=1.0, lambda_efficiency=0.0, task_loss_scale=1.0,
-                architecture_warmup_epochs=0, fixed_temperature=False):
+                architecture_warmup_epochs=0, fixed_temperature=False,
+                joint_alpha=False, lambda_lasso=0.001):
     model.train()
     layers = search_layers(model)
     temperature = 1.0 if fixed_temperature else temperature_at(epoch, epochs)
@@ -76,11 +77,12 @@ def train_epoch(model, teacher, weight_loader, architecture_loader, weight_optim
     for weight_batch in weight_loader:
         if max_steps and steps >= max_steps:
             break
-        try:
-            architecture_batch = next(architecture_iterator)
-        except StopIteration:
-            architecture_iterator = iter(architecture_loader)
-            architecture_batch = next(architecture_iterator)
+        if not joint_alpha:
+            try:
+                architecture_batch = next(architecture_iterator)
+            except StopIteration:
+                architecture_iterator = iter(architecture_loader)
+                architecture_batch = next(architecture_iterator)
 
         task_components = {}
 
@@ -90,7 +92,17 @@ def train_epoch(model, teacher, weight_loader, architecture_loader, weight_optim
             task_components[stage] = {key: float(value.detach()) for key, value in components.items()}
             return loss
 
-        metrics = alternating_step(model, weight_optimizer, architecture_optimizer,
+        if joint_alpha:
+            metrics = joint_alpha_step(model, weight_optimizer, architecture_optimizer,
+                                      lambda: task(weight_batch, "weight"),
+                                      {"online_seconds": [table] * len(layers)},
+                                      {"online_seconds": budget}, lambda_lasso=lambda_lasso,
+                                      lambda_cost=lambda_cost, lambda_task=lambda_task,
+                                      task_loss_scale=task_loss_scale,
+                                      lambda_efficiency=lambda_efficiency,
+                                      update_architecture=epoch >= architecture_warmup_epochs)
+        else:
+            metrics = alternating_step(model, weight_optimizer, architecture_optimizer,
                                    lambda: task(weight_batch, "weight"),
                                    lambda: task(architecture_batch, "architecture"),
                                    {"online_seconds": [table] * len(layers)},
@@ -283,6 +295,8 @@ def main():
     parser.add_argument("--lambda-cost", type=float)
     parser.add_argument("--lambda-task", type=float)
     parser.add_argument("--lambda-efficiency", type=float)
+    parser.add_argument("--lambda-lasso", type=float, default=0.001,
+                        help="L1 coefficient on LSA alpha in fixed-RSA joint search")
     parser.add_argument("--task-loss-scale", type=float,
                         help="normalizer for the teacher task loss in architecture optimization")
     parser.add_argument("--selection-cost-preference", type=float)
@@ -316,7 +330,7 @@ def main():
         not math.isfinite(args.mixer_init_probability) or not 0 < args.mixer_init_probability < 0.5 or
         any(not math.isfinite(x) or x <= 0 for x in
             (args.budget_online_seconds, args.weight_lr, args.architecture_lr, args.max_rsa)) or
-        any(not math.isfinite(x) or x < 0 for x in (args.lambda_cost, args.lambda_task,
+        any(not math.isfinite(x) or x < 0 for x in (args.lambda_cost, args.lambda_task, args.lambda_lasso,
             args.lambda_efficiency, args.selection_cost_preference)) or
         not math.isfinite(args.task_loss_scale) or args.task_loss_scale <= 0 or
         not math.isfinite(args.rsa_logit_margin) or args.rsa_logit_margin <= 0):
@@ -341,7 +355,8 @@ def main():
                                    load_student(args.checkpoint, args.mpcvit_root))
     model = make_checkpoint_search_student(
         source, prior_strength=1.0 if args.architecture_init == "mpcvit" else 0.0)
-    initial_paths = (configure_fixed_rsa_search(model, source, mixer_probability=args.mixer_init_probability)
+    initial_paths = (configure_fixed_rsa_search(model, source, mixer_probability=args.mixer_init_probability,
+                                                direct_alpha=True)
                      if constrained else None)
     for layer in search_layers(model):
         layer.path_mode = args.path_mode
@@ -379,6 +394,8 @@ def main():
               "validation_per_class": args.validation_per_class, "weight_lr": args.weight_lr,
               "architecture_lr": args.architecture_lr, "lambda_cost": args.lambda_cost,
               "architecture_init": args.architecture_init,
+              "optimization": "joint_alpha_lasso_v1" if constrained else "alternating_v1",
+              "lambda_lasso": args.lambda_lasso,
               "search_space": args.search_space,
               "mixer_init_probability": args.mixer_init_probability,
               "architecture_warmup_epochs": args.architecture_warmup_epochs,
@@ -397,7 +414,8 @@ def main():
               "teacher_processor_sha256": teacher_metadata["processor_sha256"],
               "training_split": split, "search_holdout": holdout}
     weight_opt = torch.optim.AdamW(weight_parameters(model), lr=args.weight_lr)
-    arch_opt = torch.optim.Adam(architecture_parameters(model), lr=args.architecture_lr)
+    arch_opt = (torch.optim.AdamW(architecture_parameters(model), lr=args.architecture_lr, weight_decay=0)
+                if constrained else torch.optim.Adam(architecture_parameters(model), lr=args.architecture_lr))
     start = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
@@ -408,6 +426,8 @@ def main():
         saved_config.setdefault("search_space", "three_path")
         saved_config.setdefault("mixer_init_probability", 0.05)
         saved_config.setdefault("architecture_warmup_epochs", 0)
+        saved_config.setdefault("optimization", "alternating_v1")
+        saved_config.setdefault("lambda_lasso", 0.001)
         for key, default in (("student_init", "checkpoint"), ("path_mode", "soft"),
                              ("rsa_logit_margin", 2.0), ("lambda_task", 1.0),
                              ("lambda_efficiency", 0.0), ("task_loss_scale", 1.0),
@@ -460,6 +480,7 @@ def main():
                               task_loss_scale=args.task_loss_scale,
                               architecture_warmup_epochs=args.architecture_warmup_epochs,
                               fixed_temperature=constrained,
+                              joint_alpha=constrained, lambda_lasso=args.lambda_lasso,
                               log_every=args.log_every)
         metrics["validation_mixed"] = evaluate(model, val_data, device, args.eval_batch_size, args.eval_samples)
         metrics["architecture"] = summarize_architecture(layers)
@@ -479,6 +500,13 @@ def main():
         layer.temperature = 1.0 if constrained else temperature_at(args.epochs - 1, args.epochs)
     selection = discretize(layers, costs, budgets, cost_preference=args.selection_cost_preference)
     if constrained:
+        selection["alpha_lsa_by_layer"] = [
+            [float(value) if allowed else None for value, allowed in zip(
+                layer.lsa_alpha.detach().cpu().tolist(),
+                layer.allowed_paths[:, 1].detach().cpu().tolist())]
+            for layer in layers]
+        selection["path_counts"] = {name: sum(paths.count(name) for paths in selection["head_types"])
+                                    for name in ("rsa", "lsa", "mixer")}
         selection["fixed_rsa_observations"] = [
             {"layer": index, "heads_unobserved_or_below_threshold": [
                 head for head, (allowed, observed) in enumerate(zip(
