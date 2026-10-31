@@ -1,6 +1,7 @@
 """Experimental grouped Ring3 RSA, LSA and Mixer attention core."""
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 
 import torch
 
@@ -40,7 +41,7 @@ def prepare_hybrid(base, wide, shape, head_types, rho=None,
 
 
 def secure_hybrid(base, wide, q, k, v, material, *, patch_grid=None,
-                  has_cls_token=True):
+                  has_cls_token=True, profiler=None):
     if material.used:
         raise RuntimeError("hybrid material already consumed")
     if material.base is not base or material.wide is not wide:
@@ -55,15 +56,18 @@ def secure_hybrid(base, wide, q, k, v, material, *, patch_grid=None,
         selected = [i for i, item in enumerate(material.paths) if item == path]
         if not selected:
             continue
-        index = torch.tensor(selected, dtype=torch.long, device=base.device)
-        group_v = v.index_select(1, index)
-        if path == "rsa":
-            group_output = secure_rsa(base, wide, q.index_select(1, index),
-                                      k.index_select(1, index), group_v, material.rsa)
-        elif path == "lsa":
-            group_output = secure_lsa(base, q.index_select(1, index),
-                                      k.index_select(1, index), group_v, material.lsa)
-        else:
-            group_output = mixer_attention(group_v, patch_grid, has_cls_token)
-        output = output.index_copy(1, index, group_output)
+        with profiler.phase(f"{path}_select") if profiler else nullcontext():
+            index = torch.tensor(selected, dtype=torch.long, device=base.device)
+            group_v = v.index_select(1, index)
+            if path != "mixer":
+                group_q, group_k = q.index_select(1, index), k.index_select(1, index)
+        with profiler.phase(f"{path}_compute") if profiler else nullcontext():
+            if path == "rsa":
+                group_output = secure_rsa(base, wide, group_q, group_k, group_v, material.rsa)
+            elif path == "lsa":
+                group_output = secure_lsa(base, group_q, group_k, group_v, material.lsa)
+            else:
+                group_output = mixer_attention(group_v, patch_grid, has_cls_token)
+        with profiler.phase(f"{path}_scatter") if profiler else nullcontext():
+            output = output.index_copy(1, index, group_output)
     return output

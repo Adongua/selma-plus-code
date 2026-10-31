@@ -8,8 +8,11 @@ from pathlib import Path
 import platform
 import statistics
 import tempfile
+import time
+from contextlib import contextmanager
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sgelu.runtime_cuda import CudaRing3, CudaRing3Wide
@@ -22,6 +25,37 @@ from .reference import grouped_hattention, rsa_attention
 from .rsa import RSAProfile
 
 METHODS = ("standard", "rsa", "lsa", "mixer", "hybrid")
+
+
+class HybridProfiler:
+    """Diagnostic local wall times; synchronizations perturb the measured execution."""
+
+    def __init__(self, device, base):
+        self.device, self.base, self.stages = device, base, {}
+
+    @contextmanager
+    def phase(self, name):
+        torch.cuda.synchronize(self.device)
+        before_bytes, before_phases = self.base.sent_bytes, self.base.phases
+        started = time.perf_counter()
+        yield
+        torch.cuda.synchronize(self.device)
+        self.stages[name] = {"seconds": time.perf_counter() - started,
+                             "sent_bytes": self.base.sent_bytes - before_bytes,
+                             "phases": self.base.phases - before_phases}
+
+
+def collect_hybrid_profile(local_stages):
+    """Gather once after execution, avoiding extra collectives between stages."""
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local_stages)
+    if any(set(row) != set(local_stages) for row in gathered):
+        raise ValueError("profile stage mismatch across ranks")
+    return {name: {"seconds_per_rank": [row[name]["seconds"] for row in gathered],
+                   "seconds_max": max(row[name]["seconds"] for row in gathered),
+                   "sent_bytes_per_rank": [row[name]["sent_bytes"] for row in gathered],
+                   "phases_per_rank": [row[name]["phases"] for row in gathered]}
+            for name in local_stages}
 
 
 def standard_attention(q, k, v):
@@ -166,6 +200,31 @@ def _worker(rank, rendezvous, options):
                     "per_head_error_vs_own_reference": per_head,
                     "correctness_passed": passed,
                     "online_includes_provider": method == "standard"}
+                if method == "hybrid" and options["profile_hybrid"]:
+                    # Fresh one-use material keeps this synchronized diagnostic out of
+                    # the ordinary online measurement and its communication counters.
+                    profile_material, profile_offline = _ring_measure(device, base, lambda: prepare_hybrid(
+                        base, wide, shape, head_types[method], rho, fixed, rsa_profile))
+                    profiler = HybridProfiler(device, base)
+                    profile_output, profile_online = _ring_measure(device, base, lambda: secure_hybrid(
+                        base, wide, *shares, profile_material, patch_grid=grid,
+                        has_cls_token=options["has_cls_token"], profiler=profiler))
+                    stages = collect_hybrid_profile(profiler.stages)
+                    profile_opened, _ = _ring_measure(device, base, lambda: base.reveal(profile_output))
+                    profile_errors = _error_metrics(fixed.decode(profile_opened), references[method])
+                    profile_passed = (all(math.isfinite(x) for x in profile_errors.values())
+                                      and profile_errors["max_abs"] <= options["max_abs_error"])
+                    row["methods"][method]["diagnostic_profile"] = {
+                        "offline": profile_offline, "online_instrumented": profile_online,
+                        "stages": stages, "error_vs_own_reference": profile_errors,
+                        "correctness_passed": profile_passed,
+                        "notes": "Separate execution with fresh material and GPU synchronization at stage boundaries; "
+                                 "stage maxima can come from different ranks and must not be summed. "
+                                 "Stage time may include peer waiting or GPU contention; compare ordinary online separately."}
+                    if rank == 0:
+                        print(json.dumps({"event": "hybrid_profile_complete", "warmup": iteration == 0,
+                                          "stages_seconds_max": {k: v["seconds_max"] for k, v in stages.items()},
+                                          "max_abs_error": profile_errors["max_abs"], "passed": profile_passed}), flush=True)
                 if rank == 0:
                     print(json.dumps({"event": "method_complete", "warmup": iteration == 0,
                                       "method": method, "seconds": online["seconds_max"],
@@ -174,8 +233,8 @@ def _worker(rank, rendezvous, options):
                 records.append(row)
 
         if rank == 0:
-            passed = all(x["correctness_passed"] for row in records if not row["warmup"]
-                         for x in row["methods"].values())
+            passed = all(x["correctness_passed"] and x.get("diagnostic_profile", {}).get("correctness_passed", True)
+                         for row in records if not row["warmup"] for x in row["methods"].values())
             report = {"status": "benchmark_passed_not_security_validated" if passed else "benchmark_failed_correctness",
                 "framework": "CrypTen MPCTensor standard; custom Ring3 hAttention",
                 "backend": options["backend"], "world_size": 3, "shape_b_h_n_d": shape,
@@ -224,9 +283,13 @@ def main():
                         help="fractional precision for standard CrypTen only (default: 17)")
     parser.add_argument("--allow-invalid-report", action="store_true",
                         help="write report and exit successfully even when correctness fails")
+    parser.add_argument("--profile-hybrid", action="store_true",
+                        help="run a separate synchronized hybrid stage diagnostic with fresh preprocessing")
     args = parser.parse_args()
     if len(set(args.methods)) != len(args.methods):
         parser.error("methods must not contain duplicates")
+    if args.profile_hybrid and "hybrid" not in args.methods:
+        parser.error("--profile-hybrid requires --methods to include hybrid")
     if args.repeats < 1 or any(not math.isfinite(x) or x <= 0 for x in
                                (args.input_std, args.input_bound, args.max_abs_error)):
         parser.error("repeats, input-std, input-bound and max-abs-error must be positive")

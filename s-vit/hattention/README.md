@@ -1,5 +1,36 @@
 # hAttention
 
+## Diagnose hybrid path timings
+
+`benchmark_compare_cuda --profile-hybrid` first measures the usual uninstrumented
+online execution. It then prepares fresh one-use material and runs a separate
+diagnostic execution, synchronizing the GPU around each group's select, compute
+and scatter stages. Per-rank wall times, sent bytes and exchange phases are in
+each record's `methods.hybrid.diagnostic_profile.stages`; the instrumented run
+also has its own correctness check. Additional preprocessing makes this mode
+considerably slower and more memory intensive. Stage timings include any waits
+for peers and contention and are not exclusive GPU kernel times. Do not add
+individual rank maxima: different ranks can be the slowest at different stages.
+Use the ordinary `online` field for the uninstrumented measurement. Run both
+configurations under comparable GPU load; diagnostic values are not a new cost
+table or a security validation.
+
+Example: run each command with a fresh output path and the same environment.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 python -m hattention.benchmark_compare_cuda \
+  --backend gloo --shape 1x12x257x16 --methods hybrid \
+  --head-types rsa rsa rsa rsa lsa lsa lsa lsa lsa lsa mixer mixer \
+  --patch-grid 16x16 --repeats 3 --profile-hybrid \
+  --output "$HOME/home/tmp/hattention-profile-rsa4-mixer2-v1"
+
+CUDA_VISIBLE_DEVICES=0,1,2 python -m hattention.benchmark_compare_cuda \
+  --backend gloo --shape 1x12x257x16 --methods hybrid \
+  --head-types rsa rsa rsa rsa lsa lsa lsa lsa mixer mixer mixer mixer \
+  --patch-grid 16x16 --repeats 3 --profile-hybrid \
+  --output "$HOME/home/tmp/hattention-profile-rsa4-mixer4-v1"
+```
+
 ## Rank fixed LSA/Mixer candidates and distill independently
 
 `python -m hattention.ranked_mixer` loads a **joint-alpha fixed-RSA** search
