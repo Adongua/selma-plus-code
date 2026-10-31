@@ -1,5 +1,45 @@
 # hAttention
 
+## Rank fixed LSA/Mixer candidates and distill independently
+
+`python -m hattention.ranked_mixer` loads a **joint-alpha fixed-RSA** search
+checkpoint, fixes the original RSA locations, and sorts searchable heads by
+LSA alpha (ascending; layer and head index break ties). It exports independently
+initialized candidates for the requested Mixer counts and records plaintext
+accuracy and measured-table attention-core cost. Every candidate starts from
+the same search weights; its distillation uses the same data split, steps,
+optimizer settings, seed and initial feature-projection weights. It saves
+before/after checkpoints and `report.json`; no candidate is selected
+automatically. A count is a requested choice, not proof that the corresponding
+head prefers Mixer. The default search holdout was already monitored during
+search and the original MPCViT model may have seen these training images.
+Use `--eval-split official_val` only for a separately planned validation;
+repeated selection on that split makes it a tuning set.
+
+Smoke example, using a **new output directory** and an existing search checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hattention.ranked_mixer \
+  --search-checkpoint "$HOME/home/tmp/hattention-alpha-03-lasso001-v1/epoch-0005.pt" \
+  --checkpoint "$PWD/mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.3-kd.pth.tar" \
+  --mpcvit-root "$PWD/mpcvit" --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --teacher-dir "$HOME/home/models/tiny-imagenet-vit-teacher" \
+  --cost-table "$HOME/home/tmp/hattention-cost-12h-full-v2.json" \
+  --output-root "$HOME/home/tmp/hattention-ranked-smoke-v1" \
+  --mixer-counts 0 4 --recovery-steps 2 --eval-samples 16 \
+  --batch-size 1 --device cuda
+```
+
+For an actual comparison, use `--mixer-counts 0 4 8 12`, choose the same
+recovery steps and data for all candidates, and increase evaluation samples.
+Report estimates only attention-core online cost at the table's shape; it is
+not a measured full-model runtime. Checkpoint, teacher, dataset split and cost
+table hashes are checked against the search run. This command never overwrites
+an existing output directory; interrupted runs leave their completed artifacts
+in place and must be restarted in a new directory. Ruler privacy and secret RSA
+range remain unvalidated. Stored fixed checkpoints use the existing
+`hattention_fixed_student_v1` loader.
+
 ## Differentiable second-stage LSA/Mixer search
 
 `hattention.train_search --search-space fixed_rsa_lsa_mixer` initializes from

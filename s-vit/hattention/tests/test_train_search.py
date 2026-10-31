@@ -20,6 +20,7 @@ from hattention.teacher_guidance import TeacherGuidance
 from hattention.train_search import (evaluate, loader, save_checkpoint,
                                     split_architecture_items, train_epoch)
 from hattention import train_search
+from hattention import ranked_mixer
 from hattention.student_checkpoint import make_checkpoint_search_student
 from hattention.reference import rsa_attention
 from hattention.search import discretize, search_objective
@@ -115,6 +116,63 @@ class WideFixture(Dataset):
 
 
 class SearchRunnerTests(unittest.TestCase):
+    def test_ranked_mixer_entrypoint_exports_and_recovers_independent_candidates(self):
+        items = [("a", 0), ("b", 1)]
+        teacher = TeacherGuidance(Teacher(), Processor(), list(range(200)))
+        teacher_meta = {"teacher_hidden_size": 6, "weights_sha256": "w", "config_sha256": "c",
+                        "processor_sha256": "p"}
+        def load_source(*args):
+            source = WideStudent()
+            source.classifier.blocks[0].self_attn.alpha = torch.tensor([1.] * 6 + [0.] * 6)
+            return source, {"sha256": "student"}
+        def make_model(source, **kwargs):
+            return make_search_student(source, [HAttentionConfig(12, ("lsa",) * 12, patch_grid=(2, 2))])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _ = load_source()
+            model = make_model(source)
+            ranked_mixer.configure_fixed_rsa_search(model, source, direct_alpha=True)
+            model.search_feature_projection = nn.Linear(192, 6)
+            config = {"optimization": "joint_alpha_lasso_v1", "search_space": "fixed_rsa_lsa_mixer",
+                      "checkpoint_sha256": "student", "cost_table_sha256": "cost", "seed": 1,
+                      "training_split": {"seed": 1}, "validation_per_class": 1,
+                      "search_holdout": {"holdout": 1}, "mapping": "first-name",
+                      "mixer_init_probability": .05, "teacher_weights_sha256": "w",
+                      "teacher_config_sha256": "c", "teacher_processor_sha256": "p"}
+            checkpoint = root / "search.pt"
+            torch.save({"format": "hattention_search_checkpoint_v1", "config": config,
+                        "model": model.state_dict()}, checkpoint)
+            output = root / "output"
+            argv = ["ranked_mixer", "--search-checkpoint", str(checkpoint), "--checkpoint", str(root / "model"),
+                    "--mpcvit-root", str(root), "--dataset-root", str(root), "--teacher-dir", str(root),
+                    "--cost-table", str(root / "cost"), "--output-root", str(output), "--mixer-counts", "0", "1",
+                    "--recovery-steps", "1", "--eval-samples", "2", "--device", "cpu"]
+            table = torch.zeros(13, 13, dtype=torch.float64)
+            def digest(path):
+                if Path(path).name == "model": return "student"
+                if Path(path).name == "cost": return "cost"
+                return "search"
+            with patch("sys.argv", argv), patch.object(ranked_mixer, "file_sha256", side_effect=digest), \
+                 patch.object(ranked_mixer, "training_splits", return_value=(["a", "b"], items, items, {"seed": 1})), \
+                 patch.object(ranked_mixer, "split_architecture_items", return_value=(items, items, {"holdout": 1})), \
+                 patch.object(ranked_mixer, "load_student", side_effect=load_source), \
+                 patch.object(ranked_mixer, "make_checkpoint_search_student", side_effect=make_model), \
+                 patch.object(ranked_mixer, "load_teacher", return_value=(teacher, teacher_meta)), \
+                 patch.object(ranked_mixer, "load_complete_tables", return_value=(
+                     {"online_seconds": table}, {"shape_b_h_n_d": [1, 12, 257, 16], "world_size": 3})), \
+                 patch.object(ranked_mixer, "SearchDataset", WideFixture), redirect_stdout(io.StringIO()):
+                ranked_mixer.main()
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["status"], "completed_plaintext_not_security_validated")
+            self.assertEqual([row["mixer_count"] for row in report["candidates"]], [0, 1])
+            self.assertEqual(report["candidates"][1]["path_counts"]["rsa"], 6)
+            self.assertEqual(report["candidates"][1]["recovery"]["steps"], 1)
+            first = torch.load(output / "mixer-000-before.pt", weights_only=True)
+            second = torch.load(output / "mixer-001-before.pt", weights_only=True)
+            key = "classifier.blocks.0.self_attn.qkv.weight"
+            self.assertTrue(torch.equal(first["state_dict"][key], second["state_dict"][key]))
+            self.assertTrue((output / "mixer-001-after.pt").exists())
+
     def test_fixed_rsa_entrypoint_training_resume_and_export(self):
         items = [(f"{c}/{i}", c) for c in range(2) for i in range(2)]
         teacher = TeacherGuidance(Teacher(), Processor(), list(range(200)))
