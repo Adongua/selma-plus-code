@@ -1,5 +1,49 @@
 # hAttention
 
+## Layer-level LSA/Mixer search with fixed RSA
+
+`train_search --search-space fixed_rsa_layer_lsa_mixer` starts from a binary
+MPCViT RSA/LSA checkpoint and holds RSA positions fixed. Each layer has one
+trainable direct gate `alpha`: all of its non-RSA heads use
+`alpha * LSA + (1-alpha) * Mixer` in the plaintext soft forward. Weights and
+gates use the same CE/KD/feature, numeric, budget and L1 objective, and
+independent optimizers. L1 is a **sum per searchable layer**, not per head;
+do not equate its coefficient with the head-level experiment.
+
+For each layer, the cost surrogate is `alpha*C(rsa,0) + (1-alpha)*C(rsa,k)`
+where `k` is the number of original LSA heads. This is the expected measured
+endpoint cost under a hypothetical binary layer gate; it is not the runtime of
+the soft forward and does not assume individual heads choose independently.
+Export uses only the two whole-layer options, retains fixed RSA, enforces the
+estimated budget and existing CLS connectivity constraint, and maximizes the
+learned gate score among feasible structures. A tight budget may force a layer
+against its preferred gate and does not guarantee accuracy. `selection.json`
+reports `layer_lsa_alpha`, `layer_choices`, paths, costs and fixed-model
+holdout evaluation. `baseline.json` records the original fixed baseline and a
+table-derived lower bound. A separate fixed-structure distillation and final
+validation are still needed; `ranked_mixer` accepts head-level checkpoints only.
+
+Use a new output root and the same measured cost table as the intended
+deployment. Example pipeline smoke test (the wide budget is not an optimization
+target):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hattention.train_search \
+  --checkpoint "$PWD/mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.3-kd.pth.tar" \
+  --mpcvit-root "$PWD/mpcvit" --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --teacher-dir "$HOME/home/models/tiny-imagenet-vit-teacher" \
+  --cost-table "$HOME/home/tmp/hattention-cost-12h-remeasure-v1.json" \
+  --output-root "$HOME/home/tmp/hattention-layer-gate-smoke-v1" \
+  --search-space fixed_rsa_layer_lsa_mixer --architecture-warmup-epochs 1 \
+  --epochs 2 --max-steps-per-epoch 2 --eval-samples 16 --batch-size 1 \
+  --budget-online-seconds 100 --device cuda --mapping first-name --log-every 1
+```
+
+This is a plaintext search with cost estimates, not secure inference or a
+guarantee of accuracy. Search holdout images are drawn from training data and
+may have been seen by the original checkpoint. The first-name teacher mapping,
+RSA secret range and Ruler privacy remain unvalidated.
+
 ## Remeasure selected Mixer candidate costs
 
 `hattention.benchmark_candidate_costs` reads the ranked Mixer report, extracts

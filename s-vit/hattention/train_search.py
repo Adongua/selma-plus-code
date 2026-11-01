@@ -211,6 +211,9 @@ def summarize_architecture(layers):
                           "unique_preferred_counts": {name: int(((choice == i) & ~tied).sum())
                                                       for i, name in enumerate(names)},
                           "tied_heads": int(tied.sum())})
+        if layer.layer_alpha_mode:
+            per_layer[-1]["layer_lsa_alpha"] = (float(layer.lsa_alpha.detach().item())
+                                                  if bool(layer.allowed_paths[:, 1].any()) else None)
         all_probabilities.append(p)
         if layer.fixed_rsa_positions:
             searchable_probabilities.append(p[layer.allowed_paths[:, 2].detach().cpu(), 2])
@@ -285,8 +288,9 @@ def main():
     parser.add_argument("--weight-lr", type=float)
     parser.add_argument("--architecture-lr", type=float, default=3e-3)
     parser.add_argument("--architecture-init", choices=("mpcvit", "uniform", "rsa"))
-    parser.add_argument("--search-space", choices=("three_path", "fixed_rsa_lsa_mixer"), default="three_path",
-                        help="freeze checkpoint RSA locations and search LSA/Mixer elsewhere")
+    parser.add_argument("--search-space", choices=("three_path", "fixed_rsa_lsa_mixer",
+                        "fixed_rsa_layer_lsa_mixer"), default="three_path",
+                        help="freeze checkpoint RSA positions and search LSA/Mixer per head or layer")
     parser.add_argument("--mixer-init-probability", type=float, default=0.05)
     parser.add_argument("--architecture-warmup-epochs", type=int, default=0,
                         help="train model weights while architecture logits are frozen")
@@ -319,7 +323,8 @@ def main():
         parser.error("scratch initialization cannot use a checkpoint or MPCViT architecture prior")
     if not scratch and args.checkpoint is None:
         parser.error("checkpoint initialization requires --checkpoint")
-    constrained = args.search_space == "fixed_rsa_lsa_mixer"
+    layer_search = args.search_space == "fixed_rsa_layer_lsa_mixer"
+    constrained = args.search_space in ("fixed_rsa_lsa_mixer", "fixed_rsa_layer_lsa_mixer")
     if constrained and (scratch or args.architecture_init != "mpcvit" or args.path_mode != "soft"):
         parser.error("fixed RSA search requires checkpoint initialization, mpcvit prior and soft paths")
     if args.warmup_checkpoint is not None and (not scratch or args.architecture_init != "rsa"):
@@ -356,7 +361,7 @@ def main():
     model = make_checkpoint_search_student(
         source, prior_strength=1.0 if args.architecture_init == "mpcvit" else 0.0)
     initial_paths = (configure_fixed_rsa_search(model, source, mixer_probability=args.mixer_init_probability,
-                                                direct_alpha=True)
+                                                direct_alpha=True, layer_alpha=layer_search)
                      if constrained else None)
     for layer in search_layers(model):
         layer.path_mode = args.path_mode
@@ -381,7 +386,8 @@ def main():
     table = tables["online_seconds"]
     if constrained:
         minimum_possible = sum(min(float(table[paths.count("rsa"), mixer_count])
-                                   for mixer_count in range(paths.count("lsa") + 1))
+                                   for mixer_count in ((0, paths.count("lsa")) if layer_search
+                                                       else range(paths.count("lsa") + 1)))
                                for paths in initial_paths)
         if args.budget_online_seconds + 1e-12 < minimum_possible:
             raise ValueError(f"budget {args.budget_online_seconds} is below the measured-table "
@@ -394,7 +400,8 @@ def main():
               "validation_per_class": args.validation_per_class, "weight_lr": args.weight_lr,
               "architecture_lr": args.architecture_lr, "lambda_cost": args.lambda_cost,
               "architecture_init": args.architecture_init,
-              "optimization": "joint_alpha_lasso_v1" if constrained else "alternating_v1",
+              "optimization": ("joint_layer_alpha_lasso_v1" if layer_search else
+                               "joint_alpha_lasso_v1" if constrained else "alternating_v1"),
               "lambda_lasso": args.lambda_lasso,
               "search_space": args.search_space,
               "mixer_init_probability": args.mixer_init_probability,
@@ -502,9 +509,17 @@ def main():
     if constrained:
         selection["alpha_lsa_by_layer"] = [
             [float(value) if allowed else None for value, allowed in zip(
-                layer.lsa_alpha.detach().cpu().tolist(),
+                layer.lsa_alpha.detach().cpu().expand(layer.config.num_heads).tolist()
+                if layer.layer_alpha_mode else layer.lsa_alpha.detach().cpu().tolist(),
                 layer.allowed_paths[:, 1].detach().cpu().tolist())]
             for layer in layers]
+        if layer_search:
+            selection["layer_lsa_alpha"] = [float(layer.lsa_alpha.detach().item())
+                                             if bool(layer.allowed_paths[:, 1].any()) else None
+                                             for layer in layers]
+            selection["layer_choices"] = ["mixer" if "mixer" in paths else
+                                           "lsa" if "lsa" in paths else "rsa_only"
+                                           for paths in selection["head_types"]]
         selection["path_counts"] = {name: sum(paths.count(name) for paths in selection["head_types"])
                                     for name in ("rsa", "lsa", "mixer")}
         selection["fixed_rsa_observations"] = [

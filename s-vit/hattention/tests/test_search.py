@@ -14,7 +14,7 @@ from hattention.config import HAttentionConfig
 from hattention.calibrate_group_costs import all_pairs, parse_pair, validate_report
 from hattention.group_costs import assemble_reports, load_complete_tables, METADATA
 from hattention.search import (alternating_step, joint_alpha_step, architecture_parameters, discretize,
-                               expected_group_cost, export_fixed_student,
+                               expected_group_cost, expected_layer_group_cost, export_fixed_student,
                                grouped_count_distribution, make_search_student,
                                search_layers, temperature_at, weight_parameters)
 from hattention.student_checkpoint import configure_fixed_rsa_search
@@ -58,6 +58,44 @@ def table():
 
 
 class SearchTests(unittest.TestCase):
+    def test_layer_alpha_shares_gate_and_cost_uses_only_endpoints(self):
+        source = Model()
+        source.classifier.blocks[0].self_attn.alpha = nn.Parameter(torch.zeros(2))
+        model = make_search_student(source, [HAttentionConfig(2, ("lsa", "lsa"), patch_grid=(2, 2))])
+        configure_fixed_rsa_search(model, source, mixer_probability=.2, direct_alpha=True, layer_alpha=True)
+        layer = search_layers(model)[0]
+        self.assertEqual(layer.lsa_alpha.numel(), 1)
+        self.assertTrue(torch.allclose(layer.probabilities(), torch.tensor([[0., .8, .2], [0., .8, .2]])))
+        endpoints = table().clone()
+        endpoints[0, 1] = 100.0
+        cost = expected_layer_group_cost(layer, endpoints)
+        self.assertAlmostEqual(float(cost), .8, places=5)
+        cost.backward()
+        self.assertAlmostEqual(float(layer.lsa_alpha.grad), 1.0, places=5)
+        selected = discretize([layer], {"time": [endpoints]}, {"time": .9}, require_cls_mixing=False)
+        self.assertEqual(selected["head_types"], [["mixer", "mixer"]])
+        self.assertEqual(selected["costs"]["time"], 0.)
+
+    def test_layer_alpha_training_and_fixed_rsa_export(self):
+        torch.manual_seed(13)
+        source = Model()
+        source.classifier.blocks[0].self_attn.alpha = nn.Parameter(torch.tensor([1., 0.]))
+        model = make_search_student(source, [HAttentionConfig(2, ("rsa", "lsa"), patch_grid=(2, 2))])
+        configure_fixed_rsa_search(model, source, mixer_probability=.2, direct_alpha=True, layer_alpha=True)
+        layer = search_layers(model)[0]
+        weight_opt = torch.optim.AdamW(weight_parameters(model), lr=.001)
+        alpha_opt = torch.optim.AdamW(architecture_parameters(model), lr=.01, weight_decay=0)
+        value = torch.randn(2, 5, 8) * .2
+        before = float(layer.lsa_alpha.detach())
+        result = joint_alpha_step(model, weight_opt, alpha_opt, lambda: model(value).square().mean(),
+                                  {"time": [table()]}, {"time": 10.}, lambda_lasso=100.,
+                                  lambda_num=0., lambda_cost=0.)
+        self.assertLess(float(layer.lsa_alpha.detach()), before)
+        self.assertAlmostEqual(result["architecture_components"]["lsa_alpha_l1"], .8, places=5)
+        chosen = discretize([layer], {"time": [table()]}, {"time": 2.})
+        self.assertEqual(chosen["head_types"], [["rsa", "mixer"]])
+        self.assertTrue(torch.isfinite(export_fixed_student(model, chosen["head_types"])(value)).all())
+
     def test_joint_alpha_mixes_paths_and_lasso_promotes_mixer(self):
         torch.manual_seed(13)
         source = Model()

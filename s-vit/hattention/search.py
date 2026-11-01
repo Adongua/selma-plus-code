@@ -39,6 +39,7 @@ class SearchableHAttention(nn.Module):
         self.register_buffer("allowed_paths", torch.ones(self.config.num_heads, 3, dtype=torch.bool,
                                                           device=self.qkv.weight.device), persistent=False)
         self.fixed_rsa_positions = False
+        self.layer_alpha_mode = False
         self.temperature = float(temperature)
         self.path_mode = "soft"
         self.score_bound, self.denominator_min = score_bound, denominator_min
@@ -51,8 +52,8 @@ class SearchableHAttention(nn.Module):
     def probabilities(self):
         if self.lsa_alpha is not None:
             rsa = self.allowed_paths[:, 0].to(self.lsa_alpha.dtype)
-            alpha = self.lsa_alpha.clamp(0, 1) * (1 - rsa)
-            return torch.stack((rsa, alpha, (1 - self.lsa_alpha.clamp(0, 1)) * (1 - rsa)), dim=-1)
+            alpha = self.lsa_alpha.clamp(0, 1).expand_as(rsa)
+            return torch.stack((rsa, alpha * (1 - rsa), (1 - alpha) * (1 - rsa)), dim=-1)
         if not math.isfinite(self.temperature) or self.temperature <= 0:
             raise ValueError("temperature must be positive and finite")
         return F.softmax((self.structure_logits / self.temperature).masked_fill(
@@ -155,6 +156,21 @@ def expected_group_cost(probabilities, cost_table):
     return (grouped_count_distribution(probabilities) * torch.where(mask, table, 0)).sum()
 
 
+def expected_layer_group_cost(layer, cost_table):
+    """Cost surrogate for one shared layer gate, using only the two endpoints.
+
+    This is a Bernoulli-gate expected cost, not the runtime of the soft forward.
+    """
+    if not layer.layer_alpha_mode or layer.lsa_alpha is None or layer.lsa_alpha.numel() != 1:
+        raise ValueError("expected a shared fixed-RSA layer alpha")
+    expected_group_cost(torch.full_like(layer.structure_logits.detach(), 1 / 3), cost_table)
+    rsa = int(layer.allowed_paths[:, 0].sum().item())
+    searchable = int(layer.allowed_paths[:, 1].sum().item())
+    table = cost_table.to(device=layer.lsa_alpha.device, dtype=layer.lsa_alpha.dtype)
+    alpha = layer.lsa_alpha.clamp(0, 1).reshape(())
+    return alpha * table[rsa, 0] + (1 - alpha) * table[rsa, searchable]
+
+
 def search_objective(layers, task_loss, cost_tables, budgets, *, lambda_num=0.1,
                      lambda_cost=1.0, lambda_count=0.1, max_rsa=11,
                      lambda_entropy=0.01, entropy_progress=1.0,
@@ -173,7 +189,9 @@ def search_objective(layers, task_loss, cost_tables, budgets, *, lambda_num=0.1,
     for key, budget in budgets.items():
         if not math.isfinite(budget) or budget <= 0 or len(cost_tables[key]) != len(layers):
             raise ValueError("budgets must be positive and each metric needs one table per layer")
-        costs[key] = sum(expected_group_cost(p, c) for p, c in zip(probs, cost_tables[key]))
+        costs[key] = sum(expected_layer_group_cost(layer, c) if layer.layer_alpha_mode
+                         else expected_group_cost(p, c)
+                         for layer, p, c in zip(layers, probs, cost_tables[key]))
     budget_loss = sum((costs[key] / budget - 1).clamp_min(0).square()
                       for key, budget in budgets.items())
     if not math.isfinite(max_rsa) or max_rsa <= 0:
@@ -223,7 +241,9 @@ def joint_alpha_step(model, weight_optimizer, architecture_optimizer, task,
         lambda_task=lambda_task, task_loss_scale=task_loss_scale,
         lambda_efficiency=lambda_efficiency)
     # Alpha is the LSA weight; its L1 penalty encourages replacement by Mixer.
-    lasso = sum(layer.lsa_alpha[layer.allowed_paths[:, 1]].abs().sum() for layer in layers)
+    lasso = sum((layer.lsa_alpha.abs().sum() if layer.allowed_paths[:, 1].any()
+                 else layer.lsa_alpha.sum() * 0) if layer.layer_alpha_mode
+                else layer.lsa_alpha[layer.allowed_paths[:, 1]].abs().sum() for layer in layers)
     loss = objective + lambda_lasso * lasso
     if loss.ndim != 0 or not torch.isfinite(loss):
         raise ValueError("combined search loss must be a finite scalar")
@@ -342,6 +362,21 @@ def discretize(layers, cost_tables, budgets, *, max_steps=10000, cost_preference
     keys = tuple(budgets)
     layer_options = []
     for layer_index, (scores, masks) in enumerate(zip(log_probs, allowed)):
+        if layers[layer_index].layer_alpha_mode:
+            rsa_mask = masks[:, 0]
+            searchable = masks[:, 1] & masks[:, 2]
+            if not bool((rsa_mask | searchable).all()):
+                raise ValueError("layer gate requires fixed RSA and searchable LSA/Mixer")
+            choices = (1, 2) if bool(searchable.any()) else (1,)
+            options = []
+            for choice in choices:
+                assignment = tuple(0 if bool(is_rsa) else choice for is_rsa in rsa_mask)
+                rsa_count, mixer_count = assignment.count(0), assignment.count(2)
+                cost = tuple(float(cost_tables[key][layer_index][rsa_count, mixer_count]) for key in keys)
+                score = float(scores[searchable, choice][0]) if bool(searchable.any()) else 0.0
+                options.append((cost, score, assignment))
+            layer_options.append(options)
+            continue
         # For each feasible (RSA count, Mixer count), retain its most probable
         # head assignment. The dynamic program is O(heads^3), not 3**heads.
         states = {(0, 0): (0.0, ())}

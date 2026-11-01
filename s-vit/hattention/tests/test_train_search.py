@@ -227,6 +227,52 @@ class SearchRunnerTests(unittest.TestCase):
             self.assertTrue(torch.allclose(checkpoint1["model"][key], torch.full((12,), .95)))
             self.assertFalse(torch.equal(checkpoint1["model"][key][6:], checkpoint2["model"][key][6:]))
 
+    def test_layer_search_entrypoint_exports_shared_decision(self):
+        items = [(f"{c}/{i}", c) for c in range(2) for i in range(2)]
+        teacher = TeacherGuidance(Teacher(), Processor(), list(range(200)))
+        meta = {"teacher_hidden_size": 6, "weights_sha256": "w", "config_sha256": "c",
+                "processor_sha256": "p"}
+        table = torch.zeros(13, 13, dtype=torch.float64)
+
+        def load_source(*args):
+            source = WideStudent()
+            source.classifier.blocks[0].self_attn.alpha = torch.tensor([1.] * 6 + [0.] * 6)
+            return source, {"sha256": "student"}
+
+        def make_model(source, **kwargs):
+            return make_search_student(source, [HAttentionConfig(12, ("lsa",) * 12, patch_grid=(2, 2))])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cost = root / "cost.json"
+            cost.write_text("{}")
+            output = root / "output"
+            argv = ["train_search", "--checkpoint", str(root / "model"), "--mpcvit-root", str(root),
+                    "--dataset-root", str(root), "--teacher-dir", str(root), "--cost-table", str(cost),
+                    "--output-root", str(output), "--epochs", "1", "--budget-online-seconds", "9",
+                    "--search-space", "fixed_rsa_layer_lsa_mixer", "--validation-per-class", "1",
+                    "--eval-samples", "2", "--max-steps-per-epoch", "1", "--device", "cpu"]
+            with patch("sys.argv", argv), \
+                 patch.object(train_search, "training_splits", return_value=(
+                     ["class0", "class1"], [("w0", 0), ("w1", 1)], items, {"seed": 1})), \
+                 patch.object(train_search, "load_student", side_effect=load_source), \
+                 patch.object(train_search, "make_checkpoint_search_student", side_effect=make_model), \
+                 patch.object(train_search, "load_teacher", return_value=(teacher, meta)), \
+                 patch.object(train_search, "load_complete_tables", return_value=(
+                     {"online_seconds": table}, {"shape_b_h_n_d": [1, 12, 257, 16]})), \
+                 patch.object(train_search, "SearchDataset", WideFixture), redirect_stdout(io.StringIO()):
+                with patch.object(train_search, "discretize", side_effect=RuntimeError("interrupted export")):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted export"):
+                        train_search.main()
+                with patch("sys.argv", argv + ["--resume", str(output / "epoch-0001.pt")]):
+                    train_search.main()
+            selection = json.loads((output / "selection.json").read_text())
+            self.assertEqual(selection["head_types"][0][:6], ["rsa"] * 6)
+            self.assertEqual(len(set(selection["head_types"][0][6:])), 1)
+            self.assertEqual(len(selection["layer_lsa_alpha"]), 1)
+            checkpoint = torch.load(output / "epoch-0001.pt", weights_only=True)
+            self.assertEqual(checkpoint["model"]["classifier.blocks.0.self_attn.lsa_alpha"].numel(), 1)
+
     def test_rsa_warmup_learns_and_rejects_overfit_checkpoint_for_search(self):
         torch.manual_seed(3)
         items = [(f"{c}/{i}", c) for c in range(3) for i in range(4)]

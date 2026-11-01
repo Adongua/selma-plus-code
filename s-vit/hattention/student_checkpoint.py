@@ -126,10 +126,13 @@ def make_checkpoint_search_student(model, *, prior_strength=1.0, temperature=5.0
     return student
 
 
-def configure_fixed_rsa_search(student, source, *, mixer_probability=0.05, direct_alpha=False):
+def configure_fixed_rsa_search(student, source, *, mixer_probability=0.05, direct_alpha=False,
+                               layer_alpha=False):
     """Freeze checkpoint RSA positions; learn LSA/Mixer choices elsewhere."""
     if not math.isfinite(mixer_probability) or not 0 < mixer_probability < 0.5:
         raise ValueError("initial Mixer probability must be between 0 and 0.5")
+    if layer_alpha and not direct_alpha:
+        raise ValueError("shared layer alpha requires direct alpha")
     layers = search_layers(student)
     blocks = source.classifier.blocks
     if len(layers) != len(blocks):
@@ -149,7 +152,9 @@ def configure_fixed_rsa_search(student, source, *, mixer_probability=0.05, direc
             layer.structure_logits[:, 2] = math.log(mixer_probability / (1 - mixer_probability))
             if direct_alpha:
                 layer.structure_logits.requires_grad_(False)
-                layer.lsa_alpha = torch.nn.Parameter(torch.full_like(alpha, 1 - mixer_probability))
+                initial = alpha.new_full((1,), 1 - mixer_probability) if layer_alpha else torch.full_like(alpha, 1 - mixer_probability)
+                layer.lsa_alpha = torch.nn.Parameter(initial)
+                layer.layer_alpha_mode = layer_alpha
             layer.temperature = 1.0
             layer.fixed_rsa_positions = True
             paths.append(["rsa" if value else "lsa" for value in rsa.tolist()])
