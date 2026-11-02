@@ -1,5 +1,59 @@
 # hAttention
 
+## Distill exported layer-search students
+
+`python -m hattention.distill_fixed` accepts the original fixed export,
+`selection.json`, and the final layer-search checkpoint. It reconstructs the
+export and verifies every fixed tensor and path against the search checkpoint;
+it also verifies the MPCViT checkpoint, teacher files, training split, and
+search holdout. The original 33 RSA locations and all LSA/Mixer choices stay
+fixed. Train loss is CE + `lambda_kd * KD` + `lambda_feature * feature MSE`;
+the inherited feature projection is trainable. This is plaintext recovery,
+not secure inference. First-name teacher label mapping is still a hypothesis.
+
+Smoke example for lambda=0.4 (replace `0.4` with `0.5` for the other case;
+use a new output directory for every invocation):
+
+```bash
+case=0.4
+run="$HOME/home/tmp/hattention-layer-gate-lasso-${case}-v1"
+CUDA_VISIBLE_DEVICES=0 python -m hattention.distill_fixed \
+  --fixed-student "$run/fixed-student.pt" --search-checkpoint "$run/epoch-0005.pt" \
+  --selection "$run/selection.json" \
+  --checkpoint "$PWD/mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.3-kd.pth.tar" \
+  --mpcvit-root "$PWD/mpcvit" --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --teacher-dir "$HOME/home/models/tiny-imagenet-vit-teacher" \
+  --output-root "$HOME/home/tmp/hattention-distill-${case}-smoke-v1" \
+  --epochs 1 --batch-size 1 --max-steps-per-epoch 2 --eval-samples 16 \
+  --log-every 1 --device cuda
+```
+
+For a preliminary comparison, use identical training settings and seeds for
+both cases, e.g. `--epochs 5 --batch-size 8 --max-steps-per-epoch 200
+--eval-samples 1000 --log-every 50` with new output directories. A zero step
+limit uses the whole weight-training split per epoch; 200 steps is a partial
+pass, not a full dataset epoch. Reports include losses and search holdout
+metrics before training and after every epoch. `epoch-NNNN.pt` is also a
+loadable fixed-student artifact. `--resume path/to/epoch-NNNN.pt` resumes
+optimizer and RNG state with the same configuration, data and inputs; set
+`--epochs` to the desired total and use a new output root. The original
+`--fixed-student` and search files remain required for provenance checks.
+
+After deciding how to use the validation set, evaluate a fixed checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m hattention.evaluate_fixed \
+  --fixed-student "$HOME/home/tmp/hattention-distill-0.4-trial-v1/epoch-0005.pt" \
+  --checkpoint "$PWD/mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.3-kd.pth.tar" \
+  --mpcvit-root "$PWD/mpcvit" --dataset-root "$HOME/home/datasets/tiny-imagenet-200" \
+  --output "$HOME/home/tmp/hattention-distill-0.4-official-val-v1.json" \
+  --batch-size 8 --device cuda
+```
+
+By default this evaluates all official validation images; `--max-samples N`
+uses a seeded class-balanced subset. Repeated model selection on this set turns
+it into a tuning set. Reports do not imply privacy or secure numeric validity.
+
 ## Layer-level LSA/Mixer search with fixed RSA
 
 `train_search --search-space fixed_rsa_layer_lsa_mixer` starts from a binary
@@ -20,8 +74,9 @@ learned gate score among feasible structures. A tight budget may force a layer
 against its preferred gate and does not guarantee accuracy. `selection.json`
 reports `layer_lsa_alpha`, `layer_choices`, paths, costs and fixed-model
 holdout evaluation. `baseline.json` records the original fixed baseline and a
-table-derived lower bound. A separate fixed-structure distillation and final
-validation are still needed; `ranked_mixer` accepts head-level checkpoints only.
+table-derived lower bound. Fixed-structure recovery and final validation are separate steps; see
+`distill_fixed` and `evaluate_fixed` above. `ranked_mixer` accepts head-level
+checkpoints only.
 
 Use a new output root and the same measured cost table as the intended
 deployment. Example pipeline smoke test (the wide budget is not an optimization
