@@ -945,3 +945,40 @@ microbenchmark are isolated in [`../srelu`](../srelu/README.md).  hAttention
 will import that package when the secure RSA normalization path is connected;
 the plaintext `positive_srelu` formula remains here as part of the RSA
 reference definition.
+
+## Experimental full-ViT execution and range audit
+
+`hattention.benchmark_vit_cuda` contains a forward-only ViTLite prototype:
+public model weights, a public benchmark image secret-shared for execution,
+CrypTen public linear operations, Ring3 hAttention, sLayerNorm and sGeLU.
+The source MPCViT checkpoint is converted to sReLU RSA for this experiment;
+this adapted baseline is not the original MPCViT ReLU implementation. The
+reference is the checkpoint's plaintext LayerNorm/GeLU model. Just-in-time
+Ring3 material generation is counted separately and full forward wall time is
+also recorded. The model is experimental and has not been run on three GPUs.
+
+Before attempting the secure prototype, audit the real checkpoints and public
+images on CPU. For example, set `IMAGE` to an existing Tiny-ImageNet image:
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+CHECKPOINT="$PWD/mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.3-kd.pth.tar"
+IMAGE="$HOME/home/datasets/tiny-imagenet-200/val/n01784675/example.JPEG"
+
+python -m hattention.benchmark_vit_cuda \
+  --checkpoint "$CHECKPOINT" --mpcvit-root "$PWD/mpcvit" \
+  --fixed-student "$HOME/home/tmp/hattention-distill-0.4-resume200-v1/epoch-0189.pt" \
+  --image "$IMAGE" --audit-only \
+  --output "$HOME/home/tmp/hattention-vit-audit-04"
+```
+
+Replace the example image path with an actual file. Omit `--fixed-student` to
+audit the source MPCViT checkpoint. Multiple image paths may follow `--image`
+in audit mode. The generated `range-audit.json` reports per-layer plaintext
+observations and violations, but passing a finite set of public examples is
+not proof of secret ranges. The secure run refuses an observed violation by
+default. `--allow-out-of-range` is only for debugging and marks the output
+invalid; it does not repair the numerical contract. The local original
+checkpoint and one real image already exhibit LayerNorm and RSA range violations,
+so this prototype is not ready for formal full-model performance claims.
