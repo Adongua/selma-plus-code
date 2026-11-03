@@ -11,6 +11,8 @@ import torch.multiprocessing as mp
 from hattention.benchmark_vit_cuda import SecureOperators, audit_public_fixture, load_model
 from hattention.diagnose_vit_cuda import error_metrics
 from hattention.diagnose_vit_native_layernorm import first_block_input
+from hattention.diagnose_vit_native_attention import plaintext_block_input
+from hattention.benchmark_vit_native_cuda import AuditedPlainOperators
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
 from hattention.vit_executor import PlainOperators, forward_vit
@@ -105,6 +107,12 @@ class ViTExecutorTests(unittest.TestCase):
             first_input = first_block_input(model, image)
         self.assertTrue(torch.allclose(expected, actual, atol=1e-6, rtol=1e-6))
         torch.testing.assert_close(first_input, stages[(0, "block_input")])
+        cheb_stages = {}
+        with torch.no_grad():
+            forward_vit(model, image * 0.05, AuditedPlainOperators(12.0),
+                        on_stage=lambda i, s, v: cheb_stages.update({(i, s): v.detach()}))
+            second_input = plaintext_block_input(model, image * 0.05, 1, 12.0)
+        torch.testing.assert_close(second_input, cheb_stages[(1, "block_input")])
         audited, observations = audit_public_fixture(model, image)
         self.assertTrue(torch.allclose(expected.double(), audited, atol=1e-6, rtol=1e-6))
         self.assertEqual(len(observations), 37)  # 4 per block and final norm
