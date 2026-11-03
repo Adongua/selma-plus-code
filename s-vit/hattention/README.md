@@ -1071,6 +1071,10 @@ attention output. All heads are included by default; `--head` isolates one
 zero-based head. Resharing and extra openings change quantization and random
 operations compared with a full forward. It is diagnostic only, not a private
 execution or performance benchmark.
+With `--trace-exp`, the same CrypTen exponential is expanded as its initial
+division plus configured repeated squares; each result is opened and compared
+to the square of the previous opened value, including a count of errors above
+0.01. The additional openings can change timing and the random execution path.
 
 `python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
 compares compatible same-image reports, preserving failed correctness statuses

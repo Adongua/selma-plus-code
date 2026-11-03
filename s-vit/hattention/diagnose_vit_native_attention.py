@@ -21,14 +21,16 @@ from .diagnose_vit_native_layernorm import first_block_input
 from .student_checkpoint import file_sha256
 
 
-def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit):
+def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=False):
     """Run the same Softmax primitives as native CrypTen, with openings."""
     def inspect(name, value, reference):
         actual = _plain(value.get_plain_text())
         metrics = error_metrics(actual, reference)
         if metrics["finite"]:
             metrics.update(actual_min=float(actual.min()), actual_max=float(actual.max()),
-                           reference_min=float(reference.min()), reference_max=float(reference.max()))
+                           reference_min=float(reference.min()), reference_max=float(reference.max()),
+                           elements=int(actual.numel()),
+                           errors_above_0_01=int((actual.sub(reference).abs() > 0.01).sum()))
         emit({"stage": name, **metrics})
         return actual
 
@@ -43,7 +45,17 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit):
     maximum_open = inspect("maximum_vs_opened_scores", maximum, scores_open.max(dim=-1, keepdim=True).values)
     logits = scores - maximum
     logits_open = inspect("shifted_logits", logits, scores_open - maximum_open)
-    numerator = logits.exp()
+    if trace_exp:
+        # Same sequence as CrypTen exp: 1 + x/2**d, then d squares. Each
+        # reconstruction is diagnostic and does not alter the secret value.
+        steps = crypten.cfg.functions.exp_iterations
+        numerator = 1 + logits.div(2 ** steps)
+        previous = inspect("exp_initial", numerator, 1 + logits_open / (2 ** steps))
+        for step in range(steps):
+            numerator = numerator.square()
+            previous = inspect(f"exp_square_{step + 1}", numerator, previous.square())
+    else:
+        numerator = logits.exp()
     numerator_open = inspect("exp_vs_exact_opened_logits", numerator, logits_open.exp())
     denominator = numerator.sum(dim=-1, keepdim=True)
     denominator_open = inspect("denominator_vs_opened_exp_sum", denominator,
@@ -106,14 +118,18 @@ def worker(rank, rendezvous, options):
                 if rank == 0:
                     rows.append(row)
                     print(json.dumps({"event": "stage_complete", **row}, allow_nan=False), flush=True)
-            extra = trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit)
+            extra = trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit,
+                                    trace_exp=options["trace_exp"])
         if rank == 0:
             report = {"status": "diagnostic_completed_not_security_validated",
                       "scope": "public first-layer block input reshared; selected head or all heads; intermediate values opened",
                       "model": metadata, "image": str(Path(options["image"]).resolve()),
                       "image_sha256": file_sha256(options["image"]),
                       "precision": f"Q{options['precision_bits']}", "sqrt_nr_iters": options["sqrt_iters"],
-                      "device": options["device"], "head": options["head"], "stages": rows, "checks": extra,
+                      "device": options["device"], "head": options["head"],
+                      "trace_exp": options["trace_exp"],
+                      "exp_iterations": crypten.cfg.functions.exp_iterations,
+                      "stages": rows, "checks": extra,
                       "note": "Q/K/V arise from CrypTen LayerNorm and projection of reshared public block input; per-stage errors include earlier propagated error.",
                       "security": "Intermediate values opened; public fixture only. Not a timing benchmark."}
             root = Path(options["output"])
@@ -135,6 +151,7 @@ def main():
     parser.add_argument("--precision-bits", type=int, choices=(17, 20), default=20)
     parser.add_argument("--sqrt-iters", type=int, default=7)
     parser.add_argument("--head", type=int, help="optional zero-based head index; default all heads")
+    parser.add_argument("--trace-exp", action="store_true", help="open each stage of CrypTen exp")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     args = parser.parse_args()
     if not 1 <= args.sqrt_iters <= 50:

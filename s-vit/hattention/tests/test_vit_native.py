@@ -85,6 +85,13 @@ def _worker(rank, rendezvous):
         if (len(rows) != 11 or any(not row["finite"] for row in rows) or
                 extra["denominator_nonpositive"] or extra["qkv_score_reconstruction_max_abs"] > 0.01):
             raise AssertionError(f"unexpected softmax trace: {rows}, {extra}")
+        traced = []
+        trace_attention(crypten, secret_q, secret_k, secret_v, q.double(), k.double(),
+                        v.double(), traced.append, trace_exp=True)
+        if (len(traced) != 12 + crypten.cfg.functions.exp_iterations or
+                not any(row["stage"] == "exp_square_1" for row in traced) or
+                any(not row["finite"] for row in traced)):
+            raise AssertionError(f"unexpected exponential trace: {traced}")
     finally:
         crypten.uninit()
 
