@@ -9,6 +9,7 @@ import torch.multiprocessing as mp
 
 from hattention.benchmark_vit_native_cuda import (AuditedPlainOperators, CrypTenNativeOperators,
                                                   PlainStandardOperators, chebyshev_gelu, numerical_gate)
+from hattention.diagnose_vit_native_attention import trace_attention
 from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
@@ -76,6 +77,14 @@ def _worker(rank, rendezvous):
         if not ((roots[1] - expected_sqrt).abs().max() < 0.001 and
                 (roots[1] - expected_sqrt).abs().max() < (roots[0] - expected_sqrt).abs().max()):
             raise AssertionError(f"unexpected Newton convergence: {roots} vs {expected_sqrt}")
+        q, k, v = [torch.randn(1, 2, 5, 4) * 0.1 for _ in range(3)]
+        secret_q, secret_k, secret_v = [crypten.cryptensor(t, src=0, precision=20) for t in (q, k, v)]
+        rows = []
+        extra = trace_attention(crypten, secret_q, secret_k, secret_v,
+                                q.double(), k.double(), v.double(), rows.append)
+        if (len(rows) != 11 or any(not row["finite"] for row in rows) or
+                extra["denominator_nonpositive"] or extra["qkv_score_reconstruction_max_abs"] > 0.01):
+            raise AssertionError(f"unexpected softmax trace: {rows}, {extra}")
     finally:
         crypten.uninit()
 

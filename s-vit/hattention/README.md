@@ -1064,6 +1064,14 @@ local CrypTen default. Both `benchmark_vit_native_cuda` and
 `diagnose_vit_native_cuda` also accept `--sqrt-iters` and record the effective
 value. A change in iterations modifies baseline cost and must be timed anew.
 
+`python -m hattention.diagnose_vit_native_attention` reshares the public
+first-block input, applies CrypTen LayerNorm and QKV projection, and opens the
+Q/K/V, scores, row maximum, exponential, denominator, reciprocal, weights and
+attention output. All heads are included by default; `--head` isolates one
+zero-based head. Resharing and extra openings change quantization and random
+operations compared with a full forward. It is diagnostic only, not a private
+execution or performance benchmark.
+
 `python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
 compares compatible same-image reports, preserving failed correctness statuses
 and separate communication counters. A failed numerical check makes a timing
