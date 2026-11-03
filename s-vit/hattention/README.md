@@ -1056,6 +1056,14 @@ the opened GeLU input exceeds the interpolation bound. The run reveals
 intermediates and must not be used on private inputs or treated as a timing
 benchmark. Each error includes propagation from previous stages.
 
+`python -m hattention.diagnose_vit_native_layernorm` isolates first-block
+pre_norm on the public fixture and opens the input, mean, variance, square root,
+reciprocal and affine output. It supports CPU and CUDA. `--sqrt-iters 7` is an
+optional diagnostic CrypTen configuration override; omitting it preserves the
+local CrypTen default. Both `benchmark_vit_native_cuda` and
+`diagnose_vit_native_cuda` also accept `--sqrt-iters` and record the effective
+value. A change in iterations modifies baseline cost and must be timed anew.
+
 `python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
 compares compatible same-image reports, preserving failed correctness statuses
 and separate communication counters. A failed numerical check makes a timing

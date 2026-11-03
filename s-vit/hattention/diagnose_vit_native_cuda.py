@@ -28,6 +28,8 @@ def worker(rank, rendezvous, options):
                       DISTRIBUTED_BACKEND="gloo")
     import crypten
     crypten.cfg.encoder.precision_bits = options["precision_bits"]
+    if options["sqrt_iters"] is not None:
+        crypten.cfg.functions.sqrt_nr_iters = options["sqrt_iters"]
     crypten.init(device=device)
     try:
         model, metadata = load_model(options["checkpoint"], options["mpcvit_root"], None)
@@ -74,6 +76,7 @@ def worker(rank, rendezvous, options):
                       "model": metadata, "image": str(Path(options["image"]).resolve()),
                       "image_sha256": file_sha256(options["image"]),
                       "precision": f"Q{options['precision_bits']}", "chebyshev_bound": bound,
+                      "sqrt_nr_iters": crypten.cfg.functions.sqrt_nr_iters,
                       "plaintext_gelu_input_max_abs_by_layer": reference_ops.gelu_max_abs,
                       "sites": rows, "logits": final,
                       "interpretation": "Compared with the same plaintext Chebyshev model; each site includes errors propagated from preceding sites.",
@@ -96,10 +99,13 @@ def main():
     parser.add_argument("--image", required=True, help="one public test image")
     parser.add_argument("--output", required=True, help="new output directory")
     parser.add_argument("--precision-bits", type=int, choices=(17, 20), default=20)
+    parser.add_argument("--sqrt-iters", type=int, help="override CrypTen inverse-square-root iterations")
     parser.add_argument("--chebyshev-bound", type=float, default=12.0)
     args = parser.parse_args()
     if not math.isfinite(args.chebyshev_bound) or args.chebyshev_bound <= 0:
         parser.error("Chebyshev bound must be finite and positive")
+    if args.sqrt_iters is not None and not 1 <= args.sqrt_iters <= 50:
+        parser.error("sqrt-iters must be in [1,50]")
     if Path(args.output).exists():
         parser.error("output already exists")
     if torch.cuda.device_count() < 3:

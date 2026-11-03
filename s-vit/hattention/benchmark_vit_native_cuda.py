@@ -88,6 +88,8 @@ def worker(rank, rendezvous, options):
                       DISTRIBUTED_BACKEND="gloo")
     import crypten
     crypten.cfg.encoder.precision_bits = options["precision_bits"]
+    if options["sqrt_iters"] is not None:
+        crypten.cfg.functions.sqrt_nr_iters = options["sqrt_iters"]
     crypten.init(device=device)
     crypten.cfg.communicator.verbose = True
     try:
@@ -162,6 +164,7 @@ def worker(rank, rendezvous, options):
                       "model": metadata, "weights_note": "MPCViT checkpoint weights; attention replaced by softmax without retraining, not a trained standard ViT",
                       "image_sha256": file_sha256(options["image"]),
                       "precision": f"Q{options['precision_bits']}", "repeats": options["repeats"],
+                      "sqrt_nr_iters": crypten.cfg.functions.sqrt_nr_iters,
                       "max_abs_error_threshold": options["max_abs_error"], "records": records,
                       "correctness_gate": "max error against the selected plaintext formula; exact GeLU model deviation reported separately",
                       "crypten_import": crypten.__file__, "python": platform.python_version(),
@@ -186,6 +189,7 @@ def main():
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--precision-bits", type=int, default=20, choices=(17, 20))
+    parser.add_argument("--sqrt-iters", type=int, help="override CrypTen inverse-square-root iterations")
     parser.add_argument("--gelu", choices=("erf", "chebyshev16"), default="erf")
     parser.add_argument("--chebyshev-bound", type=float, default=12.0,
                         help="fit 16-degree interpolant on [-bound, bound]; public audit only")
@@ -193,7 +197,8 @@ def main():
     parser.add_argument("--max-abs-error", type=float, default=1.0)
     args = parser.parse_args()
     if (args.repeats < 1 or not 0 < args.max_abs_error < float("inf") or
-            not math.isfinite(args.chebyshev_bound) or args.chebyshev_bound <= 0):
+            not math.isfinite(args.chebyshev_bound) or args.chebyshev_bound <= 0 or
+            (args.sqrt_iters is not None and not 1 <= args.sqrt_iters <= 50)):
         parser.error("repeats and max-abs-error must be positive")
     if Path(args.output).exists():
         parser.error("output already exists")

@@ -66,6 +66,16 @@ def _worker(rank, rendezvous):
             raise AssertionError(f"unexpected opened site order: {opened_sites}")
         if not torch.isfinite(cheb_output).all() or (cheb_output - approximate).abs().max() > 1.0:
             raise AssertionError(f"Chebyshev ViT mismatch: {cheb_output} versus {approximate}")
+        variance = torch.tensor([0.00689607485])
+        expected_sqrt = variance.sqrt()
+        roots = []
+        for iterations in (3, 7):
+            crypten.cfg.functions.sqrt_nr_iters = iterations
+            encrypted_variance = crypten.cryptensor(variance, src=0, precision=20)
+            roots.append(encrypted_variance.sqrt().get_plain_text())
+        if not ((roots[1] - expected_sqrt).abs().max() < 0.001 and
+                (roots[1] - expected_sqrt).abs().max() < (roots[0] - expected_sqrt).abs().max()):
+            raise AssertionError(f"unexpected Newton convergence: {roots} vs {expected_sqrt}")
     finally:
         crypten.uninit()
 
