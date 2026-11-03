@@ -40,8 +40,8 @@ def chebyshev_gelu(value, bound, coefficients):
     return z.mul(previous).sub(previous2).add(0.5 * coefficients[0])
 
 
-def numerical_gate(records, max_abs_error):
-    measured = [r for r in records if not r["warmup"]]
+def numerical_gate(records, max_abs_error, *, include_warmup=False):
+    measured = [r for r in records if include_warmup or not r["warmup"]]
     return bool(measured) and all(r["error_vs_own_formula_logits"]["finite"] and
                                   r["error_vs_own_formula_logits"]["max_abs"] <= max_abs_error
                                   for r in measured)
@@ -180,7 +180,7 @@ def worker(rank, rendezvous, options):
                 records.append(row)
                 print(json.dumps({"event": "iteration_complete", "record": row}), flush=True)
         if rank == 0:
-            passed = numerical_gate(records, options["max_abs_error"])
+            passed = numerical_gate(records, options["max_abs_error"], include_warmup=True)
             report = {"status": "benchmark_passed_not_security_validated" if passed else "benchmark_failed_correctness",
                       "backend": "gloo", "world_size": 3,
                       "scope": "full ViTLite forward; public weights and public image shared as secret input; batch 1",
@@ -196,7 +196,7 @@ def worker(rank, rendezvous, options):
                       "precision": f"Q{options['precision_bits']}", "repeats": options["repeats"],
                       "sqrt_nr_iters": crypten.cfg.functions.sqrt_nr_iters,
                       "max_abs_error_threshold": options["max_abs_error"], "records": records,
-                      "correctness_gate": "max error against the selected plaintext formula; exact GeLU model deviation reported separately",
+                      "correctness_gate": "all iterations including warmup must meet max error against selected plaintext formula; exact GeLU model deviation reported separately",
                       "crypten_import": crypten.__file__, "python": platform.python_version(),
                       "torch": torch.__version__,
                       "timing_note": "CrypTen provider work is included in forward; input sharing and output reconstruction are separate.",

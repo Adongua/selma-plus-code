@@ -124,6 +124,7 @@ class NativeViTTests(unittest.TestCase):
                 {"warmup": False, "error_vs_plaintext_logits": {"finite": True, "max_abs": 1.1},
                  "error_vs_own_formula_logits": {"finite": True, "max_abs": 0.1}}]
         self.assertTrue(numerical_gate(rows, 1.0))
+        self.assertFalse(numerical_gate(rows, 1.0, include_warmup=True))
         self.assertFalse(numerical_gate(rows, 0.01))
         self.assertFalse(numerical_gate(rows[:1], 1.0))
 

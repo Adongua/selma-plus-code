@@ -1089,6 +1089,8 @@ third-party protocol. The report records the method and scale; all additional
 operations and CrypTen provider work remain in the timed forward. It does not
 fix exponential outliers, prove the secret denominator range or establish
 classification accuracy. Evaluate correctness and repeat before comparing cost.
+The baseline's correctness gate checks warmup and measured runs, although warmup
+is excluded from timing summaries, to retain evidence of intermittent failures.
 
 `python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
 compares compatible same-image reports, preserving failed correctness statuses
