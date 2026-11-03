@@ -1036,6 +1036,18 @@ Default Q20 matches the prior softmax engineering benchmark; `--precision-bits
 17` is available for a same-Q comparison with Ring3. Validate both profiles:
 CrypTen erf and softmax approximations can produce severe numerical error.
 
+`--gelu chebyshev16 --chebyshev-bound 12` selects a separate CrypTen
+adaptation of the reconstructed 16-degree Chebyshev interpolant, fitted on
+[-12,12]. This wider fit is distinct from the earlier CryptGPU [-8,8] fit and
+uses reconstructed, not original experiment, coefficients. Before the secure
+forward, public exact-GeLU and Chebyshev plaintext models are audited; an
+observed input beyond the bound aborts the run. This is not a secret-range
+check and does not clamp secret inputs. The report records secure error against
+both the exact-GeLU and Chebyshev plaintext models; the correctness gate uses
+the selected formula, and neither gate measures classification accuracy. The
+MPCViT weights remain unretrained for softmax or Chebyshev. Real CUDA results
+and repeated samples are required before drawing performance conclusions.
+
 `python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
 compares compatible same-image reports, preserving failed correctness statuses
 and separate communication counters. A failed numerical check makes a timing

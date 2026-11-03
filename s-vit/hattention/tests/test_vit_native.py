@@ -7,7 +7,9 @@ import unittest
 import torch
 import torch.multiprocessing as mp
 
-from hattention.benchmark_vit_native_cuda import CrypTenNativeOperators, PlainStandardOperators
+from hattention.benchmark_vit_native_cuda import (AuditedPlainOperators, CrypTenNativeOperators,
+                                                  PlainStandardOperators, chebyshev_gelu, numerical_gate)
+from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
 from hattention.vit_executor import forward_vit
@@ -37,11 +39,43 @@ def _worker(rank, rendezvous):
         actual = forward_vit(model, encrypted, CrypTenNativeOperators()).get_plain_text()
         if not torch.isfinite(actual).all() or (actual - reference).abs().max() > 1.0:
             raise AssertionError(f"native ViT mismatch: {actual} versus {reference}")
+        coefficients = _chebyshev_coefficients(16, 12.0)
+        fixture = torch.tensor([-12., -8.426, -1., 0., 1., 8.426, 12.])
+        for precision in (17, 20):
+            crypten.cfg.encoder.precision_bits = precision
+            secret = crypten.cryptensor(fixture, src=0, precision=precision)
+            observed = chebyshev_gelu(secret, 12.0, coefficients).get_plain_text()
+            expected = chebyshev_gelu(fixture, 12.0, coefficients)
+            if not torch.isfinite(observed).all() or (observed - expected).abs().max() > 0.05:
+                raise AssertionError(f"Q{precision} Chebyshev mismatch: {observed} versus {expected}")
+        crypten.cfg.encoder.precision_bits = 20
+        plaintext_ops = AuditedPlainOperators(12.0)
+        approximate = forward_vit(model, image, plaintext_ops)
+        encrypted = crypten.cryptensor(image, src=0, precision=20)
+        cheb_output = forward_vit(model, encrypted, CrypTenNativeOperators("chebyshev16", 12.0)).get_plain_text()
+        if not torch.isfinite(cheb_output).all() or (cheb_output - approximate).abs().max() > 1.0:
+            raise AssertionError(f"Chebyshev ViT mismatch: {cheb_output} versus {approximate}")
     finally:
         crypten.uninit()
 
 
 class NativeViTTests(unittest.TestCase):
+    def test_gate_uses_selected_formula_and_excludes_warmup(self):
+        rows = [{"warmup": True, "error_vs_own_formula_logits": {"finite": True, "max_abs": 100.}},
+                {"warmup": False, "error_vs_plaintext_logits": {"finite": True, "max_abs": 1.1},
+                 "error_vs_own_formula_logits": {"finite": True, "max_abs": 0.1}}]
+        self.assertTrue(numerical_gate(rows, 1.0))
+        self.assertFalse(numerical_gate(rows, 0.01))
+        self.assertFalse(numerical_gate(rows[:1], 1.0))
+
+    def test_chebyshev_reference_and_fit_domain(self):
+        for bound, tolerance in ((8.0, 0.018), (12.0, 0.083)):
+            values = torch.linspace(-bound, bound, 10001, dtype=torch.float64)
+            result = chebyshev_gelu(values, bound, _chebyshev_coefficients(16, bound))
+            self.assertLess((result - torch.nn.functional.gelu(values)).abs().max(), tolerance)
+            if bound == 8.0:
+                torch.testing.assert_close(result, chebyshev16_gelu_reference(values))
+
     def test_three_party_native_full_forward(self):
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(_worker, args=(Path(directory, "store").as_uri(),), nprocs=3, join=True)

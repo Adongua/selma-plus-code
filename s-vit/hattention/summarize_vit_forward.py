@@ -25,7 +25,10 @@ def summarize(label, path):
             "online_ring_sent_bytes": None if native else mean_at("online_ring_excluding_preprocessing", "sent_bytes_sum"),
             "ring_preprocessing_sent_bytes": None if native else mean_at("ring_preprocessing", "sent_bytes_sum"),
             "max_logit_error": max(r["error_vs_plaintext_logits"]["max_abs"] or 0 for r in rows)
-                               if all(r["error_vs_plaintext_logits"]["finite"] for r in rows) else None}
+                               if all(r["error_vs_plaintext_logits"]["finite"] for r in rows) else None,
+            "max_own_formula_logit_error": max(r["error_vs_own_formula_logits"]["max_abs"] or 0 for r in rows)
+                               if all("error_vs_own_formula_logits" in r and r["error_vs_own_formula_logits"]["finite"] for r in rows) else None,
+            "correctness_gate": report.get("correctness_gate", "max error against plaintext exact model")}
 
 
 def main():
@@ -51,12 +54,12 @@ def main():
     note = ("Mean of measured repetitions; maximum elapsed time across parties per repetition. "
             "Input sharing and output reconstruction excluded. CrypTen provider work is included "
             "in forward; Ring3 preparation is separately counted. Communication counters and "
-            "precision differ; results with failed numerical checks are diagnostic only.")
+            "precision and correctness-gate references differ; results with failed numerical checks are diagnostic only.")
     report = {"scope": "full ViTLite forward", "note": note, "results": results}
     (out / "comparison.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     header = ["# Full ViT forward comparison", "", note, "",
-              "| Method | Status | Precision | Forward wall (s) | Ring prep (s) | Forward excl. Ring prep (s) | CrypTen comm (MiB) | Ring online (MiB) | Max logit error |",
-              "|---|---|---|---:|---:|---:|---:|---:|---:|"]
+              "| Method | Status | Precision | Forward wall (s) | Ring prep (s) | Forward excl. Ring prep (s) | CrypTen comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
+              "|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
     fmt = lambda x: "—" if x is None else f"{x:.3f}"
     for r in results:
         header.append(f"| {r['label']} | {r['status']} | {r['precision']} | "
@@ -64,7 +67,7 @@ def main():
                       f"{fmt(r['forward_excluding_ring_preprocessing_seconds'])} | "
                       f"{fmt(r['crypten_system_bytes'] / 2**20)} | "
                       f"{fmt(None if r['online_ring_sent_bytes'] is None else r['online_ring_sent_bytes'] / 2**20)} | "
-                      f"{fmt(r['max_logit_error'])} |")
+                      f"{fmt(r['max_logit_error'])} | {fmt(r['max_own_formula_logit_error'])} |")
     text = "\n".join(header) + "\n"
     (out / "comparison.md").write_text(text)
     print(text, end="")
