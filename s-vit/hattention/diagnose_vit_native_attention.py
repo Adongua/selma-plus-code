@@ -22,11 +22,65 @@ from .student_checkpoint import file_sha256
 from .vit_executor import forward_vit
 
 
+def _raw_tensor(opened):
+    return opened.tensor() if hasattr(opened, "tensor") else opened
+
+
+def open_exact(value):
+    """Open once; decode raw shares exactly in float64 and inspect bundled decoder."""
+    raw_opened = value.reveal()
+    raw = _raw_tensor(raw_opened)
+    scale = value._tensor.encoder.scale
+    exact = raw.to(torch.float64) / scale
+    legacy = _plain(value._tensor.encoder.decode(raw_opened.clone()))
+    return raw, exact, legacy
+
+
+def diagnostic_raw_square(value):
+    """Same Beaver square and truncation, with public raw openings around them."""
+    import crypten
+    from crypten.mpc.primitives import beaver
+
+    if crypten.cfg.mpc.protocol != "beaver":
+        raise ValueError("raw square tracing currently requires the beaver protocol")
+    input_raw = _raw_tensor(value.reveal())
+    scale = value._tensor.encoder.scale
+    product = beaver.square(value._tensor)
+    product_raw = _raw_tensor(product.reveal())
+    expected_product = input_raw * input_raw  # int64 ring arithmetic
+    product_mismatches = int((product_raw != expected_product).sum())
+    expected_truncated = torch.div(product_raw, scale, rounding_mode="trunc")
+    product.div_(scale)
+    truncated_raw = _raw_tensor(product.reveal())
+    delta = truncated_raw - expected_truncated
+    max_index = int(delta.abs().argmax())
+    coordinates, remaining = [], max_index
+    for size in reversed(delta.shape):
+        coordinates.append(remaining % size)
+        remaining //= size
+    coordinates.reverse()
+    qbits = scale.bit_length() - 1
+    one_wrap = 1 << (64 - qbits)
+    probe = {"raw_product_mismatches": product_mismatches,
+             "truncation_delta_max_abs": int(delta.abs().max()),
+             "truncation_deltas_over_4": int((delta.abs() > 4).sum()),
+             "expected_one_wrap_raw": one_wrap,
+             "deltas_near_one_wrap": int(((delta.abs() - one_wrap).abs() <= 4).sum()),
+             "max_delta_index": coordinates,
+             "truncation_delta_at_max": int(delta.reshape(-1)[max_index]),
+             "raw_product_at_max": int(product_raw.reshape(-1)[max_index]),
+             "truncated_at_max": int(truncated_raw.reshape(-1)[max_index]),
+             "expected_truncated_at_max": int(expected_truncated.reshape(-1)[max_index])}
+    result = value.clone()
+    result._tensor.share = product.share
+    return result, probe
+
+
 def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=False,
-                    reciprocal_scale=None):
+                    reciprocal_scale=None, trace_raw_square=False):
     """Run the same Softmax primitives as native CrypTen, with openings."""
-    def inspect(name, value, reference):
-        actual = _plain(value.get_plain_text())
+    def inspect(name, value, reference, raw_square_probe=None):
+        raw, actual, legacy = open_exact(value)
         metrics = error_metrics(actual, reference)
         if metrics["finite"]:
             delta = (actual - reference).reshape(-1)
@@ -44,7 +98,11 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=Fa
                            max_error_index=coords,
                            actual_at_max_error=float(actual.reshape(-1)[flat_index]),
                            reference_at_max_error=float(reference.reshape(-1)[flat_index]),
-                           signed_error_at_max=float(delta[flat_index]))
+                           signed_error_at_max=float(delta[flat_index]),
+                           legacy_decode_max_abs_error=float((legacy - actual).abs().max()),
+                           legacy_decode_errors_above_0_1=int(((legacy - actual).abs() > 0.1).sum()))
+        if raw_square_probe is not None:
+            metrics["raw_square_probe"] = raw_square_probe
         emit({"stage": name, **metrics})
         return actual
 
@@ -69,8 +127,11 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=Fa
         previous = inspect("exp_initial", numerator, 1 + logits_open / (2 ** steps))
         inspect("exp_public_addition", numerator, 1 + divided_open)
         for step in range(steps):
-            numerator = numerator.square()
-            previous = inspect(f"exp_square_{step + 1}", numerator, previous.square())
+            if trace_raw_square:
+                numerator, probe = diagnostic_raw_square(numerator)
+            else:
+                numerator, probe = numerator.square(), None
+            previous = inspect(f"exp_square_{step + 1}", numerator, previous.square(), probe)
     else:
         numerator = logits.exp()
     numerator_open = inspect("exp_vs_exact_opened_logits", numerator, logits_open.exp())
@@ -175,7 +236,8 @@ def worker(rank, rendezvous, options):
                         print(json.dumps({"event": "stage_complete", "iteration": iteration + 1, **row}, allow_nan=False), flush=True)
                 extra = trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit,
                                         trace_exp=options["trace_exp"],
-                                        reciprocal_scale=options["reciprocal_scale"])
+                                        reciprocal_scale=options["reciprocal_scale"],
+                                        trace_raw_square=options["trace_raw_square"])
                 if rank == 0:
                     records.append({"iteration": iteration + 1, "stages": rows, "checks": extra})
         if rank == 0:
@@ -188,6 +250,8 @@ def worker(rank, rendezvous, options):
                       "chebyshev_bound": options["chebyshev_bound"], "repeats": options["repeats"],
                       "reciprocal_scale": options["reciprocal_scale"],
                       "trace_exp": options["trace_exp"],
+                      "trace_raw_square": options["trace_raw_square"],
+                      "opening_decode": "raw int64 divided by encoder scale in float64; bundled decoder also checked",
                       "exp_iterations": crypten.cfg.functions.exp_iterations,
                       "stages": records[0]["stages"], "checks": records[0]["checks"], "records": records,
                       "note": "Q/K/V arise from CrypTen LayerNorm and projection of the selected plaintext block input reshared; it is not the actual secure-forward state. Extra openings affect random execution.",
@@ -215,10 +279,13 @@ def main():
     parser.add_argument("--chebyshev-bound", type=float, default=12.0)
     parser.add_argument("--head", type=int, help="optional zero-based head index; default all heads")
     parser.add_argument("--trace-exp", action="store_true", help="open each stage of CrypTen exp")
+    parser.add_argument("--trace-raw-square", action="store_true", help="open raw Beaver product and truncation stages; implies --trace-exp")
     parser.add_argument("--reciprocal-scale", type=int,
                         help="also diagnose scaled reciprocal 1/(d/S)/S using public power-of-two S")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     args = parser.parse_args()
+    if args.trace_raw_square:
+        args.trace_exp = True
     if not 1 <= args.sqrt_iters <= 50:
         parser.error("sqrt-iters must be in [1,50]")
     if args.layer < 1 or not 1 <= args.repeats <= 20 or not 0 < args.chebyshev_bound < float("inf"):

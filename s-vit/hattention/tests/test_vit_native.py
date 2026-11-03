@@ -10,7 +10,7 @@ import torch.multiprocessing as mp
 from hattention.benchmark_vit_native_cuda import (AuditedPlainOperators, CrypTenNativeOperators,
                                                   PlainStandardOperators, chebyshev_gelu, numerical_gate,
                                                   scaled_standard_attention, validate_reciprocal_scale)
-from hattention.diagnose_vit_native_attention import trace_attention
+from hattention.diagnose_vit_native_attention import open_exact, trace_attention
 from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
@@ -97,6 +97,19 @@ def _worker(rank, rendezvous):
         for stage in ("exp_division", "exp_public_addition"):
             if trace_map[stage]["max_abs"] > 0.0001 or len(trace_map[stage]["max_error_index"]) != 4:
                 raise AssertionError(f"unexpected {stage} diagnostic: {trace_map[stage]}")
+        encoded_boundary = torch.tensor([-2.0 + 2**-20], dtype=torch.float64)
+        secret_boundary = crypten.cryptensor(encoded_boundary, src=0, precision=20)
+        _, decoded_exact, decoded_legacy = open_exact(secret_boundary)
+        if not torch.allclose(decoded_exact, encoded_boundary, atol=0, rtol=0) or not torch.allclose(
+                decoded_legacy - decoded_exact, -torch.ones_like(decoded_exact), atol=1e-6, rtol=0):
+            raise AssertionError(f"negative-boundary decoding not detected: {decoded_exact}, {decoded_legacy}")
+        raw_traced = []
+        trace_attention(crypten, secret_q, secret_k, secret_v, q.double(), k.double(),
+                        v.double(), raw_traced.append, trace_exp=True, trace_raw_square=True)
+        probes = [row["raw_square_probe"] for row in raw_traced if "raw_square_probe" in row]
+        if (len(probes) != crypten.cfg.functions.exp_iterations or
+                any(p["raw_product_mismatches"] or p["truncation_deltas_over_4"] for p in probes)):
+            raise AssertionError(f"unexpected raw-square diagnostics: {probes}")
         scaled_rows = []
         scaled = trace_attention(crypten, secret_q, secret_k, secret_v, q.double(), k.double(),
                                  v.double(), scaled_rows.append, reciprocal_scale=256)

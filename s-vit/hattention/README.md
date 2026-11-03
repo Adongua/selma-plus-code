@@ -1083,6 +1083,13 @@ to the square of the previous opened value, including a count of errors above
 The diagnostic separately opens the public division and subsequent addition,
 and records the largest-error coordinate, signed error, and counts above
 1e-4 and 0.01. These records contain intermediate values for a public fixture.
+`--trace-raw-square` additionally opens the integer values before and after
+each Beaver square and its truncation. It compares ring products and
+truncation deltas, including the magnitude of one missed wrap. Opened values
+are decoded as signed int64 divided by their actual scale in float64; the
+report also records differences from the bundled CrypTen decoder. This mode
+reveals intermediate values, changes the execution, and is only for public
+fixtures; it is not a security or performance test.
 With `--reciprocal-scale 256`, the same opened denominator feeds both native
 reciprocal and the diagnostic adaptation `(1 / (d / 256)) / 256`; the report
 contains both residuals and Attention outputs. This is an optional comparison,
