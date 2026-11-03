@@ -254,7 +254,8 @@ def worker(rank, rendezvous, options):
             online = _aggregate(device, max(0.0, wall - ops.offline_seconds), {
                 "bytes": base.sent_bytes - sent - ops.offline_bytes,
                 "rounds": base.phases - phases - ops.offline_phases, "time": 0.0})
-            opened, reconstruction = _crypten_measure(device, crypten, lambda: output.get_plain_text())
+            from .exact_decode import reveal_exact
+            opened, reconstruction = _crypten_measure(device, crypten, lambda: reveal_exact(output))
             actual = _plain(opened)
             diff = (actual - reference).abs()
             finite = bool(torch.isfinite(actual).all())
@@ -281,6 +282,7 @@ def worker(rank, rendezvous, options):
                          r["error_vs_plaintext_logits"]["max_abs"] <= options["max_abs_error"]
                          for r in measured)
             report = {"status": "benchmark_passed_not_security_validated" if passed else "benchmark_failed_correctness", "backend": "gloo", "world_size": 3,
+                "output_decoding": "signed raw integer divided by encoder scale in float64",
                 "scope": "full ViTLite forward; public model weights and public benchmark image secret-shared for execution; batch 1",
                 "model": meta, "head_types": paths,
                 "path_counts": dict(Counter(p for layer in paths for p in layer)),

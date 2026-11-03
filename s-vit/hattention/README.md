@@ -1096,6 +1096,17 @@ It compares products modulo 2^64 and reports truncation deltas in raw integer
 units. The matrix-product reference is computed on CPU, so all-head traces can
 be slow. This option also exposes intermediate values and changes execution;
 use only on public fixtures, never for performance measurements.
+
+`python -m hattention.diagnose_crypten_truncation` independently stresses
+CrypTen three-party integer truncation on a public repeated value whose raw
+magnitude matches a Q2p product. It opens raw values before and after the
+protocol, reporting deviations from signed truncation and one-wrap-sized
+errors. Errors are stochastic, so a run with no outliers does not prove
+correctness. This does not change or repair the protocol and is not private.
+Both full ViT benchmarks reconstruct their output via signed raw integer /
+encoder scale in float64 rather than CrypTen's bundled decoder. This only
+changes output reconstruction and its separate timing, not the forward or
+intermediate CrypTen operations. Compare old numerical results with care.
 With `--reciprocal-scale 256`, the same opened denominator feeds both native
 reciprocal and the diagnostic adaptation `(1 / (d / 256)) / 256`; the report
 contains both residuals and Attention outputs. This is an optional comparison,

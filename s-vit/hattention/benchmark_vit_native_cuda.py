@@ -22,6 +22,7 @@ from .benchmark_compare_cuda import standard_attention
 from .benchmark_vit_cuda import SecureOperators, image_tensor, load_model
 from .student_checkpoint import file_sha256
 from .vit_executor import PlainOperators, forward_vit
+from .exact_decode import reveal_exact
 
 
 class PlainStandardOperators(PlainOperators):
@@ -157,7 +158,7 @@ def worker(rank, rendezvous, options):
                 with torch.no_grad():
                     return forward_vit(model, shared, ops, on_layer=progress)
             output, online = _crypten_measure(device, crypten, forward)
-            opened, reconstruction = _crypten_measure(device, crypten, lambda: output.get_plain_text())
+            opened, reconstruction = _crypten_measure(device, crypten, lambda: reveal_exact(output))
             actual = _plain(opened)
             finite = bool(torch.isfinite(actual).all())
             diff = (actual - reference).abs()
@@ -183,6 +184,7 @@ def worker(rank, rendezvous, options):
             passed = numerical_gate(records, options["max_abs_error"], include_warmup=True)
             report = {"status": "benchmark_passed_not_security_validated" if passed else "benchmark_failed_correctness",
                       "backend": "gloo", "world_size": 3,
+                      "output_decoding": "signed raw integer divided by encoder scale in float64",
                       "scope": "full ViTLite forward; public weights and public image shared as secret input; batch 1",
                       "method": f"CrypTen softmax ({options['softmax']}), {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
                       "softmax_method": options["softmax"],

@@ -11,6 +11,7 @@ from hattention.benchmark_vit_native_cuda import (AuditedPlainOperators, CrypTen
                                                   PlainStandardOperators, chebyshev_gelu, numerical_gate,
                                                   scaled_standard_attention, validate_reciprocal_scale)
 from hattention.diagnose_vit_native_attention import open_exact, trace_attention
+from hattention.exact_decode import reveal_exact
 from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
@@ -100,6 +101,9 @@ def _worker(rank, rendezvous):
         encoded_boundary = torch.tensor([-2.0 + 2**-20], dtype=torch.float64)
         secret_boundary = crypten.cryptensor(encoded_boundary, src=0, precision=20)
         _, decoded_exact, decoded_legacy = open_exact(secret_boundary)
+        decoded_forward = reveal_exact(secret_boundary)
+        if not torch.equal(decoded_forward, decoded_exact):
+            raise AssertionError("forward reconstruction must decode raw fixed-point integers exactly")
         if not torch.allclose(decoded_exact, encoded_boundary, atol=0, rtol=0) or not torch.allclose(
                 decoded_legacy - decoded_exact, -torch.ones_like(decoded_exact), atol=1e-6, rtol=0):
             raise AssertionError(f"negative-boundary decoding not detected: {decoded_exact}, {decoded_legacy}")
