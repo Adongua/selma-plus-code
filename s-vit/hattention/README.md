@@ -1075,6 +1075,11 @@ With `--trace-exp`, the same CrypTen exponential is expanded as its initial
 division plus configured repeated squares; each result is opened and compared
 to the square of the previous opened value, including a count of errors above
 0.01. The additional openings can change timing and the random execution path.
+With `--reciprocal-scale 256`, the same opened denominator feeds both native
+reciprocal and the diagnostic adaptation `(1 / (d / 256)) / 256`; the report
+contains both residuals and Attention outputs. This is an optional comparison,
+not a change to the native baseline. Its accuracy requires validation for the
+input range, and it cannot repair a previously corrupted exponential.
 
 `python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
 compares compatible same-image reports, preserving failed correctness statuses

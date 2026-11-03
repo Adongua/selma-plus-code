@@ -92,6 +92,12 @@ def _worker(rank, rendezvous):
                 not any(row["stage"] == "exp_square_1" for row in traced) or
                 any(not row["finite"] for row in traced)):
             raise AssertionError(f"unexpected exponential trace: {traced}")
+        scaled_rows = []
+        scaled = trace_attention(crypten, secret_q, secret_k, secret_v, q.double(), k.double(),
+                                 v.double(), scaled_rows.append, reciprocal_scale=256)
+        if (len(scaled_rows) != 15 or any(not row["finite"] for row in scaled_rows) or
+                scaled["reciprocal_scale"] != 256 or scaled["reciprocal_residual_max_abs"] > 0.03):
+            raise AssertionError(f"unexpected scaled reciprocal: {scaled_rows}, {scaled}")
     finally:
         crypten.uninit()
 

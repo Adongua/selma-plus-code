@@ -21,7 +21,8 @@ from .diagnose_vit_native_layernorm import first_block_input
 from .student_checkpoint import file_sha256
 
 
-def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=False):
+def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=False,
+                    reciprocal_scale=None):
     """Run the same Softmax primitives as native CrypTen, with openings."""
     def inspect(name, value, reference):
         actual = _plain(value.get_plain_text())
@@ -63,6 +64,18 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=Fa
     with crypten.cfg.temp_override({"functions.reciprocal_all_pos": True}):
         inverse = denominator.reciprocal()
     inverse_open = inspect("reciprocal_vs_opened_denominator", inverse, denominator_open.reciprocal())
+    native_residual = (1 - denominator_open * inverse_open).abs().max()
+    if reciprocal_scale is not None:
+        native_weights = numerator * inverse
+        inspect("native_weights_vs_exact_softmax", native_weights, torch.softmax(scores_open, dim=-1))
+        inspect("native_attention_vs_plain_reference", native_weights.matmul(v),
+                torch.softmax(scores_reference, dim=-1).matmul(v_ref))
+        scaled_denominator = denominator.div(reciprocal_scale)
+        inspect("scaled_denominator", scaled_denominator, denominator_open / reciprocal_scale)
+        with crypten.cfg.temp_override({"functions.reciprocal_all_pos": True}):
+            inverse = scaled_denominator.reciprocal().div(reciprocal_scale)
+        inverse_open = inspect("scaled_reciprocal_vs_opened_denominator", inverse,
+                               denominator_open.reciprocal())
     weights = numerator * inverse
     weights_open = inspect("weights_vs_exact_softmax_of_opened_scores", weights,
                            torch.softmax(scores_open, dim=-1))
@@ -72,10 +85,12 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=Fa
     extra = {"qkv_score_reconstruction_max_abs": float(
                  (scores_open - oq.matmul(ok.transpose(-2, -1)) * scale).abs().max()),
              "denominator_nonpositive": int((denominator_open <= 0).sum()),
+             "native_reciprocal_residual_max_abs": float(native_residual),
+             "reciprocal_scale": reciprocal_scale,
              "reciprocal_residual_max_abs": float((1 - denominator_open * inverse_open).abs().max()),
              "output_matmul_max_abs_error": float((output_open - weights_open.matmul(ov)).abs().max())}
-    if not all(torch.isfinite(torch.tensor(x)) for x in extra.values()):
-        extra = {key: value if bool(torch.isfinite(torch.tensor(value))) else None
+    if not all(value is None or torch.isfinite(torch.tensor(value)) for value in extra.values()):
+        extra = {key: value if value is None or bool(torch.isfinite(torch.tensor(value))) else None
                  for key, value in extra.items()}
     return extra
 
@@ -119,7 +134,8 @@ def worker(rank, rendezvous, options):
                     rows.append(row)
                     print(json.dumps({"event": "stage_complete", **row}, allow_nan=False), flush=True)
             extra = trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit,
-                                    trace_exp=options["trace_exp"])
+                                    trace_exp=options["trace_exp"],
+                                    reciprocal_scale=options["reciprocal_scale"])
         if rank == 0:
             report = {"status": "diagnostic_completed_not_security_validated",
                       "scope": "public first-layer block input reshared; selected head or all heads; intermediate values opened",
@@ -127,6 +143,7 @@ def worker(rank, rendezvous, options):
                       "image_sha256": file_sha256(options["image"]),
                       "precision": f"Q{options['precision_bits']}", "sqrt_nr_iters": options["sqrt_iters"],
                       "device": options["device"], "head": options["head"],
+                      "reciprocal_scale": options["reciprocal_scale"],
                       "trace_exp": options["trace_exp"],
                       "exp_iterations": crypten.cfg.functions.exp_iterations,
                       "stages": rows, "checks": extra,
@@ -152,10 +169,15 @@ def main():
     parser.add_argument("--sqrt-iters", type=int, default=7)
     parser.add_argument("--head", type=int, help="optional zero-based head index; default all heads")
     parser.add_argument("--trace-exp", action="store_true", help="open each stage of CrypTen exp")
+    parser.add_argument("--reciprocal-scale", type=int,
+                        help="also diagnose scaled reciprocal 1/(d/S)/S using public power-of-two S")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     args = parser.parse_args()
     if not 1 <= args.sqrt_iters <= 50:
         parser.error("sqrt-iters must be in [1,50]")
+    if args.reciprocal_scale is not None and (args.reciprocal_scale <= 0 or
+            args.reciprocal_scale > 2**20 or args.reciprocal_scale & (args.reciprocal_scale - 1)):
+        parser.error("reciprocal-scale must be a power of two in [1, 2**20]")
     if Path(args.output).exists():
         parser.error("output already exists")
     if args.device == "cuda" and torch.cuda.device_count() < 3:
