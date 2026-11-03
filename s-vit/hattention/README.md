@@ -1021,3 +1021,23 @@ and its timings and communication cannot be used as benchmark measurements.
 Differences at a site include errors inherited from previous sites; they are
 not isolated measurements of that operator. The CUDA end-to-end diagnostic
 requires validation on the target server.
+
+### Full-forward CrypTen control
+
+`python -m hattention.benchmark_vit_native_cuda` runs full ViTLite with
+CrypTen softmax attention, CrypTen erf-based GeLU and the CrypTen
+sqrt/reciprocal LayerNorm composition. It reuses the supplied MPCViT
+checkpoint's public projections and other weights, but replaces every head
+with standard softmax without retraining. Thus this is an operator-cost
+control, not an accuracy measurement of a trained standard ViT. Input
+sharing and output reconstruction are measured separately. CrypTen provider
+work is included in forward and cannot be classified as zero-cost offline work.
+Default Q20 matches the prior softmax engineering benchmark; `--precision-bits
+17` is available for a same-Q comparison with Ring3. Validate both profiles:
+CrypTen erf and softmax approximations can produce severe numerical error.
+
+`python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
+compares compatible same-image reports, preserving failed correctness statuses
+and separate communication counters. A failed numerical check makes a timing
+diagnostic, and framework counters and preprocessing boundaries differ. The
+original Ring3 full-ViT benchmark can supply the two optimized reports.
