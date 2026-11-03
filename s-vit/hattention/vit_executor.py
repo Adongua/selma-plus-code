@@ -28,7 +28,7 @@ class PlainOperators:
         return module.forward_preprojected(q, k, v)
 
 
-def forward_vit(model, x, ops, on_layer=None):
+def forward_vit(model, x, ops, on_layer=None, on_stage=None):
     """Run a fixed hAttention ViTLite model and return classification logits."""
     classifier = model.classifier
     if classifier.seq_pool or len(model.tokenizer.conv_layers) != 1:
@@ -43,14 +43,25 @@ def forward_vit(model, x, ops, on_layer=None):
     for index, block in enumerate(classifier.blocks):
         att = block.self_attn
         y = ops.norm(x, block.pre_norm)
+        if on_stage is not None:
+            on_stage(index, "pre_norm", y)
         b, n, dim = y.shape
         h = att.config.num_heads
         qkv = ops.linear(y, att.qkv).reshape(b, n, 3, h, dim // h).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         y = ops.attention(q, k, v, att).transpose(1, 2).reshape(b, n, dim)
+        if on_stage is not None:
+            on_stage(index, "attention", y)
         x = x + ops.linear(y, att.proj)
         x = ops.norm(x, block.norm1)
-        x = x + ops.linear(ops.gelu(ops.linear(x, block.linear1)), block.linear2)
+        if on_stage is not None:
+            on_stage(index, "norm1", x)
+        y = ops.gelu(ops.linear(x, block.linear1))
+        if on_stage is not None:
+            on_stage(index, "gelu", y)
+        x = x + ops.linear(y, block.linear2)
+        if on_stage is not None:
+            on_stage(index, "block_output", x)
         if on_layer is not None:
             on_layer(index, x)
     x = ops.norm(x, classifier.norm)

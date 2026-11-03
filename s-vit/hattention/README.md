@@ -1009,3 +1009,15 @@ intermediate ranges. Current CPU tests cover synthetic boundary and near-zero
 cases, but the user's trained checkpoints, GPU implementation, larger sample
 sets, and privacy guarantees have not been validated by these tests. The
 three-party timings and numerical errors must be remeasured for this profile.
+
+For public-fixture numerical diagnosis, `python -m hattention.diagnose_vit_cuda`
+accepts the same checkpoint, fixed-student, mpcvit-root, image and numeric-profile
+arguments as the full-ViT benchmark and writes `diagnosis.json` in a new output
+directory. It reconstructs pre-norm, attention, norm1, GeLU and block outputs
+on every layer and compares them against the corresponding plaintext model.
+All three parties participate in every opening. Only use an explicitly public
+fixture: intermediate activations are revealed, so this is not private inference
+and its timings and communication cannot be used as benchmark measurements.
+Differences at a site include errors inherited from previous sites; they are
+not isolated measurements of that operator. The CUDA end-to-end diagnostic
+requires validation on the target server.

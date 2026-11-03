@@ -9,6 +9,7 @@ import torch
 import torch.multiprocessing as mp
 
 from hattention.benchmark_vit_cuda import SecureOperators, audit_public_fixture, load_model
+from hattention.diagnose_vit_cuda import error_metrics
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
 from hattention.vit_executor import PlainOperators, forward_vit
@@ -50,7 +51,12 @@ def _crypten_worker(rank, rendezvous):
         config = HAttentionConfig(3, ("rsa", "lsa", "mixer"), patch_grid=(2, 2))
         model = make_fixed_student(source, [config]).eval()
         image = torch.randn(1, 3, 8, 8) * 0.2
-        plain = forward_vit(model, image, PlainOperators())
+        reference_sites = {}
+        plain = forward_vit(model, image, PlainOperators(),
+                            on_stage=lambda i, s, x: reference_sites.update({(i, s): x.clone()}))
+        if list(reference_sites) != [(0, s) for s in
+                                    ("pre_norm", "attention", "norm1", "gelu", "block_output")]:
+            raise AssertionError("unexpected diagnostic sites")
         base = Ring3()
         secure = SecureOperators.__new__(SecureOperators)
         secure.base, secure.wide, secure.mu = base, Ring3Wide(base), 1.4621998268680836
@@ -59,7 +65,16 @@ def _crypten_worker(rank, rendezvous):
         for profile in ("legacy", "wide-range"):
             secure.numeric_profile = profile
             encrypted = crypten.cryptensor(image, src=0, precision=17)
-            out = forward_vit(model, encrypted, secure).get_plain_text()
+            seen = []
+            def inspect(index, site, value):
+                actual_site = value.get_plain_text()
+                metrics = error_metrics(actual_site, reference_sites[(index, site)])
+                if not metrics["finite"]:
+                    raise AssertionError(f"nonfinite diagnostic site {index} {site}")
+                seen.append((index, site))
+            out = forward_vit(model, encrypted, secure, on_stage=inspect).get_plain_text()
+            if seen != list(reference_sites):
+                raise AssertionError("incorrect diagnostic site order")
             if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
                 raise AssertionError(f"{profile} encrypted full forward mismatch: {out} vs {plain}")
     finally:
@@ -67,6 +82,16 @@ def _crypten_worker(rank, rendezvous):
 
 
 class ViTExecutorTests(unittest.TestCase):
+    def test_diagnostic_metrics(self):
+        actual = torch.tensor([1.0, 3.0])
+        reference = torch.tensor([0.0, 1.0])
+        metrics = error_metrics(actual, reference)
+        self.assertEqual(metrics["mae"], 1.5)
+        self.assertEqual(metrics["max_abs"], 2.0)
+        self.assertFalse(error_metrics(torch.tensor([float("nan")]), torch.ones(1))["finite"])
+        with self.assertRaises(ValueError):
+            error_metrics(torch.ones(2), torch.ones(3))
+
     def test_executor_matches_fixed_model(self):
         checkpoint = ROOT / "mpcvit/mpcvit_checkpoints/mpcvit_tinyimagenet-0.3-kd.pth.tar"
         model, _ = load_model(checkpoint, ROOT / "mpcvit", None)
