@@ -32,7 +32,11 @@ def worker(rank, rendezvous, options):
             secret = crypten.cryptensor(fixture, src=0, precision=options["precision_bits"], device=device)
             raw_before = secret.reveal()
             raw_before = raw_before.tensor() if hasattr(raw_before, "tensor") else raw_before
-            secret._tensor.div_(scale)
+            if options["mode"] == "experimental":
+                from .experimental_crypten_truncation import experimental_truncate
+                experimental_truncate(secret._tensor, scale)
+            else:
+                secret._tensor.div_(scale)
             opened = secret.reveal()
             raw_after = opened.tensor() if hasattr(opened, "tensor") else opened
             expected = torch.div(raw_before, scale, rounding_mode="trunc")
@@ -54,6 +58,7 @@ def worker(rank, rendezvous, options):
             report = {"scope": "public input diagnostic; intermediate values opened; not private or a benchmark",
                       "crypten_import": crypten.__file__, "backend": "gloo", "world_size": 3,
                       "device": options["device"], "precision_bits": options["precision_bits"],
+                      "mode": options["mode"],
                       "divisor": scale, "raw_input": options["sign"] * scale * scale,
                       "expected_one_wrap_raw": 1 << (64 - options["precision_bits"]),
                       "records": records}
@@ -73,6 +78,8 @@ def main():
     parser.add_argument("--elements", type=int, default=1000000)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--sign", type=int, choices=(-1, 1), default=1)
+    parser.add_argument("--mode", choices=("legacy", "experimental"), default="legacy",
+                        help="experimental uses unreviewed secret wrap correction and is much more expensive")
     args = parser.parse_args()
     if args.elements < 1 or args.repeats < 1:
         parser.error("--elements and --repeats must be positive")

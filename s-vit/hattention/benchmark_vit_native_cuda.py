@@ -4,6 +4,7 @@ This uses MPCViT checkpoint weights with every attention head replaced by
 standard softmax. It is an operator-cost control, not a trained standard ViT.
 """
 import argparse
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -23,6 +24,7 @@ from .benchmark_vit_cuda import SecureOperators, image_tensor, load_model
 from .student_checkpoint import file_sha256
 from .vit_executor import PlainOperators, forward_vit
 from .exact_decode import reveal_exact
+from .experimental_crypten_truncation import experimental_truncation
 
 
 class PlainStandardOperators(PlainOperators):
@@ -155,7 +157,8 @@ def worker(rank, rendezvous, options):
                     if rank == 0:
                         print(json.dumps({"event": "layer_complete", "warmup": iteration == 0,
                                           "layer": index + 1}), flush=True)
-                with torch.no_grad():
+                truncation = experimental_truncation() if options["truncation"] == "experimental" else nullcontext()
+                with torch.no_grad(), truncation:
                     return forward_vit(model, shared, ops, on_layer=progress)
             output, online = _crypten_measure(device, crypten, forward)
             opened, reconstruction = _crypten_measure(device, crypten, lambda: reveal_exact(output))
@@ -188,6 +191,8 @@ def worker(rank, rendezvous, options):
                       "scope": "full ViTLite forward; public weights and public image shared as secret input; batch 1",
                       "method": f"CrypTen softmax ({options['softmax']}), {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
                       "softmax_method": options["softmax"],
+                      "truncation_method": options["truncation"],
+                      "truncation_note": "experimental uses unreviewed secret share-wrap counting; not CrypTen native or security validated",
                       "reciprocal_scale": options["reciprocal_scale"] if options["softmax"] == "scaled" else None,
                       "softmax_note": "scaled is a CrypTen adaptation using 1/(d/S)/S; native uses CrypTen softmax unchanged",
                       "gelu_method": options["gelu"], "public_chebyshev_range_audit": cheb_audit,
@@ -223,6 +228,8 @@ def main():
     parser.add_argument("--precision-bits", type=int, default=20, choices=(17, 20))
     parser.add_argument("--sqrt-iters", type=int, help="override CrypTen inverse-square-root iterations")
     parser.add_argument("--softmax", choices=("native", "scaled"), default="native")
+    parser.add_argument("--truncation", choices=("legacy", "experimental"), default="legacy",
+                        help="experimental binary share-wrap counting is unreviewed and memory intensive")
     parser.add_argument("--reciprocal-scale", type=int, default=256,
                         help="public power-of-two scale used by adapted softmax")
     parser.add_argument("--gelu", choices=("erf", "chebyshev16"), default="erf")

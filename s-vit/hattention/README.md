@@ -1107,6 +1107,17 @@ Both full ViT benchmarks reconstruct their output via signed raw integer /
 encoder scale in float64 rather than CrypTen's bundled decoder. This only
 changes output reconstruction and its separate timing, not the forward or
 intermediate CrypTen operations. Compare old numerical results with care.
+
+The truncation diagnostic's opt-in `--mode experimental` tests a research
+prototype that counts additive-share wraps with CrypTen binary circuits. It
+does not use the legacy `count_wraps` or its zero-underflow edge case. The
+standard full ViT benchmark accepts `--truncation experimental`; its default
+remains `legacy`, and the optimized ViT benchmark is unchanged. The prototype
+inherits CrypTen's preprocessing trust model, can incur small truncation error,
+uses much more memory and communication, and has not been independently
+reviewed for security or validated on CUDA or real-size ViT. Start with small
+`--elements`; a full forward may run out of memory. Neither mode establishes a
+security proof or a validated performance comparison.
 With `--reciprocal-scale 256`, the same opened denominator feeds both native
 reciprocal and the diagnostic adaptation `(1 / (d / 256)) / 256`; the report
 contains both residuals and Attention outputs. This is an optional comparison,

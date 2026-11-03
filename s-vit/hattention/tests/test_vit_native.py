@@ -12,6 +12,7 @@ from hattention.benchmark_vit_native_cuda import (AuditedPlainOperators, CrypTen
                                                   scaled_standard_attention, validate_reciprocal_scale)
 from hattention.diagnose_vit_native_attention import open_exact, trace_attention
 from hattention.exact_decode import reveal_exact
+from hattention.experimental_crypten_truncation import experimental_truncation
 from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
@@ -136,6 +137,12 @@ def _worker(rank, rendezvous):
                              CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256)).get_plain_text()
         if not torch.isfinite(output).all() or (output - approximate).abs().max() > 1.0:
             raise AssertionError(f"scaled full forward mismatch: {output} vs {approximate}")
+        encrypted = crypten.cryptensor(image, src=0, precision=20)
+        with experimental_truncation():
+            output = reveal_exact(forward_vit(model, encrypted,
+                                  CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256)))
+        if not torch.isfinite(output).all() or (output - approximate).abs().max() > 1.0:
+            raise AssertionError(f"experimental full forward mismatch: {output} vs {approximate}")
     finally:
         crypten.uninit()
 
