@@ -50,9 +50,20 @@ def _worker(rank, rendezvous):
                 raise AssertionError(f"Q{precision} Chebyshev mismatch: {observed} versus {expected}")
         crypten.cfg.encoder.precision_bits = 20
         plaintext_ops = AuditedPlainOperators(12.0)
-        approximate = forward_vit(model, image, plaintext_ops)
+        sites = {}
+        approximate = forward_vit(model, image, plaintext_ops,
+                                   on_stage=lambda i, s, x: sites.update({(i, s): x.detach().clone()}))
         encrypted = crypten.cryptensor(image, src=0, precision=20)
-        cheb_output = forward_vit(model, encrypted, CrypTenNativeOperators("chebyshev16", 12.0)).get_plain_text()
+        opened_sites = []
+        def inspect(i, site, value):
+            opened = value.get_plain_text()
+            if opened.shape != sites[(i, site)].shape or not torch.isfinite(opened).all():
+                raise AssertionError(f"invalid opened site {i} {site}")
+            opened_sites.append((i, site))
+        cheb_output = forward_vit(model, encrypted, CrypTenNativeOperators("chebyshev16", 12.0),
+                                  on_stage=inspect).get_plain_text()
+        if opened_sites != list(sites) or len(opened_sites) != 7:
+            raise AssertionError(f"unexpected opened site order: {opened_sites}")
         if not torch.isfinite(cheb_output).all() or (cheb_output - approximate).abs().max() > 1.0:
             raise AssertionError(f"Chebyshev ViT mismatch: {cheb_output} versus {approximate}")
     finally:

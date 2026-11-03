@@ -55,7 +55,7 @@ def _crypten_worker(rank, rendezvous):
         plain = forward_vit(model, image, PlainOperators(),
                             on_stage=lambda i, s, x: reference_sites.update({(i, s): x.clone()}))
         if list(reference_sites) != [(0, s) for s in
-                                    ("pre_norm", "attention", "norm1", "gelu", "block_output")]:
+                                    ("block_input", "pre_norm", "attention", "norm1", "gelu_input", "gelu", "block_output")]:
             raise AssertionError("unexpected diagnostic sites")
         base = Ring3()
         secure = SecureOperators.__new__(SecureOperators)

@@ -42,6 +42,8 @@ def forward_vit(model, x, ops, on_layer=None, on_stage=None):
         x = x + classifier.positional_emb.detach()
     for index, block in enumerate(classifier.blocks):
         att = block.self_attn
+        if on_stage is not None:
+            on_stage(index, "block_input", x)
         y = ops.norm(x, block.pre_norm)
         if on_stage is not None:
             on_stage(index, "pre_norm", y)
@@ -56,7 +58,10 @@ def forward_vit(model, x, ops, on_layer=None, on_stage=None):
         x = ops.norm(x, block.norm1)
         if on_stage is not None:
             on_stage(index, "norm1", x)
-        y = ops.gelu(ops.linear(x, block.linear1))
+        y = ops.linear(x, block.linear1)
+        if on_stage is not None:
+            on_stage(index, "gelu_input", y)
+        y = ops.gelu(y)
         if on_stage is not None:
             on_stage(index, "gelu", y)
         x = x + ops.linear(y, block.linear2)

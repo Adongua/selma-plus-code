@@ -1048,6 +1048,14 @@ the selected formula, and neither gate measures classification accuracy. The
 MPCViT weights remain unretrained for softmax or Chebyshev. Real CUDA results
 and repeated samples are required before drawing performance conclusions.
 
+`python -m hattention.diagnose_vit_native_cuda` diagnoses the softmax +
+Chebyshev control on one public image. Every rank opens each block input,
+pre-norm, attention, norm1, GeLU input/output and block output, and compares
+them to the corresponding plaintext Chebyshev model. It also reports whether
+the opened GeLU input exceeds the interpolation bound. The run reveals
+intermediates and must not be used on private inputs or treated as a timing
+benchmark. Each error includes propagation from previous stages.
+
 `python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
 compares compatible same-image reports, preserving failed correctness statuses
 and separate communication counters. A failed numerical check makes a timing
