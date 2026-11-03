@@ -110,6 +110,13 @@ def _worker(rank, rendezvous):
         if (len(probes) != crypten.cfg.functions.exp_iterations or
                 any(p["raw_product_mismatches"] or p["truncation_deltas_over_4"] for p in probes)):
             raise AssertionError(f"unexpected raw-square diagnostics: {probes}")
+        qk_rows = []
+        trace_attention(crypten, secret_q, secret_k, secret_v, q.double(), k.double(),
+                        v.double(), qk_rows.append, trace_raw_qk=True)
+        qk_probes = [row["raw_qk_probe"] for row in qk_rows if "raw_qk_probe" in row]
+        if (len(qk_probes) != 2 or any(p["raw_product_mismatches"] or
+                p["truncation_deltas_over_4"] for p in qk_probes)):
+            raise AssertionError(f"unexpected raw QK diagnostics: {qk_probes}")
         scaled_rows = []
         scaled = trace_attention(crypten, secret_q, secret_k, secret_v, q.double(), k.double(),
                                  v.double(), scaled_rows.append, reciprocal_scale=256)

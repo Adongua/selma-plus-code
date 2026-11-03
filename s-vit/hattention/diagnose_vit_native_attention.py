@@ -76,10 +76,67 @@ def diagnostic_raw_square(value):
     return result, probe
 
 
+def diagnostic_qk_stages(q, k, factor):
+    """Open raw QK Beaver matmul and public scaling, for public inputs only."""
+    import crypten
+    from crypten.mpc.primitives import beaver
+
+    if crypten.cfg.mpc.protocol != "beaver":
+        raise ValueError("raw QK tracing requires the beaver protocol")
+    key = k.transpose(-2, -1)
+    scale = q._tensor.encoder.scale
+    if scale != key._tensor.encoder.scale or scale <= 1:
+        raise ValueError("raw QK tracing requires matching fixed-point scales")
+    qraw, kraw = _raw_tensor(q.reveal()), _raw_tensor(key.reveal())
+    product = beaver.matmul(q._tensor, key._tensor)
+    raw_product = _raw_tensor(product.reveal())
+    # CPU integer matmul computes modulo 2^64, including overflow.
+    expected = torch.matmul(qraw.cpu(), kraw.cpu()).to(raw_product.device)
+
+    def truncation_probe(before, after, divisor):
+        expected_trunc = torch.div(before, divisor, rounding_mode="trunc")
+        delta = after - expected_trunc
+        flat = int(delta.abs().argmax())
+        coords, remaining = [], flat
+        for size in reversed(delta.shape):
+            coords.append(remaining % size)
+            remaining //= size
+        one_wrap = (1 << 64) // divisor
+        return {"divisor": divisor, "max_delta_index": list(reversed(coords)),
+                "truncation_delta_max_abs": int(delta.abs().max()),
+                "truncation_deltas_over_4": int((delta.abs() > 4).sum()),
+                "expected_one_wrap_raw": one_wrap,
+                "deltas_near_one_wrap": int(((delta.abs() - one_wrap).abs() <= 4).sum()),
+                "truncation_delta_at_max": int(delta.reshape(-1)[flat]),
+                "raw_product_at_max": int(before.reshape(-1)[flat]),
+                "truncated_at_max": int(after.reshape(-1)[flat]),
+                "expected_truncated_at_max": int(expected_trunc.reshape(-1)[flat])}
+
+    product.div_(scale)
+    matmul_raw = _raw_tensor(product.reveal())
+    matmul_probe = truncation_probe(raw_product, matmul_raw, scale)
+    matmul_probe["raw_product_mismatches"] = int((raw_product != expected).sum())
+    matmul = q.clone()
+    matmul._tensor.share = product.share
+
+    encoded = matmul._tensor.encoder.encode(factor, device=matmul._tensor.device)
+    scaled = matmul._tensor.clone()
+    scaled.share = scaled.share * encoded
+    scaled_product_raw = _raw_tensor(scaled.reveal())
+    scaled.div_(scale)
+    scaled_raw = _raw_tensor(scaled.reveal())
+    scaling_probe = truncation_probe(scaled_product_raw, scaled_raw, scale)
+    scaling_probe["raw_product_mismatches"] = int(
+        (scaled_product_raw != matmul_raw * int(factor * scale)).sum())
+    scores = q.clone()
+    scores._tensor.share = scaled.share
+    return matmul, scores, matmul_probe, scaling_probe
+
+
 def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=False,
-                    reciprocal_scale=None, trace_raw_square=False):
+                    reciprocal_scale=None, trace_raw_square=False, trace_raw_qk=False):
     """Run the same Softmax primitives as native CrypTen, with openings."""
-    def inspect(name, value, reference, raw_square_probe=None):
+    def inspect(name, value, reference, raw_square_probe=None, probe_key="raw_square_probe"):
         raw, actual, legacy = open_exact(value)
         metrics = error_metrics(actual, reference)
         if metrics["finite"]:
@@ -102,7 +159,7 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=Fa
                            legacy_decode_max_abs_error=float((legacy - actual).abs().max()),
                            legacy_decode_errors_above_0_1=int(((legacy - actual).abs() > 0.1).sum()))
         if raw_square_probe is not None:
-            metrics["raw_square_probe"] = raw_square_probe
+            metrics[probe_key] = raw_square_probe
         emit({"stage": name, **metrics})
         return actual
 
@@ -111,7 +168,12 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=Fa
     ov = inspect("v", v, v_ref)
     scale = q.size(-1) ** -0.5
     scores_reference = q_ref.matmul(k_ref.transpose(-2, -1)) * scale
-    scores = q.matmul(k.transpose(-2, -1)) * scale
+    if trace_raw_qk:
+        matmul, scores, matmul_probe, scaling_probe = diagnostic_qk_stages(q, k, scale)
+        inspect("qk_matmul_raw_trace", matmul, oq.matmul(ok.transpose(-2, -1)), matmul_probe, "raw_qk_probe")
+        inspect("qk_scale_raw_trace", scores, oq.matmul(ok.transpose(-2, -1)) * scale, scaling_probe, "raw_qk_probe")
+    else:
+        scores = q.matmul(k.transpose(-2, -1)) * scale
     scores_open = inspect("scores", scores, scores_reference)
     maximum = scores.max(dim=-1, keepdim=True)[0]
     maximum_open = inspect("maximum_vs_opened_scores", maximum, scores_open.max(dim=-1, keepdim=True).values)
@@ -237,7 +299,8 @@ def worker(rank, rendezvous, options):
                 extra = trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit,
                                         trace_exp=options["trace_exp"],
                                         reciprocal_scale=options["reciprocal_scale"],
-                                        trace_raw_square=options["trace_raw_square"])
+                                        trace_raw_square=options["trace_raw_square"],
+                                        trace_raw_qk=options["trace_raw_qk"])
                 if rank == 0:
                     records.append({"iteration": iteration + 1, "stages": rows, "checks": extra})
         if rank == 0:
@@ -251,6 +314,7 @@ def worker(rank, rendezvous, options):
                       "reciprocal_scale": options["reciprocal_scale"],
                       "trace_exp": options["trace_exp"],
                       "trace_raw_square": options["trace_raw_square"],
+                      "trace_raw_qk": options["trace_raw_qk"],
                       "opening_decode": "raw int64 divided by encoder scale in float64; bundled decoder also checked",
                       "exp_iterations": crypten.cfg.functions.exp_iterations,
                       "stages": records[0]["stages"], "checks": records[0]["checks"], "records": records,
@@ -280,6 +344,7 @@ def main():
     parser.add_argument("--head", type=int, help="optional zero-based head index; default all heads")
     parser.add_argument("--trace-exp", action="store_true", help="open each stage of CrypTen exp")
     parser.add_argument("--trace-raw-square", action="store_true", help="open raw Beaver product and truncation stages; implies --trace-exp")
+    parser.add_argument("--trace-raw-qk", action="store_true", help="open raw QK matmul and public scale stages for public fixture diagnosis")
     parser.add_argument("--reciprocal-scale", type=int,
                         help="also diagnose scaled reciprocal 1/(d/S)/S using public power-of-two S")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")

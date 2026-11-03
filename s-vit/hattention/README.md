@@ -1090,6 +1090,12 @@ are decoded as signed int64 divided by their actual scale in float64; the
 report also records differences from the bundled CrypTen decoder. This mode
 reveals intermediate values, changes the execution, and is only for public
 fixtures; it is not a security or performance test.
+`--trace-raw-qk` separately opens and checks the Beaver QK matrix product,
+its fixed-point truncation, and the following public scaling and truncation.
+It compares products modulo 2^64 and reports truncation deltas in raw integer
+units. The matrix-product reference is computed on CPU, so all-head traces can
+be slow. This option also exposes intermediate values and changes execution;
+use only on public fixtures, never for performance measurements.
 With `--reciprocal-scale 256`, the same opened denominator feeds both native
 reciprocal and the diagnostic adaptation `(1 / (d / 256)) / 256`; the report
 contains both residuals and Attention outputs. This is an optional comparison,
