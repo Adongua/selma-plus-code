@@ -22,14 +22,34 @@ import torch.multiprocessing as mp
 
 from sgelu.runtime_cuda import CudaRing3, CudaRing3Wide
 from sgelu.protocol import prepare_g2, ruler_g2
+from sgelu.wide_range import WideGeLUProfile, prepare_wide_gelu, wide_gelu
 from slayernorm.protocol import Profile as LNProfile, prepare as prepare_ln, layernorm
+from slayernorm.wide_range import WideLayerNormProfile, prepare_wide_layernorm, wide_layernorm
 from slayernorm.benchmark_crypten_cuda import _aggregate, _barrier, _crypten_measure, _plain
 from .config import HAttentionConfig
 from .hybrid import prepare_hybrid, secure_hybrid
+from .hybrid_wide_range import prepare_wide_hybrid, secure_wide_hybrid
 from .reference import rsa_attention
 from .student_checkpoint import file_sha256, load_fixed_student, load_student
 from .vit_executor import forward_vit
 from .vit_integration import make_fixed_student
+
+
+def numeric_profile_details(name, mu):
+    if name == "wide-range":
+        ln = WideLayerNormProfile()
+        return {"layernorm_input_bound": 64, "layernorm_affine_bound": 4,
+                "layernorm_variance_fraction_bits": 28, "layernorm_scale": 16,
+                "layernorm_epsilon": ln.epsilon, "layernorm_effective_epsilon": ln.effective_epsilon,
+                "gelu_input_bound": 12, "gelu_mu": mu, "qkv_input_bound": 16,
+                "rsa_score_bound_exclusive": 16, "rsa_denominator_bounds": [0.0005, 2048],
+                "rsa_reciprocal_fraction_bits": 24, "rsa_reciprocal_iterations": 32}
+    if name == "legacy":
+        return {"layernorm_input_bound": 4, "layernorm_affine_bound": 2,
+                "gelu_input_bound": 8, "gelu_mu": mu, "qkv_input_bound": 8,
+                "rsa_score_bound_exclusive": 16, "rsa_denominator_bounds": [0.01, 64],
+                "rsa_reciprocal_fraction_bits": 24, "rsa_reciprocal_iterations": 24}
+    raise ValueError("unknown numerical profile")
 
 
 def load_model(checkpoint, root, fixed):
@@ -54,8 +74,14 @@ def image_tensor(path):
     return ((x - mean) / std).unsqueeze(0)
 
 
-def audit_public_fixture(model, image):
+def audit_public_fixture(model, image, numeric_profile="legacy"):
     """Inspect plaintext ranges on this public image, never secret intermediates."""
+    if numeric_profile not in ("legacy", "wide-range"):
+        raise ValueError("unknown numerical profile")
+    ln_bound, affine_bound = (64, 4) if numeric_profile == "wide-range" else (4, 2)
+    gelu_bound = 12 if numeric_profile == "wide-range" else 8
+    qkv_bound = 16 if numeric_profile == "wide-range" else 8
+    denominator_min, denominator_max = ((0.0005, 2048) if numeric_profile == "wide-range" else (0.01, 64))
     observations, hooks = [], []
     def norm_hook(name):
         def inspect(module, inputs):
@@ -65,13 +91,13 @@ def audit_public_fixture(model, image):
             beta = float(module.bias.detach().abs().max())
             observations.append({"site": name, "type": "layernorm", "input_max_abs": maximum,
                                  "gamma_max_abs": gamma, "beta_max_abs": beta,
-                                 "within_profile": maximum <= 4 and gamma <= 2 and beta <= 2})
+                                 "within_profile": maximum <= ln_bound and gamma <= affine_bound and beta <= affine_bound})
         return inspect
     def gelu_hook(name):
         def inspect(_module, _inputs, output):
             maximum = float(output.abs().max())
             observations.append({"site": name, "type": "gelu", "input_max_abs": maximum,
-                                 "within_profile": maximum <= 8})
+                                 "within_profile": maximum <= gelu_bound})
         return inspect
     def attention_hook(name):
         def inspect(module, inputs):
@@ -82,7 +108,7 @@ def audit_public_fixture(model, image):
             indexes = [i for i, path in enumerate(module.config.head_types) if path == "rsa"]
             maximum = max(float(t.abs().max()) for t in (q, k, v))
             row = {"site": name, "type": "attention", "qkv_max_abs": maximum,
-                   "within_profile": maximum <= 8}
+                   "within_profile": maximum <= qkv_bound}
             if indexes:
                 idx = torch.tensor(indexes, device=q.device)
                 _, aux = rsa_attention(q.index_select(1, idx), k.index_select(1, idx),
@@ -90,7 +116,7 @@ def audit_public_fixture(model, image):
                 score = float(aux["scores"].abs().max())
                 low, high = float(aux["denominator"].min()), float(aux["denominator"].max())
                 row.update(score_max_abs=score, denominator_min=low, denominator_max=high)
-                row["within_profile"] &= score < 16 and low >= 0.01 and high <= 64
+                row["within_profile"] &= score < 16 and low >= denominator_min and high <= denominator_max
             observations.append(row)
         return inspect
     try:
@@ -110,10 +136,11 @@ def audit_public_fixture(model, image):
 
 
 class SecureOperators:
-    def __init__(self, base, wide, mu):
+    def __init__(self, base, wide, mu, numeric_profile="legacy"):
         from crypten.cuda import CUDALongTensor
         from crypten.mpc import MPCTensor
         self.base, self.wide, self.mu = base, wide, mu
+        self.numeric_profile = numeric_profile
         self.cuda_tensor, self.mpc_tensor = CUDALongTensor, MPCTensor
         self.offline_seconds = 0.0
         self.offline_bytes = 0
@@ -147,13 +174,20 @@ class SecureOperators:
         return out + layer.bias.detach() if layer.bias is not None else out
 
     def norm(self, x, layer):
-        profile = LNProfile(epsilon=layer.eps)
-        material = self.prepare(lambda: prepare_ln(self.base, self.wide, tuple(x.shape), profile))
+        wide_range = getattr(self, "numeric_profile", "legacy") == "wide-range"
+        profile = WideLayerNormProfile(epsilon=layer.eps) if wide_range else LNProfile(epsilon=layer.eps)
+        prepare_fn = prepare_wide_layernorm if wide_range else prepare_ln
+        function = wide_layernorm if wide_range else layernorm
+        material = self.prepare(lambda: prepare_fn(self.base, self.wide, tuple(x.shape), profile))
         gamma = self.base.public(torch.round(layer.weight.detach() * (1 << 17)).long())
         beta = self.base.public(torch.round(layer.bias.detach() * (1 << 17)).long())
-        return self.wrap(layernorm(self.base, self.wide, x.share.data, gamma, beta, material))
+        return self.wrap(function(self.base, self.wide, x.share.data, gamma, beta, material))
 
     def gelu(self, x):
+        if getattr(self, "numeric_profile", "legacy") == "wide-range":
+            profile = WideGeLUProfile(mu=self.mu)
+            material = self.prepare(lambda: prepare_wide_gelu(self.base, self.wide, tuple(x.shape), profile))
+            return self.wrap(wide_gelu(self.base, self.wide, x.share.data, material))
         material = self.prepare(lambda: prepare_g2(self.base, self.wide, tuple(x.shape), self.mu))
         return self.wrap(ruler_g2(self.base, self.wide, x.share.data, material))
 
@@ -162,11 +196,13 @@ class SecureOperators:
         if (config.srelu_radius != 0.0055 or config.epsilon != 1e-5 or
                 config.resolved_rho(q.shape[-1]) != q.shape[-1] ** -0.5):
             raise ValueError("unsupported attention profile for Ring3 RSA")
-        material = self.prepare(lambda: prepare_hybrid(self.base, self.wide, tuple(q.shape),
+        wide_range = getattr(self, "numeric_profile", "legacy") == "wide-range"
+        prepare_fn = prepare_wide_hybrid if wide_range else prepare_hybrid
+        function = secure_wide_hybrid if wide_range else secure_hybrid
+        material = self.prepare(lambda: prepare_fn(self.base, self.wide, tuple(q.shape),
                                 config.head_types, rho=config.resolved_rho(q.shape[-1])))
-        result = secure_hybrid(self.base, self.wide, q.share.data, k.share.data, v.share.data,
-                               material, patch_grid=config.patch_grid,
-                               has_cls_token=config.has_cls_token)
+        result = function(self.base, self.wide, q.share.data, k.share.data, v.share.data,
+                          material, patch_grid=config.patch_grid, has_cls_token=config.has_cls_token)
         return self.wrap(result)
 
 
@@ -183,7 +219,7 @@ def worker(rank, rendezvous, options):
         model, meta = load_model(options["checkpoint"], options["mpcvit_root"], options["fixed_student"])
         model = model.to(device).eval()
         image = image_tensor(options["image"][0]).to(device)
-        reference, observations = audit_public_fixture(model, image)
+        reference, observations = audit_public_fixture(model, image, options["numeric_profile"])
         violations = [row for row in observations if not row["within_profile"]]
         if rank == 0:
             print(json.dumps({"event": "public_fixture_range_audit", "violations": violations}), flush=True)
@@ -196,7 +232,7 @@ def worker(rank, rendezvous, options):
             shared, sharing = _crypten_measure(device, crypten, lambda: crypten.cryptensor(
                 image, src=0, precision=17, device=device))
             torch.cuda.reset_peak_memory_stats(device)
-            ops = SecureOperators(base, wide, options["mu"])
+            ops = SecureOperators(base, wide, options["mu"], options["numeric_profile"])
             _barrier(device)
             crypten.reset_communication_stats()
             torch.cuda.synchronize(device)
@@ -250,7 +286,9 @@ def worker(rank, rendezvous, options):
                 "path_counts": dict(Counter(p for layer in paths for p in layer)),
                 "image_sha256": file_sha256(options["image"][0]), "repeats": options["repeats"],
                 "public_fixture_range_audit": observations,
-                "precision": "Q17", "mu": options["mu"], "max_abs_error_threshold": options["max_abs_error"], "records": records,
+                "precision": "Q17", "numeric_profile": options["numeric_profile"],
+                "numeric_profile_details": numeric_profile_details(options["numeric_profile"], options["mu"]),
+                "mu": options["mu"], "max_abs_error_threshold": options["max_abs_error"], "records": records,
                 "crypten_import": crypten.__file__, "python": platform.python_version(), "torch": torch.__version__,
                 "timing_note": "forward wall includes just-in-time preprocessing; online time subtracts local preprocessing before rank maximum; CrypTen provider work remains online; sync instrumentation included",
                 "communication_note": "Ring3 sent payloads and CrypTen bidirectional logs/2 are separate; counters are not equivalent protocol rounds",
@@ -281,6 +319,8 @@ def main():
                         help="diagnostic only; range failures mark the result invalid")
     parser.add_argument("--audit-only", action="store_true",
                         help="inspect plaintext numerical ranges on CPU without initializing three-party runtime")
+    parser.add_argument("--numeric-profile", choices=("legacy", "wide-range"), default="legacy",
+                        help="select legacy operators or the experimental wide-range implementations")
     args = parser.parse_args()
     if args.repeats < 1 or not 0.25 <= args.mu <= 4 or not 0 < args.max_abs_error < float("inf"):
         parser.error("invalid repeats, mu or max-abs-error")
@@ -290,7 +330,7 @@ def main():
         model, meta = load_model(args.checkpoint, args.mpcvit_root, args.fixed_student)
         rows = []
         for image in args.image:
-            logits, observations = audit_public_fixture(model, image_tensor(image))
+            logits, observations = audit_public_fixture(model, image_tensor(image), args.numeric_profile)
             violations = [row for row in observations if not row["within_profile"]]
             rows.append({"image": str(Path(image).resolve()), "sha256": file_sha256(image),
                          "top1": int(logits.argmax(-1).item()), "violations": violations,
@@ -299,7 +339,8 @@ def main():
                               "violations": len(violations)}), flush=True)
         root = Path(args.output)
         root.mkdir(parents=True, exist_ok=False)
-        report = {"status": "plaintext_range_audit_only", "model": meta, "images": rows,
+        report = {"status": "plaintext_range_audit_only", "numeric_profile": args.numeric_profile,
+                  "numeric_profile_details": numeric_profile_details(args.numeric_profile, args.mu), "model": meta, "images": rows,
                   "note": "Public fixture and plaintext intermediate values only. Passing these observations does not verify secret fixed-point ranges or security."}
         with (root / "range-audit.json").open("x", encoding="utf-8") as f:
             json.dump(report, f, indent=2, allow_nan=False)

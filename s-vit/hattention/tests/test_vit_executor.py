@@ -56,10 +56,12 @@ def _crypten_worker(rank, rendezvous):
         secure.base, secure.wide, secure.mu = base, Ring3Wide(base), 1.4621998268680836
         secure.prepare = lambda fn: fn()
         secure.wrap = lambda share: MPCTensor.from_shares(share, precision=17)
-        encrypted = crypten.cryptensor(image, src=0, precision=17)
-        out = forward_vit(model, encrypted, secure).get_plain_text()
-        if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
-            raise AssertionError(f"encrypted full forward mismatch: {out} vs {plain}")
+        for profile in ("legacy", "wide-range"):
+            secure.numeric_profile = profile
+            encrypted = crypten.cryptensor(image, src=0, precision=17)
+            out = forward_vit(model, encrypted, secure).get_plain_text()
+            if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
+                raise AssertionError(f"{profile} encrypted full forward mismatch: {out} vs {plain}")
     finally:
         crypten.uninit()
 

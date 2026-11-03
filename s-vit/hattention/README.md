@@ -982,3 +982,30 @@ default. `--allow-out-of-range` is only for debugging and marks the output
 invalid; it does not repair the numerical contract. The local original
 checkpoint and one real image already exhibit LayerNorm and RSA range violations,
 so this prototype is not ready for formal full-model performance claims.
+
+### Experimental wider numerical profile
+
+The old RSA and LayerNorm protocols remain unchanged, and `legacy` remains the
+default. `--numeric-profile wide-range` explicitly selects separate experimental
+implementations for the full-ViT prototype:
+
+- sLayerNorm: Q17 input, fixed public scale 16, Q21 centered values and Q28
+  scaled variance; profile requires |input|<=64 and |gamma|,|beta|<=4.
+  At epsilon=1e-5 the quantized effective epsilon is approximately 9.5367e-6.
+- RSA: Q17 input with |score|<16, Q24 Newton reciprocal with 32 iterations,
+  and a declared denominator interval [0.0005, 2048]. The sReLU primitive is
+  unchanged, so its finite precision can still matter for very small rows.
+- sGeLU: fixed |input|<=12 profile reuses the unchanged G2 protocol and
+  validates the public radicand bound for mu in [0.25,4].
+- LSA Q/K/V input bound is 16; the wide grouped path requires N<=257, D<=16.
+
+For a plaintext check of the new declared range, add `--numeric-profile
+wide-range` to the `--audit-only` example above and use a fresh output path.
+The GPU forward prototype also accepts `--numeric-profile wide-range`. It
+still requires a public range audit and compares reconstructed logits against
+the corresponding plaintext model; `--allow-out-of-range` only permits an
+invalid diagnostic execution. The plaintext audit does not enforce secret
+intermediate ranges. Current CPU tests cover synthetic boundary and near-zero
+cases, but the user's trained checkpoints, GPU implementation, larger sample
+sets, and privacy guarantees have not been validated by these tests. The
+three-party timings and numerical errors must be remeasured for this profile.
