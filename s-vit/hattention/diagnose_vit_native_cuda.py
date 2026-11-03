@@ -15,7 +15,7 @@ import torch.multiprocessing as mp
 
 from slayernorm.benchmark_crypten_cuda import _plain
 from .benchmark_vit_cuda import image_tensor, load_model
-from .benchmark_vit_native_cuda import AuditedPlainOperators, CrypTenNativeOperators
+from .benchmark_vit_native_cuda import AuditedPlainOperators, CrypTenNativeOperators, validate_reciprocal_scale
 from .diagnose_vit_cuda import error_metrics
 from .student_checkpoint import file_sha256
 from .vit_executor import forward_vit
@@ -47,7 +47,8 @@ def worker(rank, rendezvous, options):
         if rank == 0:
             print(json.dumps({"event": "public_chebyshev_range_audit", "bound": bound,
                               "input_max_abs_by_layer": reference_ops.gelu_max_abs}), flush=True)
-        ops = CrypTenNativeOperators("chebyshev16", bound)
+        ops = CrypTenNativeOperators("chebyshev16", bound, options["softmax"],
+                                     options["reciprocal_scale"])
         encrypted = crypten.cryptensor(image, src=0, precision=options["precision_bits"], device=device)
         rows = []
         def inspect(index, site, value):
@@ -72,7 +73,9 @@ def worker(rank, rendezvous, options):
                              secure_top1=int(actual.argmax(-1).item()))
             report = {"status": "diagnostic_completed_not_security_validated",
                       "scope": "public image and public model; intermediate activations opened",
-                      "method": "CrypTen softmax + reconstructed Chebyshev16 GeLU + CrypTen LayerNorm",
+                      "method": f"CrypTen softmax ({options['softmax']}) + reconstructed Chebyshev16 GeLU + CrypTen LayerNorm",
+                      "softmax_method": options["softmax"],
+                      "reciprocal_scale": options["reciprocal_scale"] if options["softmax"] == "scaled" else None,
                       "model": metadata, "image": str(Path(options["image"]).resolve()),
                       "image_sha256": file_sha256(options["image"]),
                       "precision": f"Q{options['precision_bits']}", "chebyshev_bound": bound,
@@ -100,8 +103,14 @@ def main():
     parser.add_argument("--output", required=True, help="new output directory")
     parser.add_argument("--precision-bits", type=int, choices=(17, 20), default=20)
     parser.add_argument("--sqrt-iters", type=int, help="override CrypTen inverse-square-root iterations")
+    parser.add_argument("--softmax", choices=("native", "scaled"), default="native")
+    parser.add_argument("--reciprocal-scale", type=int, default=256)
     parser.add_argument("--chebyshev-bound", type=float, default=12.0)
     args = parser.parse_args()
+    try:
+        validate_reciprocal_scale(args.reciprocal_scale)
+    except ValueError as error:
+        parser.error(str(error))
     if not math.isfinite(args.chebyshev_bound) or args.chebyshev_bound <= 0:
         parser.error("Chebyshev bound must be finite and positive")
     if args.sqrt_iters is not None and not 1 <= args.sqrt_iters <= 50:

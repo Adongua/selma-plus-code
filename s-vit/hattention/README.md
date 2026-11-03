@@ -1081,6 +1081,15 @@ contains both residuals and Attention outputs. This is an optional comparison,
 not a change to the native baseline. Its accuracy requires validation for the
 input range, and it cannot repair a previously corrupted exponential.
 
+The full CrypTen ViT control and its per-layer diagnostic also accept
+`--softmax scaled --reciprocal-scale 256` to execute this rescaled reciprocal
+inside every attention head. Default `--softmax native` remains unchanged.
+This is a CrypTen engineering adaptation, not native CrypTen or an official
+third-party protocol. The report records the method and scale; all additional
+operations and CrypTen provider work remain in the timed forward. It does not
+fix exponential outliers, prove the secret denominator range or establish
+classification accuracy. Evaluate correctness and repeat before comparing cost.
+
 `python -m hattention.summarize_vit_forward --report LABEL=PATH ... --output DIR`
 compares compatible same-image reports, preserving failed correctness statuses
 and separate communication counters. A failed numerical check makes a timing

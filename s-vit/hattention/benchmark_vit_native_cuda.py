@@ -47,6 +47,25 @@ def numerical_gate(records, max_abs_error):
                                   for r in measured)
 
 
+def validate_reciprocal_scale(scale):
+    if not isinstance(scale, int) or isinstance(scale, bool) or scale <= 0 or scale > 2**20 or scale & (scale - 1):
+        raise ValueError("reciprocal scale must be a power of two in [1, 2**20]")
+    return scale
+
+
+def scaled_standard_attention(q, k, v, reciprocal_scale):
+    """CrypTen softmax with public denominator scaling; not the native path."""
+    import crypten
+    scale = validate_reciprocal_scale(reciprocal_scale)
+    scores = q.matmul(k.transpose(-2, -1)) * (q.size(-1) ** -0.5)
+    maximum = scores.max(dim=-1, keepdim=True)[0]
+    numerator = (scores - maximum).exp()
+    denominator = numerator.sum(dim=-1, keepdim=True)
+    with crypten.cfg.temp_override({"functions.reciprocal_all_pos": True}):
+        inverse = denominator.div(scale).reciprocal().div(scale)
+    return (numerator * inverse).matmul(v)
+
+
 class AuditedPlainOperators(PlainStandardOperators):
     def __init__(self, bound=None):
         self.bound = bound
@@ -59,7 +78,8 @@ class AuditedPlainOperators(PlainStandardOperators):
 
 
 class CrypTenNativeOperators(SecureOperators):
-    def __init__(self, gelu_method="erf", chebyshev_bound=12.0):
+    def __init__(self, gelu_method="erf", chebyshev_bound=12.0,
+                 softmax_method="native", reciprocal_scale=256):
         # Public conv, CLS and linear methods need no Ring3 runtime.
         if gelu_method not in ("erf", "chebyshev16"):
             raise ValueError("unknown GeLU method")
@@ -68,6 +88,10 @@ class CrypTenNativeOperators(SecureOperators):
         self.gelu_method = gelu_method
         self.chebyshev_bound = chebyshev_bound
         self.coefficients = _chebyshev_coefficients(16, chebyshev_bound) if gelu_method == "chebyshev16" else None
+        if softmax_method not in ("native", "scaled"):
+            raise ValueError("unknown softmax method")
+        self.softmax_method = softmax_method
+        self.reciprocal_scale = validate_reciprocal_scale(reciprocal_scale)
 
     def norm(self, x, layer):
         return crypten_native_layernorm(x, layer.weight.detach(), layer.bias.detach(), layer.eps)
@@ -78,6 +102,8 @@ class CrypTenNativeOperators(SecureOperators):
         return crypten_erf_gelu(x)
 
     def attention(self, q, k, v, module):
+        if self.softmax_method == "scaled":
+            return scaled_standard_attention(q, k, v, self.reciprocal_scale)
         return standard_attention(q, k, v)
 
 
@@ -116,7 +142,8 @@ def worker(rank, rendezvous, options):
                     print(json.dumps({"event": "public_chebyshev_range_audit", **cheb_audit}), flush=True)
                 if not cheb_audit["within_bound"]:
                     raise ValueError("public plaintext GeLU input exceeds Chebyshev bound")
-        ops = CrypTenNativeOperators(options["gelu"], options["chebyshev_bound"])
+        ops = CrypTenNativeOperators(options["gelu"], options["chebyshev_bound"],
+                                     options["softmax"], options["reciprocal_scale"])
         records = []
         for iteration in range(options["repeats"] + 1):
             shared, sharing = _crypten_measure(device, crypten, lambda: crypten.cryptensor(
@@ -157,7 +184,10 @@ def worker(rank, rendezvous, options):
             report = {"status": "benchmark_passed_not_security_validated" if passed else "benchmark_failed_correctness",
                       "backend": "gloo", "world_size": 3,
                       "scope": "full ViTLite forward; public weights and public image shared as secret input; batch 1",
-                      "method": f"CrypTen softmax, {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
+                      "method": f"CrypTen softmax ({options['softmax']}), {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
+                      "softmax_method": options["softmax"],
+                      "reciprocal_scale": options["reciprocal_scale"] if options["softmax"] == "scaled" else None,
+                      "softmax_note": "scaled is a CrypTen adaptation using 1/(d/S)/S; native uses CrypTen softmax unchanged",
                       "gelu_method": options["gelu"], "public_chebyshev_range_audit": cheb_audit,
                       "gelu_note": ("Chebyshev is a CrypTen adaptation with reconstructed coefficients, not CrypTen native or original CryptGPU timing."
                                     if cheb_audit is not None else "CrypTen native Taylor-erf approximation."),
@@ -190,12 +220,19 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--precision-bits", type=int, default=20, choices=(17, 20))
     parser.add_argument("--sqrt-iters", type=int, help="override CrypTen inverse-square-root iterations")
+    parser.add_argument("--softmax", choices=("native", "scaled"), default="native")
+    parser.add_argument("--reciprocal-scale", type=int, default=256,
+                        help="public power-of-two scale used by adapted softmax")
     parser.add_argument("--gelu", choices=("erf", "chebyshev16"), default="erf")
     parser.add_argument("--chebyshev-bound", type=float, default=12.0,
                         help="fit 16-degree interpolant on [-bound, bound]; public audit only")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--max-abs-error", type=float, default=1.0)
     args = parser.parse_args()
+    try:
+        validate_reciprocal_scale(args.reciprocal_scale)
+    except ValueError as error:
+        parser.error(str(error))
     if (args.repeats < 1 or not 0 < args.max_abs_error < float("inf") or
             not math.isfinite(args.chebyshev_bound) or args.chebyshev_bound <= 0 or
             (args.sqrt_iters is not None and not 1 <= args.sqrt_iters <= 50)):

@@ -8,7 +8,8 @@ import torch
 import torch.multiprocessing as mp
 
 from hattention.benchmark_vit_native_cuda import (AuditedPlainOperators, CrypTenNativeOperators,
-                                                  PlainStandardOperators, chebyshev_gelu, numerical_gate)
+                                                  PlainStandardOperators, chebyshev_gelu, numerical_gate,
+                                                  scaled_standard_attention, validate_reciprocal_scale)
 from hattention.diagnose_vit_native_attention import trace_attention
 from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
@@ -98,11 +99,26 @@ def _worker(rank, rendezvous):
         if (len(scaled_rows) != 15 or any(not row["finite"] for row in scaled_rows) or
                 scaled["reciprocal_scale"] != 256 or scaled["reciprocal_residual_max_abs"] > 0.03):
             raise AssertionError(f"unexpected scaled reciprocal: {scaled_rows}, {scaled}")
+        output = scaled_standard_attention(secret_q, secret_k, secret_v, 256).get_plain_text()
+        target = torch.softmax(q.matmul(k.transpose(-2, -1)) * 0.5, dim=-1).matmul(v)
+        if not torch.isfinite(output).all() or (output - target).abs().max() > 0.03:
+            raise AssertionError(f"scaled attention mismatch: {output} vs {target}")
+        encrypted = crypten.cryptensor(image, src=0, precision=20)
+        output = forward_vit(model, encrypted,
+                             CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256)).get_plain_text()
+        if not torch.isfinite(output).all() or (output - approximate).abs().max() > 1.0:
+            raise AssertionError(f"scaled full forward mismatch: {output} vs {approximate}")
     finally:
         crypten.uninit()
 
 
 class NativeViTTests(unittest.TestCase):
+    def test_reciprocal_scale_validation(self):
+        self.assertEqual(validate_reciprocal_scale(256), 256)
+        for invalid in (0, -1, 3, True, 2**21):
+            with self.assertRaises(ValueError):
+                validate_reciprocal_scale(invalid)
+
     def test_gate_uses_selected_formula_and_excludes_warmup(self):
         rows = [{"warmup": True, "error_vs_own_formula_logits": {"finite": True, "max_abs": 100.}},
                 {"warmup": False, "error_vs_plaintext_logits": {"finite": True, "max_abs": 1.1},
