@@ -29,10 +29,22 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=Fa
         actual = _plain(value.get_plain_text())
         metrics = error_metrics(actual, reference)
         if metrics["finite"]:
+            delta = (actual - reference).reshape(-1)
+            flat_index = int(delta.abs().argmax())
+            coords, remaining = [], flat_index
+            for size in reversed(actual.shape):
+                coords.append(remaining % size)
+                remaining //= size
+            coords.reverse()
             metrics.update(actual_min=float(actual.min()), actual_max=float(actual.max()),
                            reference_min=float(reference.min()), reference_max=float(reference.max()),
                            elements=int(actual.numel()),
-                           errors_above_0_01=int((actual.sub(reference).abs() > 0.01).sum()))
+                           errors_above_0_01=int((delta.abs() > 0.01).sum()),
+                           errors_above_0_0001=int((delta.abs() > 0.0001).sum()),
+                           max_error_index=coords,
+                           actual_at_max_error=float(actual.reshape(-1)[flat_index]),
+                           reference_at_max_error=float(reference.reshape(-1)[flat_index]),
+                           signed_error_at_max=float(delta[flat_index]))
         emit({"stage": name, **metrics})
         return actual
 
@@ -51,8 +63,11 @@ def trace_attention(crypten, q, k, v, q_ref, k_ref, v_ref, emit, *, trace_exp=Fa
         # Same sequence as CrypTen exp: 1 + x/2**d, then d squares. Each
         # reconstruction is diagnostic and does not alter the secret value.
         steps = crypten.cfg.functions.exp_iterations
-        numerator = 1 + logits.div(2 ** steps)
+        divided = logits.div(2 ** steps)
+        divided_open = inspect("exp_division", divided, logits_open / (2 ** steps))
+        numerator = 1 + divided
         previous = inspect("exp_initial", numerator, 1 + logits_open / (2 ** steps))
+        inspect("exp_public_addition", numerator, 1 + divided_open)
         for step in range(steps):
             numerator = numerator.square()
             previous = inspect(f"exp_square_{step + 1}", numerator, previous.square())

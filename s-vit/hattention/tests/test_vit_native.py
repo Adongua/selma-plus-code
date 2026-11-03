@@ -89,10 +89,14 @@ def _worker(rank, rendezvous):
         traced = []
         trace_attention(crypten, secret_q, secret_k, secret_v, q.double(), k.double(),
                         v.double(), traced.append, trace_exp=True)
-        if (len(traced) != 12 + crypten.cfg.functions.exp_iterations or
+        if (len(traced) != 14 + crypten.cfg.functions.exp_iterations or
                 not any(row["stage"] == "exp_square_1" for row in traced) or
                 any(not row["finite"] for row in traced)):
             raise AssertionError(f"unexpected exponential trace: {traced}")
+        trace_map = {row["stage"]: row for row in traced}
+        for stage in ("exp_division", "exp_public_addition"):
+            if trace_map[stage]["max_abs"] > 0.0001 or len(trace_map[stage]["max_error_index"]) != 4:
+                raise AssertionError(f"unexpected {stage} diagnostic: {trace_map[stage]}")
         scaled_rows = []
         scaled = trace_attention(crypten, secret_q, secret_k, secret_v, q.double(), k.double(),
                                  v.double(), scaled_rows.append, reciprocal_scale=256)

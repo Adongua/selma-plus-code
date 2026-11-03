@@ -1080,6 +1080,9 @@ With `--trace-exp`, the same CrypTen exponential is expanded as its initial
 division plus configured repeated squares; each result is opened and compared
 to the square of the previous opened value, including a count of errors above
 0.01. The additional openings can change timing and the random execution path.
+The diagnostic separately opens the public division and subsequent addition,
+and records the largest-error coordinate, signed error, and counts above
+1e-4 and 0.01. These records contain intermediate values for a public fixture.
 With `--reciprocal-scale 256`, the same opened denominator feeds both native
 reciprocal and the diagnostic adaptation `(1 / (d / 256)) / 256`; the report
 contains both residuals and Attention outputs. This is an optional comparison,
