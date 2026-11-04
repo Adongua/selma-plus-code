@@ -8,12 +8,14 @@ from contextlib import contextmanager
 
 
 @contextmanager
-def experimental_truncation():
+def experimental_truncation(mode="experimental"):
     """Temporarily select the experimental protocol in this process only."""
     from crypten.mpc.primitives import beaver
 
     original = beaver.truncate
-    beaver.truncate = experimental_truncate
+    if mode not in ("experimental", "batched"):
+        raise ValueError("unknown experimental truncation mode")
+    beaver.truncate = experimental_truncate if mode == "experimental" else batched_truncate
     try:
         yield
     finally:
@@ -26,6 +28,15 @@ def experimental_truncate(x, divisor):
     Experimental only: depends on CrypTen's Boolean circuits and preprocessing.
     Supports positive Python scalar divisors.
     """
+    return _truncate(x, divisor, batched=False)
+
+
+def batched_truncate(x, divisor):
+    """Experimental wrap counter with batched sign circuits; same assumptions."""
+    return _truncate(x, divisor, batched=True)
+
+
+def _truncate(x, divisor, *, batched):
     import crypten
     import crypten.communicator as comm
     from crypten.mpc.primitives import beaver
@@ -43,14 +54,27 @@ def experimental_truncate(x, divisor):
     shares = [BinarySharedTensor(x.share, src=i) for i in range(3)]
     partial = shares[0]
     overflow_bits = []
+    sign_rows = []
     for other in shares[1:]:
         total = partial + other
         a, b, c = [(value >> 63) & 1 for value in (partial, other, total)]
-        overflow_bits.extend([((~a) & (~b) & c) & 1,
-                              (a & b & (~c)) & 1])
+        if batched:
+            sign_rows.append((a, b, c))
+        else:
+            overflow_bits.extend([((~a) & (~b) & c) & 1,
+                                  (a & b & (~c)) & 1])
         partial = total
-    bits = beaver.B2A_single_bit(BinarySharedTensor.stack(overflow_bits))
-    theta = bits[0] - bits[1] + bits[2] - bits[3]
+    if batched:
+        a, b, c = [BinarySharedTensor.stack([row[i] for row in sign_rows]) for i in range(3)]
+        # Overflow iff both input signs differ from the sum sign.  The sign of
+        # the first input identifies negative overflow. Batch the two additions.
+        overflow = (a ^ c) & (b ^ c)
+        negative = overflow & a
+        bits = beaver.B2A_single_bit(BinarySharedTensor.stack([overflow, negative]))
+        theta = (bits[0] - 2 * bits[1]).sum(0)
+    else:
+        bits = beaver.B2A_single_bit(BinarySharedTensor.stack(overflow_bits))
+        theta = bits[0] - bits[1] + bits[2] - bits[3]
     x.share = x.share.div_(divisor, rounding_mode="trunc")
     correction = theta * 4 * (int(2**62) // divisor)
     x.share -= correction.share

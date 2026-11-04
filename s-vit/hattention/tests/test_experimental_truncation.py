@@ -16,7 +16,8 @@ def worker(rank, rendezvous):
     from crypten.common.util import count_wraps
     from crypten.mpc.primitives import beaver
     from crypten.mpc.primitives.arithmetic import ArithmeticSharedTensor
-    from hattention.experimental_crypten_truncation import experimental_truncate, experimental_truncation
+    from hattention.experimental_crypten_truncation import (batched_truncate, experimental_truncate,
+                                                             experimental_truncation)
 
     crypten.init()
     try:
@@ -37,14 +38,14 @@ def worker(rank, rendezvous):
             for scale in (192, 1 << 17, 1 << 20):
                 x = ArithmeticSharedTensor(values, precision=0, src=0)
                 legacy = beaver.truncate(x.clone(), scale).reveal()
-                fixed = experimental_truncate(x.clone(), scale).reveal()
                 expected = torch.div(values, scale, rounding_mode="trunc")
                 legacy_diff = legacy - expected
-                corrected_diff = fixed - expected
                 if not (legacy_diff[:2].abs() > (1 << 40)).all():
                     raise AssertionError(f"fixture did not force both wraps: {legacy_diff}")
-                if not (corrected_diff.abs() <= 10).all():
-                    raise AssertionError(f"wrap correction failed for {scale}: {corrected_diff}")
+                for function in (experimental_truncate, batched_truncate):
+                    corrected_diff = function(x.clone(), scale).reveal() - expected
+                    if not (corrected_diff.abs() <= 10).all():
+                        raise AssertionError(f"{function.__name__} failed for {scale}: {corrected_diff}")
         finally:
             provider.wrap_rng = original
 
@@ -58,10 +59,24 @@ def worker(rank, rendezvous):
         raw = party_shares[0] + party_shares[1] + party_shares[2]
         for divisor in (2, 192, 1 << 17, 1 << 20, 1 << 62):
             shared = ArithmeticSharedTensor.from_shares(party_shares[rank].clone(), precision=0)
-            result = experimental_truncate(shared, divisor).reveal()
             expected = torch.div(raw, divisor, rounding_mode="trunc")
-            if not ((result - expected).abs() <= 10).all():
-                raise AssertionError(f"boundary failed for {divisor}: {result}, expected {expected}")
+            for function in (experimental_truncate, batched_truncate):
+                result = function(shared.clone(), divisor).reveal()
+                if not ((result - expected).abs() <= 10).all():
+                    raise AssertionError(f"{function.__name__} boundary failed for {divisor}: {result}, expected {expected}")
+
+        # Deterministic public full-ring shares exercise different residues and signs.
+        generator = torch.Generator().manual_seed(20261104)
+        random_shares = [torch.randint(-(1 << 63), (1 << 63) - 1, (256,),
+                                       dtype=torch.long, generator=generator) for _ in range(3)]
+        random_raw = random_shares[0] + random_shares[1] + random_shares[2]
+        for divisor in (192, 1 << 17, 1 << 20):
+            expected = torch.div(random_raw, divisor, rounding_mode="trunc")
+            for function in (experimental_truncate, batched_truncate):
+                shared = ArithmeticSharedTensor.from_shares(random_shares[rank].clone(), precision=0)
+                delta = function(shared, divisor).reveal() - expected
+                if ((delta > 10) | (delta < -10)).any():
+                    raise AssertionError(f"{function.__name__} random-ring failure at divisor {divisor}")
 
         # Exercise multiplication and an end-to-end softmax attention expression.
         from hattention.benchmark_vit_native_cuda import scaled_standard_attention
@@ -71,13 +86,14 @@ def worker(rank, rendezvous):
         v = torch.tensor([[[[0.2, -0.3], [0.4, 0.1]]]])
         secret = [crypten.cryptensor(t, src=0, precision=20) for t in (q, k, v)]
         old_truncate = beaver.truncate
-        with experimental_truncation():
-            out = reveal_exact(scaled_standard_attention(*secret, 2))
-        if beaver.truncate is not old_truncate:
-            raise AssertionError("experimental protocol was not restored")
         expected = torch.softmax(q.matmul(k.transpose(-2, -1)) * 2**-0.5, -1).matmul(v)
-        if not torch.isfinite(out).all() or (out - expected).abs().max() > 0.03:
-            raise AssertionError(f"experimental attention mismatch: {out} vs {expected}")
+        for mode in ("experimental", "batched"):
+            with experimental_truncation(mode):
+                out = reveal_exact(scaled_standard_attention(*secret, 2))
+            if beaver.truncate is not old_truncate:
+                raise AssertionError("experimental protocol was not restored")
+            if not torch.isfinite(out).all() or (out - expected).abs().max() > 0.03:
+                raise AssertionError(f"{mode} attention mismatch: {out} vs {expected}")
     finally:
         crypten.uninit()
 

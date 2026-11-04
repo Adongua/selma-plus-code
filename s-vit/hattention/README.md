@@ -1118,6 +1118,25 @@ uses much more memory and communication, and has not been independently
 reviewed for security or validated on CUDA or real-size ViT. Start with small
 `--elements`; a full forward may run out of memory. Neither mode establishes a
 security proof or a validated performance comparison.
+
+`--truncation batched` is another opt-in research variant. It retains the
+same arithmetic-share wrap count, but batches boolean overflow checks and
+converts overflow and sign bits together. It is not a published protocol
+implementation or a replacement for security review.
+`python -m hattention.benchmark_crypten_truncation` compares `legacy`,
+`experimental`, and `batched` on the same public mixed-sign Q2p-sized fixture.
+Only the truncation call is timed: provider work is included; sharing, result
+opening and metric gathers are excluded. Warmups are recorded but excluded
+from timing summaries. The report includes maximum party time, estimated
+CrypTen bytes and rounds, GPU peak allocated memory, and raw integer errors.
+A run that misses rare legacy wrap errors does not prove correctness. Do not
+compare provider-inclusive timing with Ring3 online-only measurements.
+
+Ring3's `sgelu.protocol.prob_trunc` uses different sharing and fresh correlated
+preprocessing, and requires reconstructed inputs in [-2^62, 2^62). It is not
+a drop-in CrypTen additive-share truncation. See the primary references
+[ABY3](https://iacr.steepath.eu/2018/403-ABY3AMixedProtocolFrameworkforMachineLearning.pdf)
+and [MP-SPDZ documentation](https://mp-spdz.readthedocs.io/en/latest/readme.html).
 With `--reciprocal-scale 256`, the same opened denominator feeds both native
 reciprocal and the diagnostic adaptation `(1 / (d / 256)) / 256`; the report
 contains both residuals and Attention outputs. This is an optional comparison,

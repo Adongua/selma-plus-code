@@ -157,7 +157,8 @@ def worker(rank, rendezvous, options):
                     if rank == 0:
                         print(json.dumps({"event": "layer_complete", "warmup": iteration == 0,
                                           "layer": index + 1}), flush=True)
-                truncation = experimental_truncation() if options["truncation"] == "experimental" else nullcontext()
+                truncation = (experimental_truncation(options["truncation"])
+                              if options["truncation"] != "legacy" else nullcontext())
                 with torch.no_grad(), truncation:
                     return forward_vit(model, shared, ops, on_layer=progress)
             output, online = _crypten_measure(device, crypten, forward)
@@ -228,7 +229,7 @@ def main():
     parser.add_argument("--precision-bits", type=int, default=20, choices=(17, 20))
     parser.add_argument("--sqrt-iters", type=int, help="override CrypTen inverse-square-root iterations")
     parser.add_argument("--softmax", choices=("native", "scaled"), default="native")
-    parser.add_argument("--truncation", choices=("legacy", "experimental"), default="legacy",
+    parser.add_argument("--truncation", choices=("legacy", "experimental", "batched"), default="legacy",
                         help="experimental binary share-wrap counting is unreviewed and memory intensive")
     parser.add_argument("--reciprocal-scale", type=int, default=256,
                         help="public power-of-two scale used by adapted softmax")
