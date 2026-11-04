@@ -132,6 +132,7 @@ class StrictProviderCache:
         self.requests = []
         self.values = deque()
         self.calls = 0
+        self.expected_count = None
 
     def install(self):
         self.crypten.mpc.get_default_provider = lambda: self
@@ -170,32 +171,35 @@ class StrictProviderCache:
             raise RuntimeError("provider is not tracing")
         self.mode = "idle"
 
-    def prepare(self):
+    def prepare(self, start=0, end=None):
         if self.mode != "idle" or self.values:
             raise RuntimeError("provider material remains from an earlier iteration")
         # Direct calls bypass this proxy: no online values or tensor inputs are used.
-        for index, (signature, args, kwargs) in enumerate(self.requests, 1):
+        requests = self.requests[start:end]
+        self.expected_count = len(requests)
+        for index, (signature, args, kwargs) in enumerate(requests, 1):
             name = signature[0]
             value = getattr(self.provider, name)(*args, **kwargs)
             if self.storage == "cpu":
                 value = _move_material(value, "cpu")
                 self.budget.reserve(value)
             self.values.append((signature, value))
-            if (not dist.is_initialized() or dist.get_rank() == 0) and (index % 500 == 0 or index == len(self.requests)):
+            if (not dist.is_initialized() or dist.get_rank() == 0) and (index % 500 == 0 or index == len(requests)):
                 print(json.dumps({"event": "offline_provider_progress", "completed": index,
-                                  "total": len(self.requests), "host_cache_gib_per_rank":
+                                  "total": len(requests), "host_cache_gib_per_rank":
                                   round(self.budget.used_bytes / 2**30, 3) if self.budget else None}), flush=True)
         self.calls = 0
 
     def begin_replay(self):
-        if self.mode != "idle" or len(self.values) != len(self.requests):
+        if self.mode != "idle" or self.expected_count is None or len(self.values) != self.expected_count:
             raise RuntimeError("provider materials not completely prepared")
         self.mode = "replay"
 
     def end_replay(self):
-        if self.mode != "replay" or self.values or self.calls != len(self.requests):
+        if self.mode != "replay" or self.values or self.calls != self.expected_count:
             raise RuntimeError("provider material sequence was not consumed exactly once")
         self.mode = "idle"
+        self.expected_count = None
 
 
 class StrictRingCache:
@@ -213,6 +217,7 @@ class StrictRingCache:
         self.requests = []
         self.values = deque()
         self.calls = 0
+        self.expected_count = None
 
     def request(self, key, factory):
         key = _public_signature(key)
@@ -239,27 +244,30 @@ class StrictRingCache:
             raise RuntimeError("Ring3 is not tracing")
         self.mode = "idle"
 
-    def prepare(self):
+    def prepare(self, start=0, end=None):
         if self.mode != "idle" or self.values:
             raise RuntimeError("Ring3 material remains from an earlier iteration")
-        for index, (key, factory) in enumerate(self.requests, 1):
+        requests = self.requests[start:end]
+        self.expected_count = len(requests)
+        for index, (key, factory) in enumerate(requests, 1):
             value = factory()
             if self.storage == "cpu":
                 value = _move_material(value, "cpu")
                 self.budget.reserve(value)
             self.values.append((key, value))
-            if (not dist.is_initialized() or dist.get_rank() == 0) and (index % 5 == 0 or index == len(self.requests)):
+            if (not dist.is_initialized() or dist.get_rank() == 0) and (index % 5 == 0 or index == len(requests)):
                 print(json.dumps({"event": "offline_ring_progress", "completed": index,
-                                  "total": len(self.requests), "host_cache_gib_per_rank":
+                                  "total": len(requests), "host_cache_gib_per_rank":
                                   round(self.budget.used_bytes / 2**30, 3) if self.budget else None}), flush=True)
         self.calls = 0
 
     def begin_replay(self):
-        if self.mode != "idle" or len(self.values) != len(self.requests):
+        if self.mode != "idle" or self.expected_count is None or len(self.values) != self.expected_count:
             raise RuntimeError("Ring3 materials not completely prepared")
         self.mode = "replay"
 
     def end_replay(self):
-        if self.mode != "replay" or self.values or self.calls != len(self.requests):
+        if self.mode != "replay" or self.values or self.calls != self.expected_count:
             raise RuntimeError("Ring3 material sequence was not consumed exactly once")
         self.mode = "idle"
+        self.expected_count = None

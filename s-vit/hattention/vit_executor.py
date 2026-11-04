@@ -28,7 +28,7 @@ class PlainOperators:
         return module.forward_preprojected(q, k, v)
 
 
-def forward_vit(model, x, ops, on_layer=None, on_stage=None):
+def forward_vit(model, x, ops, on_layer=None, on_stage=None, on_segment=None):
     """Run a fixed hAttention ViTLite model and return classification logits."""
     classifier = model.classifier
     if classifier.seq_pool or len(model.tokenizer.conv_layers) != 1:
@@ -36,11 +36,17 @@ def forward_vit(model, x, ops, on_layer=None, on_stage=None):
     tokenizer = model.tokenizer.conv_layers[0]
     if len(tokenizer) != 3 or not all(isinstance(m, torch.nn.Identity) for m in tokenizer[1:]):
         raise ValueError("tokenizer activation and pooling must be identities")
+    if on_segment is not None:
+        on_segment("start", "tokenizer")
     x = ops.conv(x, tokenizer[0]).flatten(2, 3).transpose(-2, -1)
     x = ops.cat_cls(x, classifier.class_emb)
     if classifier.positional_emb is not None:
         x = x + classifier.positional_emb.detach()
+    if on_segment is not None:
+        on_segment("end", "tokenizer")
     for index, block in enumerate(classifier.blocks):
+        if on_segment is not None:
+            on_segment("start", f"block_{index + 1}")
         att = block.self_attn
         if on_stage is not None:
             on_stage(index, "block_input", x)
@@ -69,5 +75,12 @@ def forward_vit(model, x, ops, on_layer=None, on_stage=None):
             on_stage(index, "block_output", x)
         if on_layer is not None:
             on_layer(index, x)
+        if on_segment is not None:
+            on_segment("end", f"block_{index + 1}")
+    if on_segment is not None:
+        on_segment("start", "classifier")
     x = ops.norm(x, classifier.norm)
-    return ops.linear(x[:, 0], classifier.fc)
+    result = ops.linear(x[:, 0], classifier.fc)
+    if on_segment is not None:
+        on_segment("end", "classifier")
+    return result

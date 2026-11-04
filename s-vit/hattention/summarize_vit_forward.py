@@ -13,16 +13,27 @@ def summarize(label, path):
     native = "online_ring_excluding_preprocessing" not in rows[0]
     mean = lambda values: statistics.mean(values)
     mean_at = lambda group, field: mean(r[group][field] for r in rows)
+    segmented = report.get("preprocessing_mode") == "precomputed_segmented"
+    segment_names = ([entry["name"] for entry in rows[0]["segmented_online"]["segments"]]
+                     if segmented else None)
+    if segmented and any([entry["name"] for entry in r["segmented_online"]["segments"]] != segment_names for r in rows):
+        raise ValueError(f"{label}: measured repetitions use different segment boundaries")
+    max_party_sum = mean_at("forward_wall", "seconds_max")
+    segment_max_sum = (mean(r["segmented_online"]["sum_segment_max_seconds"] for r in rows)
+                       if segmented else None)
     return {"label": label, "report": str(Path(path).resolve()), "status": report["status"],
             "valid": report["status"] == "benchmark_passed_not_security_validated",
             "backend": report["backend"], "world_size": report["world_size"],
             "image_sha256": report["image_sha256"], "precision": report["precision"],
             "truncation_method": report.get("truncation_method", "unreported"),
             "preprocessing_mode": report.get("preprocessing_mode", "inline"),
-            "offline_cache_storage": report.get("offline_cache_storage", "device" if report.get("preprocessing_mode") == "precomputed_strict" else None),
+            "offline_cache_storage": report.get("offline_cache_storage", "device" if report.get("preprocessing_mode") in ("precomputed_strict", "precomputed_segmented") else None),
             "crypten_preprocessing_seconds": (mean_at("crypten_preprocessing", "seconds_max")
-                                               if report.get("preprocessing_mode") == "precomputed_strict" else None),
-            "repeats": len(rows), "forward_wall_seconds": mean_at("forward_wall", "seconds_max"),
+                                               if report.get("preprocessing_mode") in ("precomputed_strict", "precomputed_segmented") else None),
+            "sum_segment_max_seconds": segment_max_sum,
+            "max_party_segment_sum_seconds": max_party_sum if segmented else None,
+            "segment_names": segment_names,
+            "repeats": len(rows), "forward_wall_seconds": segment_max_sum if segmented else max_party_sum,
             "ring_preprocessing_seconds": None if native else mean_at("ring_preprocessing", "seconds_max"),
             "forward_excluding_ring_preprocessing_seconds": mean_at(
                 "online_crypten" if native else "online_ring_excluding_preprocessing", "seconds_max"),
@@ -55,15 +66,23 @@ def main():
         if len({r[key] for r in results}) != 1:
             raise ValueError(f"reports have different {key}; comparison is not valid")
     if len({r["preprocessing_mode"] for r in results}) != 1:
-        raise ValueError("reports mix inline and precomputed preprocessing; rerun under the same timing boundary")
-    if results[0]["preprocessing_mode"] == "precomputed_strict" and len({r["offline_cache_storage"] for r in results}) != 1:
+        raise ValueError("reports use different preprocessing modes; rerun under the same timing boundary")
+    if results[0]["preprocessing_mode"] in ("precomputed_strict", "precomputed_segmented") and len({r["offline_cache_storage"] for r in results}) != 1:
         raise ValueError("reports use different material storage; compare under the same storage boundary")
+    if results[0]["preprocessing_mode"] == "precomputed_segmented" and len({tuple(r["segment_names"]) for r in results}) != 1:
+        raise ValueError("reports use different segment boundaries; comparison is not valid")
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
-    strict = results[0]["preprocessing_mode"] == "precomputed_strict"
+    segmented = results[0]["preprocessing_mode"] == "precomputed_segmented"
+    strict = results[0]["preprocessing_mode"] in ("precomputed_strict", "precomputed_segmented")
     note = ("Mean of measured repetitions; maximum elapsed time across parties per repetition. "
             "Input sharing and output reconstruction excluded. " +
-            ("Fresh CrypTen provider and Ring3 materials were prepared before sharing and replayed once; "
+            ("Layer-segmented estimate: fresh materials were prepared between segments and excluded from the sum of measured online segments; "
+             "extra synchronization and changes in timing state mean this is not uninterrupted end-to-end wall time. "
+             "The table sums the slowest party's time per segment; the JSON also records the maximum party sum. "
+             "CPU-to-GPU material transfers count online when CPU storage is used; local random generation remains online. "
+             if segmented else
+             "Fresh CrypTen provider and Ring3 materials were prepared before sharing and replayed once; "
              "forward wall is measured after explicit material preparation; CPU-to-GPU material transfers "
              "are included when CPU storage is used. Local random generation and "
              "other runtime setup in the forward remain online; no security validation is implied. "
@@ -77,7 +96,8 @@ def main():
     (out / "comparison.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     header = ["# Full ViT forward comparison", "", note, ""]
     if strict:
-        header.extend(["| Method | Status | Precision | CrypTen truncation | Material storage | Online forward (s) | CrypTen online comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
+        timing_header = "Segmented online sum of maxima (s)" if segmented else "Online forward (s)"
+        header.extend([f"| Method | Status | Precision | CrypTen truncation | Material storage | {timing_header} | CrypTen online comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
                        "|---|---|---|---|---|---:|---:|---:|---:|---:|"])
     else:
         header.extend(["| Method | Status | Precision | CrypTen truncation | Forward wall (s) | CrypTen prep (s) | Ring prep (s) | Forward excl. Ring prep (s) | CrypTen comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",

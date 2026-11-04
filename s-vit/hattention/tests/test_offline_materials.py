@@ -1,10 +1,13 @@
 """Check strict offline replay refuses altered requests and reused material."""
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from hattention.offline_materials import HostCacheBudget, StrictProviderCache, StrictRingCache
+from hattention.segmented_online import SegmentedOnline
 
 
 class FakeProvider:
@@ -104,6 +107,55 @@ class OfflineMaterialTests(unittest.TestCase):
         too_small.end_trace()
         with self.assertRaisesRegex(RuntimeError, "exceeds the per-party budget"):
             too_small.prepare()
+
+    def test_segmented_cache_fits_when_whole_model_does_not(self):
+        cache = StrictRingCache("cpu", torch.device("cpu"), HostCacheBudget(48))
+        cache.begin_trace()
+        for layer in range(2):
+            cache.request(("layer", layer), lambda: torch.ones(4, dtype=torch.long))
+        cache.end_trace()
+        with self.assertRaisesRegex(RuntimeError, "exceeds the per-party budget"):
+            cache.prepare()
+        # Failed runs discard the entire cache; simulate a fresh process.
+        cache = StrictRingCache("cpu", torch.device("cpu"), HostCacheBudget(48))
+        cache.begin_trace()
+        for layer in range(2):
+            cache.request(("layer", layer), lambda: torch.ones(4, dtype=torch.long))
+        cache.end_trace()
+        for layer in range(2):
+            cache.prepare(layer, layer + 1)
+            cache.begin_replay()
+            actual = cache.request(("layer", layer), lambda: None)
+            cache.end_replay()
+            self.assertEqual(cache.budget.used_bytes, 0)
+            self.assertEqual(actual.numel(), 4)
+
+    def test_segment_timer_excludes_material_generation(self):
+        crypten = FakeCrypten()
+        crypten.reset_communication_stats = lambda: None
+        crypten.communicator = SimpleNamespace(get=lambda: SimpleNamespace(
+            get_communication_stats=lambda: {"bytes": 0, "rounds": 0, "time": 0.0}))
+        cache = StrictProviderCache(crypten)
+        cache.install()
+        try:
+            profiler = SegmentedOnline(crypten, torch.device("cpu"), cache)
+            cache.begin_trace()
+            profiler.trace_event("start", "block_1")
+            crypten.mpc.get_default_provider().square((3,))
+            profiler.trace_event("end", "block_1")
+            cache.end_trace()
+            profiler.end_trace()
+            profiler.begin_run()
+            with patch("hattention.segmented_online._barrier"), \
+                    patch("hattention.segmented_online.dist.get_rank", return_value=0), \
+                    patch("hattention.segmented_online.time.perf_counter", side_effect=[0, 5, 10, 12]):
+                profiler.measure_event("start", "block_1")
+                crypten.mpc.get_default_provider().square((3,))
+                profiler.measure_event("end", "block_1")
+            self.assertEqual(profiler.provider_seconds, 5)
+            self.assertEqual(profiler.online_seconds, 2)
+        finally:
+            cache.close()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from hattention.diagnose_vit_native_attention import open_exact, trace_attention
 from hattention.exact_decode import reveal_exact
 from hattention.experimental_crypten_truncation import experimental_truncation
 from hattention.offline_materials import HostCacheBudget, StrictProviderCache
+from hattention.segmented_online import SegmentedOnline
 from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
@@ -176,6 +177,34 @@ def _worker(rank, rendezvous):
                 pass
             else:
                 raise AssertionError("consumed materials were accepted a second time")
+        finally:
+            cache.close()
+        # Independent layer segments must reproduce a full forward while using
+        # only the current segment's fresh provider material.
+        budget = HostCacheBudget(1 << 28)
+        cache = StrictProviderCache(crypten, "cpu", torch.device("cpu"), budget)
+        cache.install()
+        try:
+            profiler = SegmentedOnline(crypten, torch.device("cpu"), cache, budget=budget)
+            cache.begin_trace()
+            with experimental_truncation("carry_save"):
+                forward_vit(model, encrypted, CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256),
+                            on_segment=profiler.trace_event)
+            cache.end_trace()
+            profiler.end_trace()
+            for _ in range(2):
+                profiler.begin_run()
+                with experimental_truncation("carry_save"):
+                    output = reveal_exact(forward_vit(model, encrypted,
+                        CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256),
+                        on_segment=profiler.measure_event))
+                result = profiler.finish_run()
+                if ([s["name"] for s in result["segments"]] != ["tokenizer", "block_1", "classifier"] or
+                        budget.used_bytes or not torch.isfinite(output).all() or
+                        (output - approximate).abs().max() > 1.0):
+                    raise AssertionError("segmented provider full forward mismatch")
+                if result["sum_segment_max_seconds"] + 1e-9 < result["online_crypten"]["seconds_max"]:
+                    raise AssertionError("sum of segment maxima cannot be below max party sum")
         finally:
             cache.close()
     finally:

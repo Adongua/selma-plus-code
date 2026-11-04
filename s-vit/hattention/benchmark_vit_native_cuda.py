@@ -27,6 +27,7 @@ from .vit_executor import PlainOperators, forward_vit
 from .exact_decode import reveal_exact
 from .experimental_crypten_truncation import experimental_truncation
 from .offline_materials import HostCacheBudget, StrictProviderCache
+from .segmented_online import SegmentedOnline
 
 
 class PlainStandardOperators(PlainOperators):
@@ -129,6 +130,8 @@ def worker(rank, rendezvous, options):
                       if options["online_only"] else None)
     if material_cache:
         material_cache.install()
+    segmented = (SegmentedOnline(crypten, device, material_cache, budget=budget)
+                 if material_cache and options["offline_granularity"] == "layer" else None)
     try:
         model, metadata = load_model(options["checkpoint"], options["mpcvit_root"], None)
         model = model.to(device).eval()
@@ -158,7 +161,7 @@ def worker(rank, rendezvous, options):
         records = []
         for iteration in range(options["repeats"] + 1):
             preprocessing = None
-            if material_cache and iteration:
+            if material_cache and iteration and not segmented:
                 if budget:
                     if budget.used_bytes:
                         raise RuntimeError("host cache contains material from a previous iteration")
@@ -167,7 +170,10 @@ def worker(rank, rendezvous, options):
             shared, sharing = _crypten_measure(device, crypten, lambda: crypten.cryptensor(
                 image, src=0, precision=options["precision_bits"], device=device))
             if material_cache:
-                material_cache.begin_trace() if iteration == 0 else material_cache.begin_replay()
+                if iteration == 0:
+                    material_cache.begin_trace()
+                elif not segmented:
+                    material_cache.begin_replay()
             torch.cuda.reset_peak_memory_stats(device)
             def forward():
                 def progress(index, value):
@@ -177,10 +183,24 @@ def worker(rank, rendezvous, options):
                 truncation = (experimental_truncation(options["truncation"])
                               if options["truncation"] != "legacy" else nullcontext())
                 with torch.no_grad(), truncation:
-                    return forward_vit(model, shared, ops, on_layer=progress)
-            output, online = _crypten_measure(device, crypten, forward)
+                    callback = (segmented.trace_event if iteration == 0 else segmented.measure_event) if segmented else None
+                    return forward_vit(model, shared, ops, on_layer=progress, on_segment=callback)
+            segmented_result = None
+            if segmented and iteration:
+                segmented.begin_run()
+                output = forward()
+                segmented_result = segmented.finish_run()
+                online = segmented_result["online_crypten"]
+                preprocessing = segmented_result["crypten_preprocessing"]
+            else:
+                output, online = _crypten_measure(device, crypten, forward)
             if material_cache:
-                material_cache.end_trace() if iteration == 0 else material_cache.end_replay()
+                if iteration == 0:
+                    material_cache.end_trace()
+                    if segmented:
+                        segmented.end_trace()
+                elif not segmented:
+                    material_cache.end_replay()
                 if budget and iteration and budget.used_bytes:
                     raise RuntimeError("host cache material was not fully consumed")
             opened, reconstruction = _crypten_measure(device, crypten, lambda: reveal_exact(output))
@@ -205,6 +225,9 @@ def worker(rank, rendezvous, options):
             if material_cache:
                 row.update(crypten_preprocessing=preprocessing,
                            precomputed_provider_requests=len(material_cache.requests))
+                if segmented_result:
+                    row["segmented_online"] = {key: segmented_result[key] for key in
+                                               ("segments", "sum_segment_max_seconds", "note")}
                 if budget:
                     local = torch.tensor([budget.peak_bytes], dtype=torch.long)
                     peaks = [torch.zeros_like(local) for _ in range(3)]
@@ -222,7 +245,7 @@ def worker(rank, rendezvous, options):
                       "method": f"CrypTen softmax ({options['softmax']}), {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
                       "softmax_method": options["softmax"],
                       "truncation_method": options["truncation"],
-                      "preprocessing_mode": "precomputed_strict" if material_cache else "inline",
+                      "preprocessing_mode": ("precomputed_segmented" if segmented else "precomputed_strict") if material_cache else "inline",
                       "offline_cache_storage": options["offline_cache"] if material_cache else None,
                       "offline_host_limit_gib_per_rank": options["offline_host_limit_gib"] if budget else None,
                       "truncation_note": "non-legacy modes use unreviewed secret share-wrap counting; not CrypTen native or security validated",
@@ -239,7 +262,8 @@ def worker(rank, rendezvous, options):
                       "correctness_gate": "all iterations including warmup must meet max error against selected plaintext formula; exact GeLU model deviation reported separately",
                       "crypten_import": crypten.__file__, "python": platform.python_version(),
                       "torch": torch.__version__,
-                      "timing_note": ("All traced CrypTen provider materials precomputed before input sharing; online forward uses strict single-use replay. CPU-to-GPU transfers, if used, are included online. Input sharing and reconstruction are separate."
+                      "timing_note": ("Layer-segmented online estimate: fresh provider materials prepared between segments and excluded; extra barriers and segmentation change the execution. CPU-to-GPU transfers count online."
+                                      if segmented else "All traced CrypTen provider materials precomputed before input sharing; online forward uses strict single-use replay. CPU-to-GPU transfers, if used, are included online. Input sharing and reconstruction are separate."
                                       if material_cache else "CrypTen provider work is included in forward; input sharing and output reconstruction are separate."),
                       "communication_note": "CrypTen bidirectional communicator logs divided by two; collective bytes are estimates.",
                       "security_note": "Numerical execution only; comparison with experimental Ring3 is not a proof of equivalent security."}
@@ -278,12 +302,16 @@ def main():
                         help="store prepared materials on GPU or CPU; CPU-to-GPU transfers count online")
     parser.add_argument("--offline-host-limit-gib", type=float, default=32.0,
                         help="approximate tensor-payload limit per party for CPU material cache")
+    parser.add_argument("--offline-granularity", choices=("full", "layer"), default="full",
+                        help="full precomputation or bounded-memory per-layer segmented online estimate")
     parser.add_argument("--max-abs-error", type=float, default=1.0)
     args = parser.parse_args()
     if not math.isfinite(args.offline_host_limit_gib) or args.offline_host_limit_gib <= 0:
         parser.error("--offline-host-limit-gib must be positive and finite")
     if args.offline_cache == "cpu" and not args.online_only:
         parser.error("--offline-cache cpu requires --online-only")
+    if args.offline_granularity == "layer" and not args.online_only:
+        parser.error("--offline-granularity layer requires --online-only")
     try:
         validate_reciprocal_scale(args.reciprocal_scale)
     except ValueError as error:

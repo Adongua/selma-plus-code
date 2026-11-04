@@ -19,6 +19,7 @@ from hattention.student_checkpoint import import_mpcvit
 from hattention.vit_executor import PlainOperators, forward_vit
 from hattention.vit_integration import make_fixed_student
 from hattention.offline_materials import HostCacheBudget, StrictProviderCache, StrictRingCache
+from hattention.segmented_online import SegmentedOnline
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -119,6 +120,31 @@ def _crypten_worker(rank, rendezvous):
                     raise AssertionError("mixed host cache accounting mismatch")
                 if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
                     raise AssertionError("precomputed mixed full forward mismatch")
+        finally:
+            provider_cache.close()
+        budget = HostCacheBudget(1 << 28)
+        provider_cache = StrictProviderCache(crypten, "cpu", torch.device("cpu"), budget)
+        ring_cache = StrictRingCache("cpu", torch.device("cpu"), budget)
+        provider_cache.install()
+        secure.prepare = lambda fn, key=None: ring_cache.request(key, fn)
+        try:
+            profiler = SegmentedOnline(crypten, torch.device("cpu"), provider_cache, ring_cache, base, budget)
+            provider_cache.begin_trace()
+            ring_cache.begin_trace()
+            with experimental_truncation("carry_save"):
+                forward_vit(model, encrypted, secure, on_segment=profiler.trace_event)
+            provider_cache.end_trace()
+            ring_cache.end_trace()
+            profiler.end_trace()
+            for _ in range(2):
+                profiler.begin_run()
+                with experimental_truncation("carry_save"):
+                    output = forward_vit(model, encrypted, secure, on_segment=profiler.measure_event).get_plain_text()
+                result = profiler.finish_run()
+                if ([s["name"] for s in result["segments"]] != ["tokenizer", "block_1", "classifier"] or
+                        budget.used_bytes or not torch.isfinite(output).all() or
+                        (output - plain).abs().max() > 0.5):
+                    raise AssertionError("segmented mixed forward mismatch")
         finally:
             provider_cache.close()
     finally:

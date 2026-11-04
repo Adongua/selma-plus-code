@@ -54,6 +54,22 @@ class ForwardSummaryTests(unittest.TestCase):
             table = (out / "comparison.md").read_text()
             self.assertIn("Online forward (s)", table)
             self.assertNotIn("Ring prep (s)", table)
+            row["segmented_online"] = {"sum_segment_max_seconds": 290,
+                                       "segments": [{"name": "tokenizer"}, {"name": "block_1"}]}
+            path.write_text(json.dumps({**base, "preprocessing_mode": "precomputed_segmented", "offline_cache_storage": "cpu", "records": [row]}))
+            result = summarize("segmented", path)
+            self.assertEqual(result["forward_wall_seconds"], 290)
+            self.assertEqual(result["max_party_segment_sum_seconds"], 270)
+            out = Path(directory) / "segmented-summary"
+            with patch("sys.argv", ["summary", "--report", f"baseline={path}", "--output", str(out)]), redirect_stdout(io.StringIO()):
+                main()
+            self.assertIn("Segmented online sum of maxima (s)", (out / "comparison.md").read_text())
+            inline = Path(directory) / "inline.json"
+            inline.write_text(json.dumps({**base, "records": [row]}))
+            with patch("sys.argv", ["summary", "--report", f"segmented={path}", "--report", f"inline={inline}",
+                                    "--output", str(Path(directory) / "mixed")]):
+                with self.assertRaisesRegex(ValueError, "different preprocessing modes"):
+                    main()
 
 
 if __name__ == "__main__":

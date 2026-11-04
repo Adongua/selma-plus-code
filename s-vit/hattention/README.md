@@ -1275,3 +1275,16 @@ Inspect available host memory and swap before use. Fresh material is still
 prepared per iteration and strictly consumed once. CPU storage is a different
 runtime configuration from GPU-resident preprocessing; its online timings
 include the additional data transfers and must not be labelled GPU-resident.
+
+For limited RAM, `--online-only --offline-granularity layer` traces separate
+public-shape material requests for the tokenizer, each block, and classifier.
+Each measured run prepares only the next segment's fresh materials, executes
+that segment, then releases them before preparing the next. Material preparation
+is excluded from segment timers, while cache replay and any CPU-to-GPU copies
+are included. The report records per-segment maximum party time, their sum, and
+the maximum across party sums. The summary displays the **sum of per-segment
+maxima** as the segmented online estimate. Synchronization is added at segment
+boundaries, preparation is interleaved, and device state can change; it is not
+the wall time of an uninterrupted forward with all materials preloaded. Do not
+mix segmented, full-precomputed, or inline reports in a comparison. A single
+large segment can still exceed the host budget or available GPU memory.

@@ -31,6 +31,7 @@ from slayernorm.benchmark_crypten_cuda import _aggregate, _barrier, _crypten_mea
 from .config import HAttentionConfig
 from .experimental_crypten_truncation import experimental_truncation
 from .offline_materials import HostCacheBudget, StrictProviderCache, StrictRingCache
+from .segmented_online import SegmentedOnline
 from .hybrid import prepare_hybrid, secure_hybrid
 from .hybrid_wide_range import prepare_wide_hybrid, secure_wide_hybrid
 from .reference import rsa_attention
@@ -251,10 +252,12 @@ def worker(rank, rendezvous, options):
             raise ValueError("public fixture exceeds protocol bounds; see range audit; do not use result as a valid benchmark")
         base = CudaRing3(device=device, reveal_mode="p2p")
         wide = CudaRing3Wide(base)
+        segmented = (SegmentedOnline(crypten, device, provider_cache, ring_cache, base, budget)
+                     if provider_cache and options["offline_granularity"] == "layer" else None)
         records = []
         for iteration in range(options["repeats"] + 1):
             provider_preprocessing = ring_precomputed = None
-            if provider_cache and iteration:
+            if provider_cache and iteration and not segmented:
                 if budget:
                     if budget.used_bytes:
                         raise RuntimeError("host cache contains material from a previous iteration")
@@ -267,7 +270,7 @@ def worker(rank, rendezvous, options):
                 if iteration == 0:
                     provider_cache.begin_trace()
                     ring_cache.begin_trace()
-                else:
+                elif not segmented:
                     provider_cache.begin_replay()
                     ring_cache.begin_replay()
             torch.cuda.reset_peak_memory_stats(device)
@@ -282,28 +285,41 @@ def worker(rank, rendezvous, options):
                                       "layer": index + 1}), flush=True)
             truncation = (experimental_truncation(options["truncation"])
                           if options["truncation"] != "legacy" else nullcontext())
+            if segmented and iteration:
+                segmented.begin_run()
             with torch.no_grad(), truncation:
-                output = forward_vit(model, shared, ops, on_layer=progress)
+                callback = (segmented.trace_event if iteration == 0 else segmented.measure_event) if segmented else None
+                output = forward_vit(model, shared, ops, on_layer=progress, on_segment=callback)
             torch.cuda.synchronize(device)
             wall = time.perf_counter() - start
+            segmented_result = segmented.finish_run() if segmented and iteration else None
             if provider_cache:
                 if iteration == 0:
                     provider_cache.end_trace()
                     ring_cache.end_trace()
-                else:
+                    if segmented:
+                        segmented.end_trace()
+                elif not segmented:
                     provider_cache.end_replay()
                     ring_cache.end_replay()
-                    if budget and budget.used_bytes:
-                        raise RuntimeError("host cache material was not fully consumed")
+                if iteration and budget and budget.used_bytes:
+                    raise RuntimeError("host cache material was not fully consumed")
             stats = crypten.communicator.get().get_communication_stats()
-            crypto = _aggregate(device, 0, stats, bidirectional_counter=True)
-            ring = _aggregate(device, wall, {"bytes": base.sent_bytes - sent,
-                "rounds": base.phases - phases, "time": 0.0})
-            offline = _aggregate(device, ops.offline_seconds, {"bytes": ops.offline_bytes,
-                "rounds": ops.offline_phases, "time": 0.0})
-            online = _aggregate(device, max(0.0, wall - ops.offline_seconds), {
-                "bytes": base.sent_bytes - sent - ops.offline_bytes,
-                "rounds": base.phases - phases - ops.offline_phases, "time": 0.0})
+            if segmented_result:
+                crypto = segmented_result["online_crypten"]
+                ring = online = segmented_result["online_ring"]
+                offline = segmented_result["ring_preprocessing"]
+                provider_preprocessing = segmented_result["crypten_preprocessing"]
+                ring_precomputed = offline
+            else:
+                crypto = _aggregate(device, 0, stats, bidirectional_counter=True)
+                ring = _aggregate(device, wall, {"bytes": base.sent_bytes - sent,
+                    "rounds": base.phases - phases, "time": 0.0})
+                offline = _aggregate(device, ops.offline_seconds, {"bytes": ops.offline_bytes,
+                    "rounds": ops.offline_phases, "time": 0.0})
+                online = _aggregate(device, max(0.0, wall - ops.offline_seconds), {
+                    "bytes": base.sent_bytes - sent - ops.offline_bytes,
+                    "rounds": base.phases - phases - ops.offline_phases, "time": 0.0})
             from .exact_decode import reveal_exact
             opened, reconstruction = _crypten_measure(device, crypten, lambda: reveal_exact(output))
             actual = _plain(opened)
@@ -326,6 +342,9 @@ def worker(rank, rendezvous, options):
                 record.update(crypten_preprocessing=provider_preprocessing,
                               precomputed_provider_requests=len(provider_cache.requests),
                               precomputed_ring_requests=len(ring_cache.requests))
+                if segmented_result:
+                    record["segmented_online"] = {key: segmented_result[key] for key in
+                                                  ("segments", "sum_segment_max_seconds", "note")}
                 if budget:
                     local = torch.tensor([budget.peak_bytes], dtype=torch.long)
                     cache_peaks = [torch.zeros_like(local) for _ in range(3)]
@@ -347,7 +366,7 @@ def worker(rank, rendezvous, options):
                 "image_sha256": file_sha256(options["image"][0]), "repeats": options["repeats"],
                 "public_fixture_range_audit": observations,
                 "precision": "Q17", "numeric_profile": options["numeric_profile"],
-                "preprocessing_mode": "precomputed_strict" if provider_cache else "inline",
+                "preprocessing_mode": ("precomputed_segmented" if segmented else "precomputed_strict") if provider_cache else "inline",
                 "offline_cache_storage": options["offline_cache"] if provider_cache else None,
                 "offline_host_limit_gib_per_rank": options["offline_host_limit_gib"] if budget else None,
                 "truncation_method": options["truncation"],
@@ -356,7 +375,8 @@ def worker(rank, rendezvous, options):
                 "mu": options["mu"], "max_abs_error_threshold": options["max_abs_error"], "records": records,
                 "correctness_gate": "public fixture within declared profile; all iterations including warmup must meet max error against this fixed student's plaintext logits",
                 "crypten_import": crypten.__file__, "python": platform.python_version(), "torch": torch.__version__,
-                "timing_note": ("Fresh traced CrypTen provider and Ring3 materials prepared before input sharing and consumed with strict single-use replay; CPU-to-GPU transfers, if used, are included online."
+                "timing_note": ("Layer-segmented online estimate: fresh CrypTen and Ring3 materials prepared between segments and excluded; extra barriers and segmentation change the execution. CPU-to-GPU transfers count online."
+                                if segmented else "Fresh traced CrypTen provider and Ring3 materials prepared before input sharing and consumed with strict single-use replay; CPU-to-GPU transfers, if used, are included online."
                                 if provider_cache else "forward wall includes just-in-time preprocessing; online time subtracts local preprocessing before rank maximum; CrypTen provider work remains online; sync instrumentation included"),
                 "communication_note": "Ring3 sent payloads and CrypTen bidirectional logs/2 are separate; counters are not equivalent protocol rounds",
                 "numerics_note": "sLayerNorm and sGeLU approximate the trained LayerNorm and GeLU; RSA uses sReLU and bounded reciprocal; secret ranges are unchecked",
@@ -387,6 +407,8 @@ def main():
                         help="store prepared materials on GPU or CPU; CPU-to-GPU transfers count online")
     parser.add_argument("--offline-host-limit-gib", type=float, default=32.0,
                         help="approximate tensor-payload limit per party for CPU material cache")
+    parser.add_argument("--offline-granularity", choices=("full", "layer"), default="full",
+                        help="full precomputation or bounded-memory per-layer segmented online estimate")
     parser.add_argument("--truncation", choices=("legacy", "experimental", "batched", "carry_save"),
                         default="legacy", help="CrypTen truncation for public-weight linear operations")
     parser.add_argument("--mu", type=float, default=1.4621998268680836)
@@ -403,6 +425,8 @@ def main():
         parser.error("--offline-host-limit-gib must be positive and finite")
     if args.offline_cache == "cpu" and not args.online_only:
         parser.error("--offline-cache cpu requires --online-only")
+    if args.offline_granularity == "layer" and not args.online_only:
+        parser.error("--offline-granularity layer requires --online-only")
     if args.repeats < 1 or not 0.25 <= args.mu <= 4 or not 0 < args.max_abs_error < float("inf"):
         parser.error("invalid repeats, mu or max-abs-error")
     if Path(args.output).exists():
