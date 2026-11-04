@@ -1288,3 +1288,22 @@ boundaries, preparation is interleaved, and device state can change; it is not
 the wall time of an uninterrupted forward with all materials preloaded. Do not
 mix segmented, full-precomputed, or inline reports in a comparison. A single
 large segment can still exceed the host budget or available GPU memory.
+
+### Continuous forward with inline preprocessing timing
+
+Both full-ViT benchmark scripts accept `--inline-preprocessing-timing` (mutually
+exclusive with `--online-only`). Fresh materials are generated just in time,
+without caching or rearranging protocol execution. The provider timer wraps
+CrypTen's traceable tuple provider methods, synchronizing CUDA before and after
+calls; the optimized benchmark also measures Ring3 preparation. Each record's
+`inline_accounting.per_rank` records local wall, provider and Ring3 times and
+`max(0, wall - provider - ring)`. The reported online estimate is the maximum
+of these per-rank differences, not a subtraction of independent maxima.
+
+The synchronized instrumentation changes execution and can affect performance;
+preprocessing communication and waiting remain interleaved with online work,
+and randomness outside the instrumented calls remains online. Thus this is an
+estimate, not precomputed online-only wall time or proof that all possible
+offline work was removed. CrypTen communication in this mode is total forward
+communication, including provider traffic. Use the same mode on all compared
+reports, and retain the numerical correctness statuses.

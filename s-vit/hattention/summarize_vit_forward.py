@@ -14,6 +14,7 @@ def summarize(label, path):
     mean = lambda values: statistics.mean(values)
     mean_at = lambda group, field: mean(r[group][field] for r in rows)
     segmented = report.get("preprocessing_mode") == "precomputed_segmented"
+    instrumented = report.get("preprocessing_mode") == "inline_instrumented"
     segment_names = ([entry["name"] for entry in rows[0]["segmented_online"]["segments"]]
                      if segmented else None)
     if segmented and any([entry["name"] for entry in r["segmented_online"]["segments"]] != segment_names for r in rows):
@@ -30,6 +31,9 @@ def summarize(label, path):
             "offline_cache_storage": report.get("offline_cache_storage", "device" if report.get("preprocessing_mode") in ("precomputed_strict", "precomputed_segmented") else None),
             "crypten_preprocessing_seconds": (mean_at("crypten_preprocessing", "seconds_max")
                                                if report.get("preprocessing_mode") in ("precomputed_strict", "precomputed_segmented") else None),
+            "inline_online_estimate_seconds": mean(r["inline_accounting"]["online_estimate_seconds_max"] for r in rows) if instrumented else None,
+            "inline_provider_seconds_max": mean(max(p["crypten_provider_seconds"] for p in r["inline_accounting"]["per_rank"]) for r in rows) if instrumented else None,
+            "inline_ring_seconds_max": mean(max(p["ring_preprocessing_seconds"] for p in r["inline_accounting"]["per_rank"]) for r in rows) if instrumented and not native else None,
             "sum_segment_max_seconds": segment_max_sum,
             "max_party_segment_sum_seconds": max_party_sum if segmented else None,
             "segment_names": segment_names,
@@ -75,6 +79,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     segmented = results[0]["preprocessing_mode"] == "precomputed_segmented"
     strict = results[0]["preprocessing_mode"] in ("precomputed_strict", "precomputed_segmented")
+    instrumented = results[0]["preprocessing_mode"] == "inline_instrumented"
     note = ("Mean of measured repetitions; maximum elapsed time across parties per repetition. "
             "Input sharing and output reconstruction excluded. " +
             ("Layer-segmented estimate: fresh materials were prepared between segments and excluded from the sum of measured online segments; "
@@ -87,6 +92,8 @@ def main():
              "are included when CPU storage is used. Local random generation and "
              "other runtime setup in the forward remain online; no security validation is implied. "
              if strict else
+             "Continuous forward with synchronized provider instrumentation; per-rank online estimate subtracts timed provider and Ring3 preparation from local wall before taking the maximum. Preparations remain interleaved, synchronization adds overhead, and local randomness outside timed calls remains online. CrypTen communication includes provider work. "
+             if instrumented else
              "CrypTen provider work is included in forward; Ring3 preparation is separately counted. "
              "Full wall includes just-in-time Ring3 preparation, and forward excluding Ring3 preparation "
              "still includes CrypTen provider work. ") +
@@ -95,7 +102,10 @@ def main():
     report = {"scope": "full ViTLite forward", "note": note, "results": results}
     (out / "comparison.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     header = ["# Full ViT forward comparison", "", note, ""]
-    if strict:
+    if instrumented:
+        header.extend(["| Method | Status | Precision | CrypTen truncation | Forward wall (s) | Provider max (s) | Ring prep max (s) | Online estimate (s) | CrypTen total comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
+                       "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"])
+    elif strict:
         timing_header = "Segmented online sum of maxima (s)" if segmented else "Online forward (s)"
         header.extend([f"| Method | Status | Precision | CrypTen truncation | Material storage | {timing_header} | CrypTen online comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
                        "|---|---|---|---|---|---:|---:|---:|---:|---:|"])
@@ -108,7 +118,10 @@ def main():
         if strict:
             line += f"{r['offline_cache_storage']} | "
         line += f"{fmt(r['forward_wall_seconds'])} | "
-        if not strict:
+        if instrumented:
+            line += (f"{fmt(r['inline_provider_seconds_max'])} | {fmt(r['inline_ring_seconds_max'])} | "
+                     f"{fmt(r['inline_online_estimate_seconds'])} | ")
+        elif not strict:
             line += (f"{fmt(r['crypten_preprocessing_seconds'])} | {fmt(r['ring_preprocessing_seconds'])} | "
                      f"{fmt(r['forward_excluding_ring_preprocessing_seconds'])} | ")
         line += (f"{fmt(r['crypten_system_bytes'] / 2**20)} | "

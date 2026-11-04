@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import tempfile
+import time
 
 import torch
 import torch.distributed as dist
@@ -28,6 +29,7 @@ from .exact_decode import reveal_exact
 from .experimental_crypten_truncation import experimental_truncation
 from .offline_materials import HostCacheBudget, StrictProviderCache
 from .segmented_online import SegmentedOnline
+from .inline_preprocessing import InlineProviderTimer, gather_accounting
 
 
 class PlainStandardOperators(PlainOperators):
@@ -186,12 +188,27 @@ def worker(rank, rendezvous, options):
                     callback = (segmented.trace_event if iteration == 0 else segmented.measure_event) if segmented else None
                     return forward_vit(model, shared, ops, on_layer=progress, on_segment=callback)
             segmented_result = None
+            accounting = None
             if segmented and iteration:
                 segmented.begin_run()
                 output = forward()
                 segmented_result = segmented.finish_run()
                 online = segmented_result["online_crypten"]
                 preprocessing = segmented_result["crypten_preprocessing"]
+            elif options["inline_preprocessing_timing"]:
+                timer = InlineProviderTimer(crypten, device)
+                from slayernorm.benchmark_crypten_cuda import _aggregate, _barrier
+                _barrier(device)
+                crypten.reset_communication_stats()
+                torch.cuda.synchronize(device)
+                start = time.perf_counter()
+                with timer.installed():
+                    output = forward()
+                torch.cuda.synchronize(device)
+                wall = time.perf_counter() - start
+                stats = crypten.communicator.get().get_communication_stats()
+                online = _aggregate(device, wall, stats, bidirectional_counter=True)
+                accounting = gather_accounting(wall, timer.seconds, 0.0, timer.calls)
             else:
                 output, online = _crypten_measure(device, crypten, forward)
             if material_cache:
@@ -222,6 +239,8 @@ def worker(rank, rendezvous, options):
                    "output_reconstruction": reconstruction,
                    "error_vs_plaintext_logits": errors,
                    "error_vs_own_formula_logits": own_errors}
+            if accounting is not None:
+                row["inline_accounting"] = accounting
             if material_cache:
                 row.update(crypten_preprocessing=preprocessing,
                            precomputed_provider_requests=len(material_cache.requests))
@@ -245,7 +264,7 @@ def worker(rank, rendezvous, options):
                       "method": f"CrypTen softmax ({options['softmax']}), {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
                       "softmax_method": options["softmax"],
                       "truncation_method": options["truncation"],
-                      "preprocessing_mode": ("precomputed_segmented" if segmented else "precomputed_strict") if material_cache else "inline",
+                      "preprocessing_mode": ("precomputed_segmented" if segmented else "precomputed_strict") if material_cache else "inline_instrumented" if options["inline_preprocessing_timing"] else "inline",
                       "offline_cache_storage": options["offline_cache"] if material_cache else None,
                       "offline_host_limit_gib_per_rank": options["offline_host_limit_gib"] if budget else None,
                       "truncation_note": "non-legacy modes use unreviewed secret share-wrap counting; not CrypTen native or security validated",
@@ -264,7 +283,7 @@ def worker(rank, rendezvous, options):
                       "torch": torch.__version__,
                       "timing_note": ("Layer-segmented online estimate: fresh provider materials prepared between segments and excluded; extra barriers and segmentation change the execution. CPU-to-GPU transfers count online."
                                       if segmented else "All traced CrypTen provider materials precomputed before input sharing; online forward uses strict single-use replay. CPU-to-GPU transfers, if used, are included online. Input sharing and reconstruction are separate."
-                                      if material_cache else "CrypTen provider work is included in forward; input sharing and output reconstruction are separate."),
+                                      if material_cache else "Instrumented continuous forward: local wall minus synchronized provider calls; randomness outside timed calls remains online; this is an estimate." if options["inline_preprocessing_timing"] else "CrypTen provider work is included in forward; input sharing and output reconstruction are separate."),
                       "communication_note": "CrypTen bidirectional communicator logs divided by two; collective bytes are estimates.",
                       "security_note": "Numerical execution only; comparison with experimental Ring3 is not a proof of equivalent security."}
             out = Path(options["output"])
@@ -296,6 +315,7 @@ def main():
     parser.add_argument("--chebyshev-bound", type=float, default=12.0,
                         help="fit 16-degree interpolant on [-bound, bound]; public audit only")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--inline-preprocessing-timing", action="store_true", help="measure and subtract just-in-time provider time per party")
     parser.add_argument("--online-only", action="store_true",
                         help="precompute fresh provider materials before input sharing; strict sequence replay may use substantial GPU memory")
     parser.add_argument("--offline-cache", choices=("device", "cpu"), default="device",
@@ -306,6 +326,8 @@ def main():
                         help="full precomputation or bounded-memory per-layer segmented online estimate")
     parser.add_argument("--max-abs-error", type=float, default=1.0)
     args = parser.parse_args()
+    if args.inline_preprocessing_timing and args.online_only:
+        parser.error("--inline-preprocessing-timing cannot be combined with --online-only")
     if not math.isfinite(args.offline_host_limit_gib) or args.offline_host_limit_gib <= 0:
         parser.error("--offline-host-limit-gib must be positive and finite")
     if args.offline_cache == "cpu" and not args.online_only:
