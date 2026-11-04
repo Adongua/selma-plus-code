@@ -1307,3 +1307,23 @@ estimate, not precomputed online-only wall time or proof that all possible
 offline work was removed. CrypTen communication in this mode is total forward
 communication, including provider traffic. Use the same mode on all compared
 reports, and retain the numerical correctness statuses.
+
+### Full-ViT operator diagnostics
+
+Add `--inline-preprocessing-timing --profile-operators` to either full-ViT
+benchmark to measure convolution, CLS insertion, linear projections,
+LayerNorm, GeLU and attention during the same forward. Calls, input shapes,
+per-party provider/Ring3 preparation and online estimates are stored in each
+record's `operator_profile`. Summarize profiled reports with
+`python -m hattention.summarize_vit_operators --report LABEL=PATH --output DIR`.
+Each repetition's breakdown uses the party with the largest total online
+estimate, and includes a residual for additions, reshapes and measurement
+bookkeeping. The categories are mutually exclusive: QKV, projection and MLP
+linear layers are in `linear`, not `attention` or `gelu`.
+
+This is synchronized diagnostic instrumentation, not a microbenchmark or an
+unmodified full-forward latency measurement. Its extra synchronization changes
+execution, and untracked local randomness remains online. Compare reports with
+matching profiling settings and hardware; inspect correctness statuses and the
+precision of each method. Profiled and non-profiled reports cannot be mixed in
+`summarize_vit_forward`.

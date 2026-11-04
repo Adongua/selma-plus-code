@@ -30,6 +30,7 @@ from .experimental_crypten_truncation import experimental_truncation
 from .offline_materials import HostCacheBudget, StrictProviderCache
 from .segmented_online import SegmentedOnline
 from .inline_preprocessing import InlineProviderTimer, gather_accounting
+from .vit_operator_profile import OperatorProfiler
 
 
 class PlainStandardOperators(PlainOperators):
@@ -177,6 +178,8 @@ def worker(rank, rendezvous, options):
                 elif not segmented:
                     material_cache.begin_replay()
             torch.cuda.reset_peak_memory_stats(device)
+            active_ops = ops
+            profiler = None
             def forward():
                 def progress(index, value):
                     if rank == 0:
@@ -186,7 +189,7 @@ def worker(rank, rendezvous, options):
                               if options["truncation"] != "legacy" else nullcontext())
                 with torch.no_grad(), truncation:
                     callback = (segmented.trace_event if iteration == 0 else segmented.measure_event) if segmented else None
-                    return forward_vit(model, shared, ops, on_layer=progress, on_segment=callback)
+                    return forward_vit(model, shared, active_ops, on_layer=progress, on_segment=callback)
             segmented_result = None
             accounting = None
             if segmented and iteration:
@@ -197,6 +200,9 @@ def worker(rank, rendezvous, options):
                 preprocessing = segmented_result["crypten_preprocessing"]
             elif options["inline_preprocessing_timing"]:
                 timer = InlineProviderTimer(crypten, device)
+                if options["profile_operators"]:
+                    profiler = OperatorProfiler(ops, timer, device)
+                    active_ops = profiler
                 from slayernorm.benchmark_crypten_cuda import _aggregate, _barrier
                 _barrier(device)
                 crypten.reset_communication_stats()
@@ -241,6 +247,8 @@ def worker(rank, rendezvous, options):
                    "error_vs_own_formula_logits": own_errors}
             if accounting is not None:
                 row["inline_accounting"] = accounting
+            if profiler is not None:
+                row["operator_profile"] = profiler.finish(accounting)
             if material_cache:
                 row.update(crypten_preprocessing=preprocessing,
                            precomputed_provider_requests=len(material_cache.requests))
@@ -263,7 +271,7 @@ def worker(rank, rendezvous, options):
                       "scope": "full ViTLite forward; public weights and public image shared as secret input; batch 1",
                       "method": f"CrypTen softmax ({options['softmax']}), {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
                       "softmax_method": options["softmax"],
-                      "truncation_method": options["truncation"],
+                      "truncation_method": options["truncation"], "operator_profiling": options["profile_operators"],
                       "preprocessing_mode": ("precomputed_segmented" if segmented else "precomputed_strict") if material_cache else "inline_instrumented" if options["inline_preprocessing_timing"] else "inline",
                       "offline_cache_storage": options["offline_cache"] if material_cache else None,
                       "offline_host_limit_gib_per_rank": options["offline_host_limit_gib"] if budget else None,
@@ -315,6 +323,7 @@ def main():
     parser.add_argument("--chebyshev-bound", type=float, default=12.0,
                         help="fit 16-degree interpolant on [-bound, bound]; public audit only")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--profile-operators", action="store_true", help="synchronized per-operator diagnostic; requires inline timing")
     parser.add_argument("--inline-preprocessing-timing", action="store_true", help="measure and subtract just-in-time provider time per party")
     parser.add_argument("--online-only", action="store_true",
                         help="precompute fresh provider materials before input sharing; strict sequence replay may use substantial GPU memory")
@@ -326,6 +335,8 @@ def main():
                         help="full precomputation or bounded-memory per-layer segmented online estimate")
     parser.add_argument("--max-abs-error", type=float, default=1.0)
     args = parser.parse_args()
+    if args.profile_operators and not args.inline_preprocessing_timing:
+        parser.error("--profile-operators requires --inline-preprocessing-timing")
     if args.inline_preprocessing_timing and args.online_only:
         parser.error("--inline-preprocessing-timing cannot be combined with --online-only")
     if not math.isfinite(args.offline_host_limit_gib) or args.offline_host_limit_gib <= 0:

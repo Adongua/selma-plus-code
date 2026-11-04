@@ -33,6 +33,7 @@ from .experimental_crypten_truncation import experimental_truncation
 from .offline_materials import HostCacheBudget, StrictProviderCache, StrictRingCache
 from .segmented_online import SegmentedOnline
 from .inline_preprocessing import InlineProviderTimer, gather_accounting
+from .vit_operator_profile import OperatorProfiler
 from .hybrid import prepare_hybrid, secure_hybrid
 from .hybrid_wide_range import prepare_wide_hybrid, secure_wide_hybrid
 from .reference import rsa_attention
@@ -287,11 +288,13 @@ def worker(rank, rendezvous, options):
             truncation = (experimental_truncation(options["truncation"])
                           if options["truncation"] != "legacy" else nullcontext())
             timer = InlineProviderTimer(crypten, device) if options["inline_preprocessing_timing"] else None
+            profiler = OperatorProfiler(ops, timer, device) if options["profile_operators"] else None
+            active_ops = profiler if profiler is not None else ops
             if segmented and iteration:
                 segmented.begin_run()
             with torch.no_grad(), truncation, (timer.installed() if timer else nullcontext()):
                 callback = (segmented.trace_event if iteration == 0 else segmented.measure_event) if segmented else None
-                output = forward_vit(model, shared, ops, on_layer=progress, on_segment=callback)
+                output = forward_vit(model, shared, active_ops, on_layer=progress, on_segment=callback)
             torch.cuda.synchronize(device)
             wall = time.perf_counter() - start
             segmented_result = segmented.finish_run() if segmented and iteration else None
@@ -343,6 +346,8 @@ def worker(rank, rendezvous, options):
                           "secure_top1": int(actual.argmax(-1).item()) if finite else None}}
             if accounting is not None:
                 record["inline_accounting"] = accounting
+            if profiler is not None:
+                record["operator_profile"] = profiler.finish(accounting)
             if provider_cache:
                 record.update(crypten_preprocessing=provider_preprocessing,
                               precomputed_provider_requests=len(provider_cache.requests),
@@ -374,7 +379,7 @@ def worker(rank, rendezvous, options):
                 "preprocessing_mode": ("precomputed_segmented" if segmented else "precomputed_strict") if provider_cache else "inline_instrumented" if options["inline_preprocessing_timing"] else "inline",
                 "offline_cache_storage": options["offline_cache"] if provider_cache else None,
                 "offline_host_limit_gib_per_rank": options["offline_host_limit_gib"] if budget else None,
-                "truncation_method": options["truncation"],
+                "truncation_method": options["truncation"], "operator_profiling": options["profile_operators"],
                 "truncation_note": "CrypTen operations only; Ring3 truncation is unchanged. Non-legacy modes use unreviewed secret share-wrap counting.",
                 "numeric_profile_details": numeric_profile_details(options["numeric_profile"], options["mu"]),
                 "mu": options["mu"], "max_abs_error_threshold": options["max_abs_error"], "records": records,
@@ -406,6 +411,7 @@ def main():
     parser.add_argument("--image", required=True, nargs="+", help="public benchmark image(s); only audit-only supports multiple")
     parser.add_argument("--output", required=True)
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--profile-operators", action="store_true", help="synchronized per-operator diagnostic; requires inline timing")
     parser.add_argument("--inline-preprocessing-timing", action="store_true", help="measure and subtract just-in-time provider and Ring3 time per party")
     parser.add_argument("--online-only", action="store_true",
                         help="precompute fresh provider and Ring3 materials before input sharing; strict replay may use substantial GPU memory")
@@ -427,6 +433,8 @@ def main():
     parser.add_argument("--numeric-profile", choices=("legacy", "wide-range"), default="legacy",
                         help="select legacy operators or the experimental wide-range implementations")
     args = parser.parse_args()
+    if args.profile_operators and not args.inline_preprocessing_timing:
+        parser.error("--profile-operators requires --inline-preprocessing-timing")
     if args.inline_preprocessing_timing and args.online_only:
         parser.error("--inline-preprocessing-timing cannot be combined with --online-only")
     if not math.isfinite(args.offline_host_limit_gib) or args.offline_host_limit_gib <= 0:

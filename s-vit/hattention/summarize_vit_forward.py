@@ -28,6 +28,7 @@ def summarize(label, path):
             "image_sha256": report["image_sha256"], "precision": report["precision"],
             "truncation_method": report.get("truncation_method", "unreported"),
             "preprocessing_mode": report.get("preprocessing_mode", "inline"),
+            "operator_profiling": report.get("operator_profiling", False),
             "offline_cache_storage": report.get("offline_cache_storage", "device" if report.get("preprocessing_mode") in ("precomputed_strict", "precomputed_segmented") else None),
             "crypten_preprocessing_seconds": (mean_at("crypten_preprocessing", "seconds_max")
                                                if report.get("preprocessing_mode") in ("precomputed_strict", "precomputed_segmented") else None),
@@ -69,6 +70,8 @@ def main():
     for key in ("backend", "world_size", "image_sha256"):
         if len({r[key] for r in results}) != 1:
             raise ValueError(f"reports have different {key}; comparison is not valid")
+    if len({r["operator_profiling"] for r in results}) != 1:
+        raise ValueError("reports differ in operator profiling; rerun under the same instrumentation")
     if len({r["preprocessing_mode"] for r in results}) != 1:
         raise ValueError("reports use different preprocessing modes; rerun under the same timing boundary")
     if results[0]["preprocessing_mode"] in ("precomputed_strict", "precomputed_segmented") and len({r["offline_cache_storage"] for r in results}) != 1:
