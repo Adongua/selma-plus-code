@@ -137,7 +137,7 @@ def _worker(rank, rendezvous):
                              CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256)).get_plain_text()
         if not torch.isfinite(output).all() or (output - approximate).abs().max() > 1.0:
             raise AssertionError(f"scaled full forward mismatch: {output} vs {approximate}")
-        for mode in ("experimental", "batched"):
+        for mode in ("experimental", "batched", "carry_save"):
             encrypted = crypten.cryptensor(image, src=0, precision=20)
             with experimental_truncation(mode):
                 output = reveal_exact(forward_vit(model, encrypted,

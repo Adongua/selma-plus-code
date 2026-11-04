@@ -1115,22 +1115,85 @@ standard full ViT benchmark accepts `--truncation experimental`; its default
 remains `legacy`, and the optimized ViT benchmark is unchanged. The prototype
 inherits CrypTen's preprocessing trust model, can incur small truncation error,
 uses much more memory and communication, and has not been independently
-reviewed for security or validated on CUDA or real-size ViT. Start with small
-`--elements`; a full forward may run out of memory. Neither mode establishes a
-security proof or a validated performance comparison.
+reviewed for security. The server's single-image CUDA ViT smoke run passed with
+`experimental`; this does not validate all inputs, new variants or security.
+Start with small `--elements`; a full forward may run out of memory.
 
 `--truncation batched` is another opt-in research variant. It retains the
 same arithmetic-share wrap count, but batches boolean overflow checks and
 converts overflow and sign bits together. It is not a published protocol
 implementation or a replacement for security review.
 `python -m hattention.benchmark_crypten_truncation` compares `legacy`,
-`experimental`, and `batched` on the same public mixed-sign Q2p-sized fixture.
+`experimental`, `batched`, and `carry_save` on the same public mixed-sign Q2p-sized fixture.
 Only the truncation call is timed: provider work is included; sharing, result
 opening and metric gathers are excluded. Warmups are recorded but excluded
 from timing summaries. The report includes maximum party time, estimated
 CrypTen bytes and rounds, GPU peak allocated memory, and raw integer errors.
 A run that misses rare legacy wrap errors does not prove correctness. Do not
 compare provider-inclusive timing with Ring3 online-only measurements.
+
+The opt-in `carry_save` variant replaces two serial 64-bit additions with a
+carry-save compression and one prefix addition. For unsigned share words
+`a,b,c`, set `s=a XOR b XOR c`, `m=(a AND b) XOR ((a XOR b) AND c)`, and
+`t=(m << 1) mod 2^64`. Since `a+b+c=s+2*m`, the signed wrap count is exactly
+
+```text
+theta = msb(m) + carry_out(s+t) + msb((s+t) mod 2^64)
+        - msb(a) - msb(b) - msb(c).
+```
+
+The two ANDs forming `m` are batched. The prefix circuit yields both the sum
+and carry-out, and three output bits are converted to arithmetic shares in
+one batch. Each party subtracts its own local input share's sign from its own
+arithmetic share of `theta`; these local signs are not sent or opened. The
+implementation reuses the bundled CrypTen private `circuit.__SPK_circuit` API,
+so updating CrypTen requires rerunning the boundary and full-ring tests.
+The existing local division and wrap correction are unchanged; small integer
+rounding errors remain, particularly for divisors that are not powers of two.
+This is an unreviewed research implementation, not a new security claim.
+
+Local three-party CPU/Gloo measurements (Q20, one warmup, five measured
+repetitions, same invocation per size) are below. Communication is the same
+CrypTen estimate used by the benchmark; these are not server CUDA timings.
+
+| Method | Rounds per party | Mean, 1,000 elements | Mean, 100,000 elements | Bytes, 100,000 elements |
+|---|---:|---:|---:|---:|
+| legacy | 2 | 0.363 ms | 3.784 ms | 3,200,000 |
+| experimental | 23 | 14.670 ms | 171.266 ms | 172,800,000 |
+| batched | 17 | 10.593 ms | 155.046 ms | 153,600,000 |
+| carry_save | 9 | 5.443 ms | 78.124 ms | 79,200,000 |
+
+All these records, including warmups, had raw error at most 2. Separate tests
+force legacy failures and cover signed overflow/underflow (including to zero),
+4096 high-bit triples against a Python-integer wrap oracle, random full-ring
+shares, scalar/non-contiguous tensors, multiple divisors and small Attention /
+ViT forwards. A passing public fixture is not a privacy or full-model accuracy
+test. The original modes and the default `legacy` remain available.
+
+Reproduce on the server with unused output directories:
+
+```bash
+export PYTHONPATH="$PWD/s-vit:$PWD/CrypTen-main/benchmarks"
+export OMP_NUM_THREADS=1
+
+for size in 1000 100000; do
+  CUDA_VISIBLE_DEVICES=1,2,3 timeout 3600 \
+  python -m hattention.benchmark_crypten_truncation \
+    --device cuda --precision-bits 20 \
+    --elements "$size" --repeats 5 \
+    --methods legacy experimental batched carry_save \
+    --output "$HOME/home/tmp/crypten-truncation-carry-save-${size}-v1" || break
+done
+```
+
+The independent stress diagnostic accepts `--mode carry_save`. After checking
+both signs and the attention-sized fixture, the standard ViT benchmark can
+use `--truncation carry_save` in place of `--truncation experimental`, retaining
+`--precision-bits 20 --sqrt-iters 7 --softmax scaled --reciprocal-scale 256
+--gelu chebyshev16 --chebyshev-bound 12` and the same image/checkpoint. Compare
+with the experimental run using the same timing boundary; a primitive speedup
+does not establish the full-forward speedup. The optimized Ring3 ViT and its
+preprocessing remain separate.
 
 Ring3's `sgelu.protocol.prob_trunc` uses different sharing and fresh correlated
 preprocessing, and requires reconstructed inputs in [-2^62, 2^62). It is not

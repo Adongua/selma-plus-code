@@ -17,7 +17,9 @@ def worker(rank, rendezvous):
     from crypten.mpc.primitives import beaver
     from crypten.mpc.primitives.arithmetic import ArithmeticSharedTensor
     from hattention.experimental_crypten_truncation import (batched_truncate, experimental_truncate,
-                                                             experimental_truncation)
+                                                          experimental_truncation, carry_save_truncate,
+                                                          _carry_save_wraps)
+    functions = (experimental_truncate, batched_truncate, carry_save_truncate)
 
     crypten.init()
     try:
@@ -42,7 +44,7 @@ def worker(rank, rendezvous):
                 legacy_diff = legacy - expected
                 if not (legacy_diff[:2].abs() > (1 << 40)).all():
                     raise AssertionError(f"fixture did not force both wraps: {legacy_diff}")
-                for function in (experimental_truncate, batched_truncate):
+                for function in functions:
                     corrected_diff = function(x.clone(), scale).reveal() - expected
                     if not (corrected_diff.abs() <= 10).all():
                         raise AssertionError(f"{function.__name__} failed for {scale}: {corrected_diff}")
@@ -60,7 +62,7 @@ def worker(rank, rendezvous):
         for divisor in (2, 192, 1 << 17, 1 << 20, 1 << 62):
             shared = ArithmeticSharedTensor.from_shares(party_shares[rank].clone(), precision=0)
             expected = torch.div(raw, divisor, rounding_mode="trunc")
-            for function in (experimental_truncate, batched_truncate):
+            for function in functions:
                 result = function(shared.clone(), divisor).reveal()
                 if not ((result - expected).abs() <= 10).all():
                     raise AssertionError(f"{function.__name__} boundary failed for {divisor}: {result}, expected {expected}")
@@ -72,11 +74,39 @@ def worker(rank, rendezvous):
         random_raw = random_shares[0] + random_shares[1] + random_shares[2]
         for divisor in (192, 1 << 17, 1 << 20):
             expected = torch.div(random_raw, divisor, rounding_mode="trunc")
-            for function in (experimental_truncate, batched_truncate):
+            for function in functions:
                 shared = ArithmeticSharedTensor.from_shares(random_shares[rank].clone(), precision=0)
                 delta = function(shared, divisor).reveal() - expected
                 if ((delta > 10) | (delta < -10)).any():
                     raise AssertionError(f"{function.__name__} random-ring failure at divisor {divisor}")
+
+        # Independent Python-integer oracle for signed wrap counts. Exhaust all
+        # 4-bit signed triples shifted to the top of the 64-bit word, plus full-
+        # ring random shares (which also exercise carries through the low bits).
+        grid = torch.cartesian_prod(*[torch.arange(-8, 8, dtype=torch.long)] * 3) * (1 << 60)
+        edges = torch.tensor([minimum, minimum + 1, -1, 0, 1, maximum - 1, maximum])
+        for matrix in (grid, torch.cartesian_prod(edges, edges, edges),
+                       torch.stack(random_shares, 1)):
+            expected_wraps = torch.tensor([(sum(row) + (1 << 63)) // (1 << 64)
+                                           for row in matrix.tolist()], dtype=torch.long)
+            shared = ArithmeticSharedTensor.from_shares(matrix[:, rank].clone(), precision=0)
+            before = shared.share.clone()
+            actual_wraps = _carry_save_wraps(shared).reveal()
+            if not torch.equal(actual_wraps, expected_wraps):
+                raise AssertionError("carry-save wrap count differs from Python integer oracle")
+            if not torch.equal(shared.share, before):
+                raise AssertionError("wrap counting modified the input share")
+
+        # Scalar and non-contiguous multidimensional shares retain their shape
+        # and encoder; neither reshaping nor a matrix-only protocol is required.
+        for shares in ([s[0] for s in random_shares],
+                       [s.reshape(2, 4, 32).transpose(0, 2) for s in random_shares]):
+            raw = shares[0] + shares[1] + shares[2]
+            shared = ArithmeticSharedTensor.from_shares(shares[rank].clone(), precision=20)
+            result = carry_save_truncate(shared, 1 << 20)
+            delta = result.reveal() - torch.div(raw, 1 << 20, rounding_mode="trunc")
+            if result is not shared or result.encoder.scale != (1 << 20) or delta.abs().max() > 4:
+                raise AssertionError("carry-save shape/encoder/rounding regression")
 
         # Exercise multiplication and an end-to-end softmax attention expression.
         from hattention.benchmark_vit_native_cuda import scaled_standard_attention
@@ -87,13 +117,20 @@ def worker(rank, rendezvous):
         secret = [crypten.cryptensor(t, src=0, precision=20) for t in (q, k, v)]
         old_truncate = beaver.truncate
         expected = torch.softmax(q.matmul(k.transpose(-2, -1)) * 2**-0.5, -1).matmul(v)
-        for mode in ("experimental", "batched"):
+        for mode in ("experimental", "batched", "carry_save"):
             with experimental_truncation(mode):
                 out = reveal_exact(scaled_standard_attention(*secret, 2))
             if beaver.truncate is not old_truncate:
                 raise AssertionError("experimental protocol was not restored")
             if not torch.isfinite(out).all() or (out - expected).abs().max() > 0.03:
                 raise AssertionError(f"{mode} attention mismatch: {out} vs {expected}")
+        try:
+            with experimental_truncation("carry_save"):
+                raise RuntimeError("test context cleanup")
+        except RuntimeError:
+            pass
+        if beaver.truncate is not old_truncate:
+            raise AssertionError("protocol was not restored on exception")
     finally:
         crypten.uninit()
 

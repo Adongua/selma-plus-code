@@ -13,9 +13,11 @@ def experimental_truncation(mode="experimental"):
     from crypten.mpc.primitives import beaver
 
     original = beaver.truncate
-    if mode not in ("experimental", "batched"):
+    methods = {"experimental": experimental_truncate, "batched": batched_truncate,
+               "carry_save": carry_save_truncate}
+    if mode not in methods:
         raise ValueError("unknown experimental truncation mode")
-    beaver.truncate = experimental_truncate if mode == "experimental" else batched_truncate
+    beaver.truncate = methods[mode]
     try:
         yield
     finally:
@@ -36,18 +38,79 @@ def batched_truncate(x, divisor):
     return _truncate(x, divisor, batched=True)
 
 
-def _truncate(x, divisor, *, batched):
+def carry_save_truncate(x, divisor):
+    """Count three-party wraps with one carry-save and one prefix addition.
+
+    Opt-in research variant; uses CrypTen's existing Boolean AND, prefix carry,
+    and masked B2A conversion. No input, output, sign or wrap bit is opened here.
+    """
+    _validate(divisor)
+    if divisor == 1:
+        return x
+    theta = _carry_save_wraps(x)
+    return _correct(x, divisor, theta)
+
+
+def _carry_save_wraps(x):
+    """Return arithmetic shares of (sum(signed shares) - signed value) / 2**64.
+
+    For unsigned words a,b,c, let s=a XOR b XOR c and m=majority(a,b,c).
+    Their integer sum is s+2*m. With t=(2*m) mod 2**64, unsigned wraps are
+    msb(m)+carry_out(s+t). Signed wraps additionally add msb(s+t) and subtract
+    the three input sign bits. Each party subtracts its own LOCAL share's sign
+    directly from its arithmetic share of theta, without converting or opening
+    these three bits. The result is exact even at signed int64 boundaries.
+    """
+    from crypten.mpc.primitives import beaver, circuit
+    from crypten.mpc.primitives.binary import BinarySharedTensor
+
+    a, b, c = [BinarySharedTensor(x.share, src=i) for i in range(3)]
+    ab = a ^ b
+    # The two products are disjoint, so XOR implements their OR. Batch both
+    # independent ANDs in one round instead of propagating a first 64-bit carry.
+    products = BinarySharedTensor.stack([a, ab]) & BinarySharedTensor.stack([b, c])
+    majority = products[0] ^ products[1]
+    xor_sum = ab ^ c
+    del a, b, c, ab, products
+    shifted = majority << 1
+    propagate = xor_sum ^ shifted
+    # Reuse the bundled adder's prefix carry, retaining its bit-63 carry-out.
+    # This private CrypTen API is covered by full-ring and boundary tests.
+    carry, _ = circuit.__SPK_circuit(xor_sum & shifted, propagate)
+    total = propagate ^ (carry << 1)
+    binary_bits = BinarySharedTensor.stack([(majority >> 63) & 1,
+                                            (carry >> 63) & 1,
+                                            (total >> 63) & 1])
+    theta = beaver.B2A_single_bit(binary_bits).sum(0)
+    theta.share -= (x.share >> 63) & 1
+    return theta
+
+
+def _validate(divisor):
     import crypten
     import crypten.communicator as comm
-    from crypten.mpc.primitives import beaver
-    from crypten.mpc.primitives.binary import BinarySharedTensor
 
     if not isinstance(divisor, int) or isinstance(divisor, bool) or not 1 <= divisor <= 2**62:
         raise ValueError("experimental truncation requires a scalar integer divisor in [1, 2**62]")
+    if divisor != 1 and (comm.get().get_world_size() != 3 or crypten.cfg.mpc.protocol != "beaver"):
+        raise ValueError("experimental truncation requires three-party Beaver sharing")
+
+
+def _correct(x, divisor, theta):
+    # Keep the previous variants' local signed division and rounding behavior.
+    x.share = x.share.div_(divisor, rounding_mode="trunc")
+    correction = theta * 4 * (int(2**62) // divisor)
+    x.share -= correction.share
+    return x
+
+
+def _truncate(x, divisor, *, batched):
+    from crypten.mpc.primitives import beaver
+    from crypten.mpc.primitives.binary import BinarySharedTensor
+
+    _validate(divisor)
     if divisor == 1:
         return x
-    if comm.get().get_world_size() != 3 or crypten.cfg.mpc.protocol != "beaver":
-        raise ValueError("experimental truncation requires three-party Beaver sharing")
     # Convert each party's own additive share to XOR sharing, then securely add
     # the three shares. Signed overflow is determined solely by input/output
     # signs, including the edge case -2**63 + -2**63 == 0 modulo 2**64.
@@ -75,7 +138,4 @@ def _truncate(x, divisor, *, batched):
     else:
         bits = beaver.B2A_single_bit(BinarySharedTensor.stack(overflow_bits))
         theta = bits[0] - bits[1] + bits[2] - bits[3]
-    x.share = x.share.div_(divisor, rounding_mode="trunc")
-    correction = theta * 4 * (int(2**62) // divisor)
-    x.share -= correction.share
-    return x
+    return _correct(x, divisor, theta)

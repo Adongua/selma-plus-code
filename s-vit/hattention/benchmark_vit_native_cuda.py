@@ -193,7 +193,7 @@ def worker(rank, rendezvous, options):
                       "method": f"CrypTen softmax ({options['softmax']}), {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
                       "softmax_method": options["softmax"],
                       "truncation_method": options["truncation"],
-                      "truncation_note": "experimental uses unreviewed secret share-wrap counting; not CrypTen native or security validated",
+                      "truncation_note": "non-legacy modes use unreviewed secret share-wrap counting; not CrypTen native or security validated",
                       "reciprocal_scale": options["reciprocal_scale"] if options["softmax"] == "scaled" else None,
                       "softmax_note": "scaled is a CrypTen adaptation using 1/(d/S)/S; native uses CrypTen softmax unchanged",
                       "gelu_method": options["gelu"], "public_chebyshev_range_audit": cheb_audit,
@@ -229,7 +229,7 @@ def main():
     parser.add_argument("--precision-bits", type=int, default=20, choices=(17, 20))
     parser.add_argument("--sqrt-iters", type=int, help="override CrypTen inverse-square-root iterations")
     parser.add_argument("--softmax", choices=("native", "scaled"), default="native")
-    parser.add_argument("--truncation", choices=("legacy", "experimental", "batched"), default="legacy",
+    parser.add_argument("--truncation", choices=("legacy", "experimental", "batched", "carry_save"), default="legacy",
                         help="experimental binary share-wrap counting is unreviewed and memory intensive")
     parser.add_argument("--reciprocal-scale", type=int, default=256,
                         help="public power-of-two scale used by adapted softmax")

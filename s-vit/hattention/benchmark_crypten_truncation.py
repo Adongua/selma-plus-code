@@ -20,7 +20,8 @@ def worker(rank, rendezvous, options):
                       DISTRIBUTED_BACKEND="gloo")
     import crypten
     from crypten.mpc.primitives import beaver
-    from .experimental_crypten_truncation import experimental_truncate, batched_truncate
+    from .experimental_crypten_truncation import (experimental_truncate, batched_truncate,
+                                                 carry_save_truncate)
 
     crypten.cfg.encoder.precision_bits = options["precision_bits"]
     crypten.init(device=device)
@@ -31,7 +32,7 @@ def worker(rank, rendezvous, options):
         idx = torch.arange(options["elements"], dtype=torch.int64, device=device)
         fixture = torch.where(idx % 2 == 0, float(scale), -float(scale)).to(torch.float64)
         methods = {"legacy": beaver.truncate, "experimental": experimental_truncate,
-                   "batched": batched_truncate}
+                   "batched": batched_truncate, "carry_save": carry_save_truncate}
         records = []
         for method in options["methods"]:
             for iteration in range(options["repeats"] + 1):
@@ -101,8 +102,8 @@ def main():
     parser.add_argument("--precision-bits", choices=(17, 20), type=int, default=20)
     parser.add_argument("--elements", type=int, default=1000)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--methods", choices=("legacy", "experimental", "batched"), nargs="+",
-                        default=("legacy", "experimental", "batched"))
+    parser.add_argument("--methods", choices=("legacy", "experimental", "batched", "carry_save"), nargs="+",
+                        default=("legacy", "experimental", "batched", "carry_save"))
     args = parser.parse_args()
     if args.elements < 1 or args.repeats < 1 or len(set(args.methods)) != len(args.methods):
         parser.error("elements and repeats must be positive and methods must not repeat")

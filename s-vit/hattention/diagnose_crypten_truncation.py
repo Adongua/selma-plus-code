@@ -32,9 +32,10 @@ def worker(rank, rendezvous, options):
             secret = crypten.cryptensor(fixture, src=0, precision=options["precision_bits"], device=device)
             raw_before = secret.reveal()
             raw_before = raw_before.tensor() if hasattr(raw_before, "tensor") else raw_before
-            if options["mode"] in ("experimental", "batched"):
-                from .experimental_crypten_truncation import experimental_truncate, batched_truncate
-                (experimental_truncate if options["mode"] == "experimental" else batched_truncate)(secret._tensor, scale)
+            if options["mode"] != "legacy":
+                from .experimental_crypten_truncation import experimental_truncation
+                with experimental_truncation(options["mode"]):
+                    secret._tensor.div_(scale)
             else:
                 secret._tensor.div_(scale)
             opened = secret.reveal()
@@ -78,7 +79,7 @@ def main():
     parser.add_argument("--elements", type=int, default=1000000)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--sign", type=int, choices=(-1, 1), default=1)
-    parser.add_argument("--mode", choices=("legacy", "experimental", "batched"), default="legacy",
+    parser.add_argument("--mode", choices=("legacy", "experimental", "batched", "carry_save"), default="legacy",
                         help="experimental uses unreviewed secret wrap correction and is much more expensive")
     args = parser.parse_args()
     if args.elements < 1 or args.repeats < 1:
