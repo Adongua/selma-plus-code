@@ -13,6 +13,7 @@ from hattention.benchmark_vit_native_cuda import (AuditedPlainOperators, CrypTen
 from hattention.diagnose_vit_native_attention import open_exact, trace_attention
 from hattention.exact_decode import reveal_exact
 from hattention.experimental_crypten_truncation import experimental_truncation
+from hattention.offline_materials import StrictProviderCache
 from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
@@ -144,6 +145,36 @@ def _worker(rank, rendezvous):
                                       CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256)))
             if not torch.isfinite(output).all() or (output - approximate).abs().max() > 1.0:
                 raise AssertionError(f"{mode} full forward mismatch: {output} vs {approximate}")
+        # Trace the public-shape call sequence, then execute two fresh,
+        # strictly precomputed full forwards. A miss or reuse must fail closed.
+        cache = StrictProviderCache(crypten)
+        cache.install()
+        try:
+            encrypted = crypten.cryptensor(image, src=0, precision=20)
+            cache.begin_trace()
+            with experimental_truncation("carry_save"):
+                traced_output = reveal_exact(forward_vit(model, encrypted,
+                    CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256)))
+            cache.end_trace()
+            if not cache.requests or not torch.isfinite(traced_output).all():
+                raise AssertionError("provider trace did not capture a valid forward")
+            for _ in range(2):
+                cache.prepare()
+                cache.begin_replay()
+                with experimental_truncation("carry_save"):
+                    output = reveal_exact(forward_vit(model, encrypted,
+                        CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256)))
+                cache.end_replay()
+                if not torch.isfinite(output).all() or (output - approximate).abs().max() > 1.0:
+                    raise AssertionError("precomputed provider full forward mismatch")
+            try:
+                cache.begin_replay()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("consumed materials were accepted a second time")
+        finally:
+            cache.close()
     finally:
         crypten.uninit()
 

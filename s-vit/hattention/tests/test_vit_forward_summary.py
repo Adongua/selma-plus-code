@@ -1,9 +1,12 @@
 import json
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from hattention.summarize_vit_forward import summarize
+from hattention.summarize_vit_forward import main, summarize
 
 
 class ForwardSummaryTests(unittest.TestCase):
@@ -34,6 +37,22 @@ class ForwardSummaryTests(unittest.TestCase):
             result = summarize("native", path)
             self.assertIsNone(result["ring_preprocessing_seconds"])
             self.assertEqual(result["forward_excluding_ring_preprocessing_seconds"], 270)
+            self.assertIsNone(result["crypten_preprocessing_seconds"])
+
+            # A strict precomputed report exposes provider preparation
+            # separately while retaining the actual measured online forward.
+            row["crypten_preprocessing"] = phase(42, 100)
+            path.write_text(json.dumps({**base, "preprocessing_mode": "precomputed_strict", "records": [row]}))
+            result = summarize("native-online", path)
+            self.assertEqual(result["preprocessing_mode"], "precomputed_strict")
+            self.assertEqual(result["crypten_preprocessing_seconds"], 42)
+            self.assertEqual(result["forward_wall_seconds"], 270)
+            out = Path(directory) / "summary"
+            with patch("sys.argv", ["summary", "--report", f"baseline={path}", "--output", str(out)]), redirect_stdout(io.StringIO()):
+                main()
+            table = (out / "comparison.md").read_text()
+            self.assertIn("Online forward (s)", table)
+            self.assertNotIn("Ring prep (s)", table)
 
 
 if __name__ == "__main__":

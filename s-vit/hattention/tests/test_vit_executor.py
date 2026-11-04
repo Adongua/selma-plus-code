@@ -18,6 +18,7 @@ from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
 from hattention.vit_executor import PlainOperators, forward_vit
 from hattention.vit_integration import make_fixed_student
+from hattention.offline_materials import StrictProviderCache, StrictRingCache
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -66,7 +67,7 @@ def _crypten_worker(rank, rendezvous):
         base = Ring3()
         secure = SecureOperators.__new__(SecureOperators)
         secure.base, secure.wide, secure.mu = base, Ring3Wide(base), 1.4621998268680836
-        secure.prepare = lambda fn: fn()
+        secure.prepare = lambda fn, key=None: fn()
         secure.wrap = lambda share: MPCTensor.from_shares(share, precision=17)
         original_truncate = beaver.truncate
         for profile, truncation in (("legacy", "legacy"), ("wide-range", "legacy"),
@@ -89,6 +90,33 @@ def _crypten_worker(rank, rendezvous):
                 raise AssertionError("incorrect diagnostic site order")
             if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
                 raise AssertionError(f"{profile}/{truncation} encrypted full forward mismatch: {out} vs {plain}")
+        provider_cache, ring_cache = StrictProviderCache(crypten), StrictRingCache()
+        provider_cache.install()
+        secure.numeric_profile = "wide-range"
+        secure.prepare = lambda fn, key=None: ring_cache.request(key, fn)
+        try:
+            encrypted = crypten.cryptensor(image, src=0, precision=17)
+            provider_cache.begin_trace()
+            ring_cache.begin_trace()
+            with experimental_truncation("carry_save"):
+                traced = forward_vit(model, encrypted, secure).get_plain_text()
+            provider_cache.end_trace()
+            ring_cache.end_trace()
+            if not provider_cache.requests or not ring_cache.requests or not torch.isfinite(traced).all():
+                raise AssertionError("offline trace missed provider or Ring3 requests")
+            for _ in range(2):
+                provider_cache.prepare()
+                ring_cache.prepare()
+                provider_cache.begin_replay()
+                ring_cache.begin_replay()
+                with experimental_truncation("carry_save"):
+                    out = forward_vit(model, encrypted, secure).get_plain_text()
+                provider_cache.end_replay()
+                ring_cache.end_replay()
+                if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
+                    raise AssertionError("precomputed mixed full forward mismatch")
+        finally:
+            provider_cache.close()
     finally:
         crypten.uninit()
 

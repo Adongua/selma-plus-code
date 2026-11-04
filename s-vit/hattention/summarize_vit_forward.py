@@ -18,6 +18,9 @@ def summarize(label, path):
             "backend": report["backend"], "world_size": report["world_size"],
             "image_sha256": report["image_sha256"], "precision": report["precision"],
             "truncation_method": report.get("truncation_method", "unreported"),
+            "preprocessing_mode": report.get("preprocessing_mode", "inline"),
+            "crypten_preprocessing_seconds": (mean_at("crypten_preprocessing", "seconds_max")
+                                               if report.get("preprocessing_mode") == "precomputed_strict" else None),
             "repeats": len(rows), "forward_wall_seconds": mean_at("forward_wall", "seconds_max"),
             "ring_preprocessing_seconds": None if native else mean_at("ring_preprocessing", "seconds_max"),
             "forward_excluding_ring_preprocessing_seconds": mean_at(
@@ -50,27 +53,42 @@ def main():
     for key in ("backend", "world_size", "image_sha256"):
         if len({r[key] for r in results}) != 1:
             raise ValueError(f"reports have different {key}; comparison is not valid")
+    if len({r["preprocessing_mode"] for r in results}) != 1:
+        raise ValueError("reports mix inline and precomputed preprocessing; rerun under the same timing boundary")
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
+    strict = results[0]["preprocessing_mode"] == "precomputed_strict"
     note = ("Mean of measured repetitions; maximum elapsed time across parties per repetition. "
-            "Input sharing and output reconstruction excluded. CrypTen provider work is included "
-            "in forward; Ring3 preparation is separately counted. Communication counters, "
-            "precision, and correctness-gate references may differ; results with failed numerical checks are diagnostic only. "
-            "Full wall time includes just-in-time Ring3 preparation and CrypTen provider work; "
-            "forward excluding Ring3 preparation still includes CrypTen provider work.")
+            "Input sharing and output reconstruction excluded. " +
+            ("Fresh CrypTen provider and Ring3 materials were prepared before sharing and replayed once; "
+             "forward wall is measured after explicit material preparation. Local random generation and "
+             "other runtime setup in the forward remain online; no security validation is implied. "
+             if strict else
+             "CrypTen provider work is included in forward; Ring3 preparation is separately counted. "
+             "Full wall includes just-in-time Ring3 preparation, and forward excluding Ring3 preparation "
+             "still includes CrypTen provider work. ") +
+            "Communication counters, precision, and correctness-gate references may differ; "
+            "results with failed numerical checks are diagnostic only.")
     report = {"scope": "full ViTLite forward", "note": note, "results": results}
     (out / "comparison.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-    header = ["# Full ViT forward comparison", "", note, "",
-              "| Method | Status | Precision | CrypTen truncation | Forward wall (s) | Ring prep (s) | Forward excl. Ring prep (s) | CrypTen comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
-              "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+    header = ["# Full ViT forward comparison", "", note, ""]
+    if strict:
+        header.extend(["| Method | Status | Precision | CrypTen truncation | Online forward (s) | CrypTen online comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
+                       "|---|---|---|---|---:|---:|---:|---:|---:|"])
+    else:
+        header.extend(["| Method | Status | Precision | CrypTen truncation | Forward wall (s) | CrypTen prep (s) | Ring prep (s) | Forward excl. Ring prep (s) | CrypTen comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
+                       "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"])
     fmt = lambda x: "—" if x is None else f"{x:.3f}"
     for r in results:
-        header.append(f"| {r['label']} | {r['status']} | {r['precision']} | {r['truncation_method']} | "
-                      f"{fmt(r['forward_wall_seconds'])} | {fmt(r['ring_preprocessing_seconds'])} | "
-                      f"{fmt(r['forward_excluding_ring_preprocessing_seconds'])} | "
-                      f"{fmt(r['crypten_system_bytes'] / 2**20)} | "
-                      f"{fmt(None if r['online_ring_sent_bytes'] is None else r['online_ring_sent_bytes'] / 2**20)} | "
-                      f"{fmt(r['max_logit_error'])} | {fmt(r['max_own_formula_logit_error'])} |")
+        line = (f"| {r['label']} | {r['status']} | {r['precision']} | {r['truncation_method']} | "
+                f"{fmt(r['forward_wall_seconds'])} | ")
+        if not strict:
+            line += (f"{fmt(r['crypten_preprocessing_seconds'])} | {fmt(r['ring_preprocessing_seconds'])} | "
+                     f"{fmt(r['forward_excluding_ring_preprocessing_seconds'])} | ")
+        line += (f"{fmt(r['crypten_system_bytes'] / 2**20)} | "
+                 f"{fmt(None if r['online_ring_sent_bytes'] is None else r['online_ring_sent_bytes'] / 2**20)} | "
+                 f"{fmt(r['max_logit_error'])} | {fmt(r['max_own_formula_logit_error'])} |")
+        header.append(line)
     text = "\n".join(header) + "\n"
     (out / "comparison.md").write_text(text)
     print(text, end="")

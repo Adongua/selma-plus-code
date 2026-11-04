@@ -26,9 +26,10 @@ from sgelu.protocol import prepare_g2, ruler_g2
 from sgelu.wide_range import WideGeLUProfile, prepare_wide_gelu, wide_gelu
 from slayernorm.protocol import Profile as LNProfile, prepare as prepare_ln, layernorm
 from slayernorm.wide_range import WideLayerNormProfile, prepare_wide_layernorm, wide_layernorm
-from slayernorm.benchmark_crypten_cuda import _aggregate, _barrier, _crypten_measure, _plain
+from slayernorm.benchmark_crypten_cuda import _aggregate, _barrier, _crypten_measure, _plain, _ring_measure
 from .config import HAttentionConfig
 from .experimental_crypten_truncation import experimental_truncation
+from .offline_materials import StrictProviderCache, StrictRingCache
 from .hybrid import prepare_hybrid, secure_hybrid
 from .hybrid_wide_range import prepare_wide_hybrid, secure_wide_hybrid
 from .reference import rsa_attention
@@ -138,20 +139,24 @@ def audit_public_fixture(model, image, numeric_profile="legacy"):
 
 
 class SecureOperators:
-    def __init__(self, base, wide, mu, numeric_profile="legacy"):
+    def __init__(self, base, wide, mu, numeric_profile="legacy", ring_cache=None):
         from crypten.cuda import CUDALongTensor
         from crypten.mpc import MPCTensor
         self.base, self.wide, self.mu = base, wide, mu
         self.numeric_profile = numeric_profile
+        self.ring_cache = ring_cache
         self.cuda_tensor, self.mpc_tensor = CUDALongTensor, MPCTensor
         self.offline_seconds = 0.0
         self.offline_bytes = 0
         self.offline_phases = 0
 
-    def prepare(self, fn):
+    def prepare(self, fn, key=None):
+        cache = getattr(self, "ring_cache", None)
+        if cache and cache.mode == "replay":
+            return cache.request(key, fn)
         torch.cuda.synchronize(self.base.device)
         start, sent, phases = time.perf_counter(), self.base.sent_bytes, self.base.phases
-        result = fn()
+        result = cache.request(key, fn) if cache else fn()
         torch.cuda.synchronize(self.base.device)
         self.offline_seconds += time.perf_counter() - start
         self.offline_bytes += self.base.sent_bytes - sent
@@ -180,7 +185,9 @@ class SecureOperators:
         profile = WideLayerNormProfile(epsilon=layer.eps) if wide_range else LNProfile(epsilon=layer.eps)
         prepare_fn = prepare_wide_layernorm if wide_range else prepare_ln
         function = wide_layernorm if wide_range else layernorm
-        material = self.prepare(lambda: prepare_fn(self.base, self.wide, tuple(x.shape), profile))
+        shape = tuple(x.shape)
+        factory = lambda shape=shape, profile=profile, fn=prepare_fn, base=self.base, wide=self.wide: fn(base, wide, shape, profile)
+        material = self.prepare(factory, ("norm", shape, self.numeric_profile, layer.eps))
         gamma = self.base.public(torch.round(layer.weight.detach() * (1 << 17)).long())
         beta = self.base.public(torch.round(layer.bias.detach() * (1 << 17)).long())
         return self.wrap(function(self.base, self.wide, x.share.data, gamma, beta, material))
@@ -188,9 +195,13 @@ class SecureOperators:
     def gelu(self, x):
         if getattr(self, "numeric_profile", "legacy") == "wide-range":
             profile = WideGeLUProfile(mu=self.mu)
-            material = self.prepare(lambda: prepare_wide_gelu(self.base, self.wide, tuple(x.shape), profile))
+            shape = tuple(x.shape)
+            factory = lambda shape=shape, profile=profile, base=self.base, wide=self.wide: prepare_wide_gelu(base, wide, shape, profile)
+            material = self.prepare(factory, ("gelu", shape, "wide-range", self.mu))
             return self.wrap(wide_gelu(self.base, self.wide, x.share.data, material))
-        material = self.prepare(lambda: prepare_g2(self.base, self.wide, tuple(x.shape), self.mu))
+        shape = tuple(x.shape)
+        factory = lambda shape=shape, mu=self.mu, base=self.base, wide=self.wide: prepare_g2(base, wide, shape, mu)
+        material = self.prepare(factory, ("gelu", shape, "legacy", self.mu))
         return self.wrap(ruler_g2(self.base, self.wide, x.share.data, material))
 
     def attention(self, q, k, v, module):
@@ -201,8 +212,10 @@ class SecureOperators:
         wide_range = getattr(self, "numeric_profile", "legacy") == "wide-range"
         prepare_fn = prepare_wide_hybrid if wide_range else prepare_hybrid
         function = secure_wide_hybrid if wide_range else secure_hybrid
-        material = self.prepare(lambda: prepare_fn(self.base, self.wide, tuple(q.shape),
-                                config.head_types, rho=config.resolved_rho(q.shape[-1])))
+        shape, paths = tuple(q.shape), tuple(config.head_types)
+        rho = config.resolved_rho(q.shape[-1])
+        factory = lambda shape=shape, paths=paths, rho=rho, fn=prepare_fn, base=self.base, wide=self.wide: fn(base, wide, shape, paths, rho=rho)
+        material = self.prepare(factory, ("attention", shape, self.numeric_profile, paths, rho))
         result = function(self.base, self.wide, q.share.data, k.share.data, v.share.data,
                           material, patch_grid=config.patch_grid, has_cls_token=config.has_cls_token)
         return self.wrap(result)
@@ -217,6 +230,10 @@ def worker(rank, rendezvous, options):
     crypten.cfg.encoder.precision_bits = 17
     crypten.init(device=device)
     crypten.cfg.communicator.verbose = True
+    provider_cache = StrictProviderCache(crypten) if options["online_only"] else None
+    ring_cache = StrictRingCache() if options["online_only"] else None
+    if provider_cache:
+        provider_cache.install()
     try:
         model, meta = load_model(options["checkpoint"], options["mpcvit_root"], options["fixed_student"])
         model = model.to(device).eval()
@@ -231,10 +248,21 @@ def worker(rank, rendezvous, options):
         wide = CudaRing3Wide(base)
         records = []
         for iteration in range(options["repeats"] + 1):
+            provider_preprocessing = ring_precomputed = None
+            if provider_cache and iteration:
+                _, provider_preprocessing = _crypten_measure(device, crypten, provider_cache.prepare)
+                _, ring_precomputed = _ring_measure(device, base, ring_cache.prepare)
             shared, sharing = _crypten_measure(device, crypten, lambda: crypten.cryptensor(
                 image, src=0, precision=17, device=device))
+            if provider_cache:
+                if iteration == 0:
+                    provider_cache.begin_trace()
+                    ring_cache.begin_trace()
+                else:
+                    provider_cache.begin_replay()
+                    ring_cache.begin_replay()
             torch.cuda.reset_peak_memory_stats(device)
-            ops = SecureOperators(base, wide, options["mu"], options["numeric_profile"])
+            ops = SecureOperators(base, wide, options["mu"], options["numeric_profile"], ring_cache)
             _barrier(device)
             crypten.reset_communication_stats()
             torch.cuda.synchronize(device)
@@ -249,6 +277,13 @@ def worker(rank, rendezvous, options):
                 output = forward_vit(model, shared, ops, on_layer=progress)
             torch.cuda.synchronize(device)
             wall = time.perf_counter() - start
+            if provider_cache:
+                if iteration == 0:
+                    provider_cache.end_trace()
+                    ring_cache.end_trace()
+                else:
+                    provider_cache.end_replay()
+                    ring_cache.end_replay()
             stats = crypten.communicator.get().get_communication_stats()
             crypto = _aggregate(device, 0, stats, bidirectional_counter=True)
             ring = _aggregate(device, wall, {"bytes": base.sent_bytes - sent,
@@ -267,7 +302,7 @@ def worker(rank, rendezvous, options):
             peaks = [torch.zeros_like(peak) for _ in range(3)]
             dist.all_gather(peaks, peak)
             record = {"warmup": iteration == 0, "input_sharing": sharing,
-                      "forward_wall": ring, "ring_preprocessing": offline,
+                      "forward_wall": ring, "ring_preprocessing": ring_precomputed if ring_precomputed else offline,
                       "online_ring_excluding_preprocessing": online,
                       "online_crypten": crypto, "output_reconstruction": reconstruction,
                       "peak_allocated_bytes_per_rank": [int(p.item()) for p in peaks],
@@ -276,6 +311,10 @@ def worker(rank, rendezvous, options):
                           "max_abs": float(diff.max()) if finite else None,
                           "plaintext_top1": int(reference.argmax(-1).item()),
                           "secure_top1": int(actual.argmax(-1).item()) if finite else None}}
+            if provider_cache:
+                record.update(crypten_preprocessing=provider_preprocessing,
+                              precomputed_provider_requests=len(provider_cache.requests),
+                              precomputed_ring_requests=len(ring_cache.requests))
             if rank == 0:
                 records.append(record)
                 print(json.dumps({"event": "iteration_complete", "record": record}), flush=True)
@@ -292,13 +331,15 @@ def worker(rank, rendezvous, options):
                 "image_sha256": file_sha256(options["image"][0]), "repeats": options["repeats"],
                 "public_fixture_range_audit": observations,
                 "precision": "Q17", "numeric_profile": options["numeric_profile"],
+                "preprocessing_mode": "precomputed_strict" if provider_cache else "inline",
                 "truncation_method": options["truncation"],
                 "truncation_note": "CrypTen operations only; Ring3 truncation is unchanged. Non-legacy modes use unreviewed secret share-wrap counting.",
                 "numeric_profile_details": numeric_profile_details(options["numeric_profile"], options["mu"]),
                 "mu": options["mu"], "max_abs_error_threshold": options["max_abs_error"], "records": records,
                 "correctness_gate": "public fixture within declared profile; all iterations including warmup must meet max error against this fixed student's plaintext logits",
                 "crypten_import": crypten.__file__, "python": platform.python_version(), "torch": torch.__version__,
-                "timing_note": "forward wall includes just-in-time preprocessing; online time subtracts local preprocessing before rank maximum; CrypTen provider work remains online; sync instrumentation included",
+                "timing_note": ("Fresh traced CrypTen provider and Ring3 materials prepared before input sharing and consumed with strict single-use replay; forward wall is online."
+                                if provider_cache else "forward wall includes just-in-time preprocessing; online time subtracts local preprocessing before rank maximum; CrypTen provider work remains online; sync instrumentation included"),
                 "communication_note": "Ring3 sent payloads and CrypTen bidirectional logs/2 are separate; counters are not equivalent protocol rounds",
                 "numerics_note": "sLayerNorm and sGeLU approximate the trained LayerNorm and GeLU; RSA uses sReLU and bounded reciprocal; secret ranges are unchecked",
                 "security_note": "Ruler openings and CUDA PRG are not privacy validated; baseline is sReLU-adapted MPCViT, not the original ReLU protocol"}
@@ -309,6 +350,8 @@ def worker(rank, rendezvous, options):
                 f.write("\n")
             print(json.dumps({"report": str(out / "comparison.json"), "status": report["status"]}), flush=True)
     finally:
+        if provider_cache:
+            provider_cache.close()
         crypten.uninit()
 
 
@@ -320,6 +363,8 @@ def main():
     parser.add_argument("--image", required=True, nargs="+", help="public benchmark image(s); only audit-only supports multiple")
     parser.add_argument("--output", required=True)
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--online-only", action="store_true",
+                        help="precompute fresh provider and Ring3 materials before input sharing; strict replay may use substantial GPU memory")
     parser.add_argument("--truncation", choices=("legacy", "experimental", "batched", "carry_save"),
                         default="legacy", help="CrypTen truncation for public-weight linear operations")
     parser.add_argument("--mu", type=float, default=1.4621998268680836)

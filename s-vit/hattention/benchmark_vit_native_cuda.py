@@ -25,6 +25,7 @@ from .student_checkpoint import file_sha256
 from .vit_executor import PlainOperators, forward_vit
 from .exact_decode import reveal_exact
 from .experimental_crypten_truncation import experimental_truncation
+from .offline_materials import StrictProviderCache
 
 
 class PlainStandardOperators(PlainOperators):
@@ -121,6 +122,9 @@ def worker(rank, rendezvous, options):
         crypten.cfg.functions.sqrt_nr_iters = options["sqrt_iters"]
     crypten.init(device=device)
     crypten.cfg.communicator.verbose = True
+    material_cache = StrictProviderCache(crypten) if options["online_only"] else None
+    if material_cache:
+        material_cache.install()
     try:
         model, metadata = load_model(options["checkpoint"], options["mpcvit_root"], None)
         model = model.to(device).eval()
@@ -149,8 +153,13 @@ def worker(rank, rendezvous, options):
                                      options["softmax"], options["reciprocal_scale"])
         records = []
         for iteration in range(options["repeats"] + 1):
+            preprocessing = None
+            if material_cache and iteration:
+                _, preprocessing = _crypten_measure(device, crypten, material_cache.prepare)
             shared, sharing = _crypten_measure(device, crypten, lambda: crypten.cryptensor(
                 image, src=0, precision=options["precision_bits"], device=device))
+            if material_cache:
+                material_cache.begin_trace() if iteration == 0 else material_cache.begin_replay()
             torch.cuda.reset_peak_memory_stats(device)
             def forward():
                 def progress(index, value):
@@ -162,6 +171,8 @@ def worker(rank, rendezvous, options):
                 with torch.no_grad(), truncation:
                     return forward_vit(model, shared, ops, on_layer=progress)
             output, online = _crypten_measure(device, crypten, forward)
+            if material_cache:
+                material_cache.end_trace() if iteration == 0 else material_cache.end_replay()
             opened, reconstruction = _crypten_measure(device, crypten, lambda: reveal_exact(output))
             actual = _plain(opened)
             finite = bool(torch.isfinite(actual).all())
@@ -181,6 +192,9 @@ def worker(rank, rendezvous, options):
                    "output_reconstruction": reconstruction,
                    "error_vs_plaintext_logits": errors,
                    "error_vs_own_formula_logits": own_errors}
+            if material_cache:
+                row.update(crypten_preprocessing=preprocessing,
+                           precomputed_provider_requests=len(material_cache.requests))
             if rank == 0:
                 records.append(row)
                 print(json.dumps({"event": "iteration_complete", "record": row}), flush=True)
@@ -193,6 +207,7 @@ def worker(rank, rendezvous, options):
                       "method": f"CrypTen softmax ({options['softmax']}), {options['gelu']} GeLU and sqrt/reciprocal LayerNorm",
                       "softmax_method": options["softmax"],
                       "truncation_method": options["truncation"],
+                      "preprocessing_mode": "precomputed_strict" if material_cache else "inline",
                       "truncation_note": "non-legacy modes use unreviewed secret share-wrap counting; not CrypTen native or security validated",
                       "reciprocal_scale": options["reciprocal_scale"] if options["softmax"] == "scaled" else None,
                       "softmax_note": "scaled is a CrypTen adaptation using 1/(d/S)/S; native uses CrypTen softmax unchanged",
@@ -207,7 +222,8 @@ def worker(rank, rendezvous, options):
                       "correctness_gate": "all iterations including warmup must meet max error against selected plaintext formula; exact GeLU model deviation reported separately",
                       "crypten_import": crypten.__file__, "python": platform.python_version(),
                       "torch": torch.__version__,
-                      "timing_note": "CrypTen provider work is included in forward; input sharing and output reconstruction are separate.",
+                      "timing_note": ("All traced CrypTen provider materials precomputed before input sharing; online forward uses strict single-use replay. Input sharing and reconstruction are separate."
+                                      if material_cache else "CrypTen provider work is included in forward; input sharing and output reconstruction are separate."),
                       "communication_note": "CrypTen bidirectional communicator logs divided by two; collective bytes are estimates.",
                       "security_note": "Numerical execution only; comparison with experimental Ring3 is not a proof of equivalent security."}
             out = Path(options["output"])
@@ -217,6 +233,8 @@ def worker(rank, rendezvous, options):
                 f.write("\n")
             print(json.dumps({"report": str(out / "comparison.json"), "status": report["status"]}), flush=True)
     finally:
+        if material_cache:
+            material_cache.close()
         crypten.uninit()
 
 
@@ -237,6 +255,8 @@ def main():
     parser.add_argument("--chebyshev-bound", type=float, default=12.0,
                         help="fit 16-degree interpolant on [-bound, bound]; public audit only")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--online-only", action="store_true",
+                        help="precompute fresh provider materials before input sharing; strict sequence replay may use substantial GPU memory")
     parser.add_argument("--max-abs-error", type=float, default=1.0)
     args = parser.parse_args()
     try:

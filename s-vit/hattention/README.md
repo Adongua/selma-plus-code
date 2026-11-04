@@ -1236,3 +1236,28 @@ compares compatible same-image reports, preserving failed correctness statuses
 and separate communication counters. A failed numerical check makes a timing
 diagnostic, and framework counters and preprocessing boundaries differ. The
 original Ring3 full-ViT benchmark can supply the two optimized reports.
+
+Both full-forward benchmarks additionally accept `--online-only`. Warmup runs
+with a public fixture and records the exact sequence of CrypTen provider calls
+and (for the optimized model) Ring3 material requests. Before **each** measured
+iteration, all recorded material is generated afresh using only public request
+metadata, before input sharing. The timed forward consumes the prepared
+materials exactly once in order. Missing, changed, reused, or leftover requests
+are errors; the benchmark does not silently generate missing materials online.
+Warmup is excluded from the online timing and the correctness gate still
+includes it. Reports retain `crypten_preprocessing` and `ring_preprocessing`
+as separate offline measurements. `forward_wall` is the measured forward after
+these explicit preparation steps. Input sharing and output reconstruction are
+separately timed and excluded. The summary rejects mixing inline and strict
+precomputed reports.
+
+The implementation holds a full forward's materials on each GPU at once and
+can exceed memory even when the previous just-in-time version fits. Start with
+`--repeats 1` and available GPU memory; online-only CUDA execution and full-size
+memory requirements must be checked on the target machine. Any remaining local
+random-number expansion or other work performed inside a forward is still
+included; this accounts for all explicit CrypTen provider and Ring3 material
+preparation, not a proof that every conceivable input-independent computation
+has been moved offline. Separate offline and online bytes and total latency are
+also useful when evaluating a deployable system. This is still a public-fixture
+numerical benchmark and does not establish equivalent privacy or security.
