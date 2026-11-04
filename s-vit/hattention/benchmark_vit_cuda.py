@@ -7,6 +7,7 @@ sLayerNorm. This is a numerical experiment, not a validated privacy protocol.
 
 import argparse
 from collections import Counter
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ from slayernorm.protocol import Profile as LNProfile, prepare as prepare_ln, lay
 from slayernorm.wide_range import WideLayerNormProfile, prepare_wide_layernorm, wide_layernorm
 from slayernorm.benchmark_crypten_cuda import _aggregate, _barrier, _crypten_measure, _plain
 from .config import HAttentionConfig
+from .experimental_crypten_truncation import experimental_truncation
 from .hybrid import prepare_hybrid, secure_hybrid
 from .hybrid_wide_range import prepare_wide_hybrid, secure_wide_hybrid
 from .reference import rsa_attention
@@ -241,7 +243,9 @@ def worker(rank, rendezvous, options):
                 if rank == 0:
                     print(json.dumps({"event": "layer_complete", "warmup": iteration == 0,
                                       "layer": index + 1}), flush=True)
-            with torch.no_grad():
+            truncation = (experimental_truncation(options["truncation"])
+                          if options["truncation"] != "legacy" else nullcontext())
+            with torch.no_grad(), truncation:
                 output = forward_vit(model, shared, ops, on_layer=progress)
             torch.cuda.synchronize(device)
             wall = time.perf_counter() - start
@@ -277,10 +281,9 @@ def worker(rank, rendezvous, options):
                 print(json.dumps({"event": "iteration_complete", "record": record}), flush=True)
         if rank == 0:
             paths = [list(b.self_attn.config.head_types) for b in model.classifier.blocks]
-            measured = [r for r in records if not r["warmup"]]
             passed = not violations and all(r["error_vs_plaintext_logits"]["finite"] and
                          r["error_vs_plaintext_logits"]["max_abs"] <= options["max_abs_error"]
-                         for r in measured)
+                         for r in records)
             report = {"status": "benchmark_passed_not_security_validated" if passed else "benchmark_failed_correctness", "backend": "gloo", "world_size": 3,
                 "output_decoding": "signed raw integer divided by encoder scale in float64",
                 "scope": "full ViTLite forward; public model weights and public benchmark image secret-shared for execution; batch 1",
@@ -289,8 +292,11 @@ def worker(rank, rendezvous, options):
                 "image_sha256": file_sha256(options["image"][0]), "repeats": options["repeats"],
                 "public_fixture_range_audit": observations,
                 "precision": "Q17", "numeric_profile": options["numeric_profile"],
+                "truncation_method": options["truncation"],
+                "truncation_note": "CrypTen operations only; Ring3 truncation is unchanged. Non-legacy modes use unreviewed secret share-wrap counting.",
                 "numeric_profile_details": numeric_profile_details(options["numeric_profile"], options["mu"]),
                 "mu": options["mu"], "max_abs_error_threshold": options["max_abs_error"], "records": records,
+                "correctness_gate": "public fixture within declared profile; all iterations including warmup must meet max error against this fixed student's plaintext logits",
                 "crypten_import": crypten.__file__, "python": platform.python_version(), "torch": torch.__version__,
                 "timing_note": "forward wall includes just-in-time preprocessing; online time subtracts local preprocessing before rank maximum; CrypTen provider work remains online; sync instrumentation included",
                 "communication_note": "Ring3 sent payloads and CrypTen bidirectional logs/2 are separate; counters are not equivalent protocol rounds",
@@ -314,6 +320,8 @@ def main():
     parser.add_argument("--image", required=True, nargs="+", help="public benchmark image(s); only audit-only supports multiple")
     parser.add_argument("--output", required=True)
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--truncation", choices=("legacy", "experimental", "batched", "carry_save"),
+                        default="legacy", help="CrypTen truncation for public-weight linear operations")
     parser.add_argument("--mu", type=float, default=1.4621998268680836)
     parser.add_argument("--max-abs-error", type=float, default=1.0,
                         help="exploratory max logit error gate against the plaintext model")

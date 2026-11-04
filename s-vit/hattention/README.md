@@ -955,7 +955,21 @@ The source MPCViT checkpoint is converted to sReLU RSA for this experiment;
 this adapted baseline is not the original MPCViT ReLU implementation. The
 reference is the checkpoint's plaintext LayerNorm/GeLU model. Just-in-time
 Ring3 material generation is counted separately and full forward wall time is
-also recorded. The model is experimental and has not been run on three GPUs.
+also recorded. The model is experimental and has not been security validated.
+
+For a comparison with the CrypTen control using the same CrypTen truncation,
+pass `--truncation carry_save` to this benchmark as well as the control. It
+applies to CrypTen public-weight convolution and linear operations; the
+separate Ring3 operator implementations are unchanged. The default `legacy`
+preserves the previous benchmark configuration. Reports now record the choice
+and check the numerical threshold on warmup as well as measured repetitions.
+Use full forward wall time for the measured end-to-end comparison including
+preprocessing. The reported forward excluding Ring3 preprocessing still
+includes CrypTen provider work and therefore has a different boundary from a
+fully online-only result. Both benchmarks exclude input sharing and output
+reconstruction; CrypTen Q20 and Ring3 Q17 have different precision and use
+different correctness references. The softmax control uses MPCViT weights with
+attention replaced, so it is a cost control rather than a trained standard ViT.
 
 Before attempting the secure prototype, audit the real checkpoints and public
 images on CPU. For example, set `IMAGE` to an existing Tiny-ImageNet image:

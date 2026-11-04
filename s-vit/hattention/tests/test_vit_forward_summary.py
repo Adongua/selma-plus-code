@@ -14,7 +14,8 @@ class ForwardSummaryTests(unittest.TestCase):
                                            "sent_bytes_sum": size}
             error = {"finite": True, "max_abs": 1.2}
             base = {"backend": "gloo", "world_size": 3, "image_sha256": "abc",
-                    "precision": "Q17", "status": "benchmark_failed_correctness"}
+                    "precision": "Q17", "status": "benchmark_failed_correctness",
+                    "truncation_method": "carry_save"}
             row = {"warmup": False, "forward_wall": phase(270, 300),
                    "ring_preprocessing": phase(260, 250),
                    "online_ring_excluding_preprocessing": phase(10, 50),
@@ -22,6 +23,7 @@ class ForwardSummaryTests(unittest.TestCase):
             path.write_text(json.dumps({**base, "records": [row]}))
             result = summarize("optimized", path)
             self.assertFalse(result["valid"])
+            self.assertEqual(result["truncation_method"], "carry_save")
             self.assertEqual(result["forward_excluding_ring_preprocessing_seconds"], 10)
             self.assertEqual(result["ring_preprocessing_seconds"], 260)
             self.assertEqual(result["max_logit_error"], 1.2)

@@ -1,6 +1,7 @@
 """Verify full forward ordering and public-weight CrypTen operations."""
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 import tempfile
 import unittest
@@ -26,6 +27,8 @@ def _crypten_worker(rank, rendezvous):
     os.environ.update(RANK=str(rank), WORLD_SIZE="3", RENDEZVOUS=rendezvous,
                       DISTRIBUTED_BACKEND="gloo")
     import crypten
+    from crypten.mpc.primitives import beaver
+    from hattention.experimental_crypten_truncation import experimental_truncation
     crypten.cfg.encoder.precision_bits = 17
     crypten.init(device=torch.device("cpu"))
     try:
@@ -65,7 +68,9 @@ def _crypten_worker(rank, rendezvous):
         secure.base, secure.wide, secure.mu = base, Ring3Wide(base), 1.4621998268680836
         secure.prepare = lambda fn: fn()
         secure.wrap = lambda share: MPCTensor.from_shares(share, precision=17)
-        for profile in ("legacy", "wide-range"):
+        original_truncate = beaver.truncate
+        for profile, truncation in (("legacy", "legacy"), ("wide-range", "legacy"),
+                                    ("wide-range", "carry_save")):
             secure.numeric_profile = profile
             encrypted = crypten.cryptensor(image, src=0, precision=17)
             seen = []
@@ -75,11 +80,15 @@ def _crypten_worker(rank, rendezvous):
                 if not metrics["finite"]:
                     raise AssertionError(f"nonfinite diagnostic site {index} {site}")
                 seen.append((index, site))
-            out = forward_vit(model, encrypted, secure, on_stage=inspect).get_plain_text()
+            context = experimental_truncation(truncation) if truncation != "legacy" else nullcontext()
+            with context:
+                out = forward_vit(model, encrypted, secure, on_stage=inspect).get_plain_text()
+            if beaver.truncate is not original_truncate:
+                raise AssertionError("CrypTen truncation was not restored after the full forward")
             if seen != list(reference_sites):
                 raise AssertionError("incorrect diagnostic site order")
             if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
-                raise AssertionError(f"{profile} encrypted full forward mismatch: {out} vs {plain}")
+                raise AssertionError(f"{profile}/{truncation} encrypted full forward mismatch: {out} vs {plain}")
     finally:
         crypten.uninit()
 
