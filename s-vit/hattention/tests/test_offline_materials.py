@@ -1,9 +1,10 @@
 """Check strict offline replay refuses altered requests and reused material."""
 import unittest
+from dataclasses import dataclass
 
 import torch
 
-from hattention.offline_materials import StrictProviderCache, StrictRingCache
+from hattention.offline_materials import HostCacheBudget, StrictProviderCache, StrictRingCache
 
 
 class FakeProvider:
@@ -30,6 +31,13 @@ class FakeMPC:
 class FakeCrypten:
     def __init__(self):
         self.mpc = FakeMPC()
+
+
+@dataclass
+class FakeRingMaterial:
+    runtime: object
+    values: tuple
+    used: bool = False
 
 
 class OfflineMaterialTests(unittest.TestCase):
@@ -74,6 +82,28 @@ class OfflineMaterialTests(unittest.TestCase):
         cache.begin_replay()
         with self.assertRaisesRegex(RuntimeError, "request changed"):
             cache.request(("norm", (3,)), lambda: -1)
+
+    def test_host_storage_keeps_runtime_identity_and_enforces_budget(self):
+        runtime = object()
+        budget = HostCacheBudget(64)
+        cache = StrictRingCache("cpu", torch.device("cpu"), budget)
+        cache.begin_trace()
+        cache.request(("norm", (4,)), lambda: FakeRingMaterial(runtime, (torch.ones(4, dtype=torch.long),)))
+        cache.end_trace()
+        cache.prepare()
+        self.assertEqual(budget.used_bytes, 32)
+        cache.begin_replay()
+        material = cache.request(("norm", (4,)), lambda: None)
+        cache.end_replay()
+        self.assertIs(material.runtime, runtime)
+        self.assertTrue(torch.equal(material.values[0], torch.ones(4, dtype=torch.long)))
+        self.assertEqual(budget.used_bytes, 0)
+        too_small = StrictRingCache("cpu", torch.device("cpu"), HostCacheBudget(16))
+        too_small.begin_trace()
+        too_small.request(("norm", (4,)), lambda: FakeRingMaterial(runtime, (torch.ones(4, dtype=torch.long),)))
+        too_small.end_trace()
+        with self.assertRaisesRegex(RuntimeError, "exceeds the per-party budget"):
+            too_small.prepare()
 
 
 if __name__ == "__main__":

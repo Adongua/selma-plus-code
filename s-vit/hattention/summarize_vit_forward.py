@@ -19,6 +19,7 @@ def summarize(label, path):
             "image_sha256": report["image_sha256"], "precision": report["precision"],
             "truncation_method": report.get("truncation_method", "unreported"),
             "preprocessing_mode": report.get("preprocessing_mode", "inline"),
+            "offline_cache_storage": report.get("offline_cache_storage", "device" if report.get("preprocessing_mode") == "precomputed_strict" else None),
             "crypten_preprocessing_seconds": (mean_at("crypten_preprocessing", "seconds_max")
                                                if report.get("preprocessing_mode") == "precomputed_strict" else None),
             "repeats": len(rows), "forward_wall_seconds": mean_at("forward_wall", "seconds_max"),
@@ -55,13 +56,16 @@ def main():
             raise ValueError(f"reports have different {key}; comparison is not valid")
     if len({r["preprocessing_mode"] for r in results}) != 1:
         raise ValueError("reports mix inline and precomputed preprocessing; rerun under the same timing boundary")
+    if results[0]["preprocessing_mode"] == "precomputed_strict" and len({r["offline_cache_storage"] for r in results}) != 1:
+        raise ValueError("reports use different material storage; compare under the same storage boundary")
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=False)
     strict = results[0]["preprocessing_mode"] == "precomputed_strict"
     note = ("Mean of measured repetitions; maximum elapsed time across parties per repetition. "
             "Input sharing and output reconstruction excluded. " +
             ("Fresh CrypTen provider and Ring3 materials were prepared before sharing and replayed once; "
-             "forward wall is measured after explicit material preparation. Local random generation and "
+             "forward wall is measured after explicit material preparation; CPU-to-GPU material transfers "
+             "are included when CPU storage is used. Local random generation and "
              "other runtime setup in the forward remain online; no security validation is implied. "
              if strict else
              "CrypTen provider work is included in forward; Ring3 preparation is separately counted. "
@@ -73,15 +77,17 @@ def main():
     (out / "comparison.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
     header = ["# Full ViT forward comparison", "", note, ""]
     if strict:
-        header.extend(["| Method | Status | Precision | CrypTen truncation | Online forward (s) | CrypTen online comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
-                       "|---|---|---|---|---:|---:|---:|---:|---:|"])
+        header.extend(["| Method | Status | Precision | CrypTen truncation | Material storage | Online forward (s) | CrypTen online comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
+                       "|---|---|---|---|---|---:|---:|---:|---:|---:|"])
     else:
         header.extend(["| Method | Status | Precision | CrypTen truncation | Forward wall (s) | CrypTen prep (s) | Ring prep (s) | Forward excl. Ring prep (s) | CrypTen comm (MiB) | Ring online (MiB) | Max error vs exact | Max error vs own formula |",
                        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"])
     fmt = lambda x: "—" if x is None else f"{x:.3f}"
     for r in results:
-        line = (f"| {r['label']} | {r['status']} | {r['precision']} | {r['truncation_method']} | "
-                f"{fmt(r['forward_wall_seconds'])} | ")
+        line = f"| {r['label']} | {r['status']} | {r['precision']} | {r['truncation_method']} | "
+        if strict:
+            line += f"{r['offline_cache_storage']} | "
+        line += f"{fmt(r['forward_wall_seconds'])} | "
         if not strict:
             line += (f"{fmt(r['crypten_preprocessing_seconds'])} | {fmt(r['ring_preprocessing_seconds'])} | "
                      f"{fmt(r['forward_excluding_ring_preprocessing_seconds'])} | ")

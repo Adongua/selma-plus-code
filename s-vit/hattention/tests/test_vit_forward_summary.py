@@ -42,9 +42,10 @@ class ForwardSummaryTests(unittest.TestCase):
             # A strict precomputed report exposes provider preparation
             # separately while retaining the actual measured online forward.
             row["crypten_preprocessing"] = phase(42, 100)
-            path.write_text(json.dumps({**base, "preprocessing_mode": "precomputed_strict", "records": [row]}))
+            path.write_text(json.dumps({**base, "preprocessing_mode": "precomputed_strict", "offline_cache_storage": "cpu", "records": [row]}))
             result = summarize("native-online", path)
             self.assertEqual(result["preprocessing_mode"], "precomputed_strict")
+            self.assertEqual(result["offline_cache_storage"], "cpu")
             self.assertEqual(result["crypten_preprocessing_seconds"], 42)
             self.assertEqual(result["forward_wall_seconds"], 270)
             out = Path(directory) / "summary"

@@ -18,7 +18,7 @@ from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
 from hattention.vit_executor import PlainOperators, forward_vit
 from hattention.vit_integration import make_fixed_student
-from hattention.offline_materials import StrictProviderCache, StrictRingCache
+from hattention.offline_materials import HostCacheBudget, StrictProviderCache, StrictRingCache
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -90,7 +90,9 @@ def _crypten_worker(rank, rendezvous):
                 raise AssertionError("incorrect diagnostic site order")
             if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
                 raise AssertionError(f"{profile}/{truncation} encrypted full forward mismatch: {out} vs {plain}")
-        provider_cache, ring_cache = StrictProviderCache(crypten), StrictRingCache()
+        budget = HostCacheBudget(1 << 28)
+        provider_cache = StrictProviderCache(crypten, "cpu", torch.device("cpu"), budget)
+        ring_cache = StrictRingCache("cpu", torch.device("cpu"), budget)
         provider_cache.install()
         secure.numeric_profile = "wide-range"
         secure.prepare = lambda fn, key=None: ring_cache.request(key, fn)
@@ -113,6 +115,8 @@ def _crypten_worker(rank, rendezvous):
                     out = forward_vit(model, encrypted, secure).get_plain_text()
                 provider_cache.end_replay()
                 ring_cache.end_replay()
+                if budget.used_bytes or budget.peak_bytes <= 0:
+                    raise AssertionError("mixed host cache accounting mismatch")
                 if not torch.isfinite(out).all() or (out - plain).abs().max() > 0.5:
                     raise AssertionError("precomputed mixed full forward mismatch")
         finally:

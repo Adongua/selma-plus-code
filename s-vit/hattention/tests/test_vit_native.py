@@ -13,7 +13,7 @@ from hattention.benchmark_vit_native_cuda import (AuditedPlainOperators, CrypTen
 from hattention.diagnose_vit_native_attention import open_exact, trace_attention
 from hattention.exact_decode import reveal_exact
 from hattention.experimental_crypten_truncation import experimental_truncation
-from hattention.offline_materials import StrictProviderCache
+from hattention.offline_materials import HostCacheBudget, StrictProviderCache
 from cryptgpu_gelu.operators import _chebyshev_coefficients, chebyshev16_gelu_reference
 from hattention.config import HAttentionConfig
 from hattention.student_checkpoint import import_mpcvit
@@ -147,7 +147,8 @@ def _worker(rank, rendezvous):
                 raise AssertionError(f"{mode} full forward mismatch: {output} vs {approximate}")
         # Trace the public-shape call sequence, then execute two fresh,
         # strictly precomputed full forwards. A miss or reuse must fail closed.
-        cache = StrictProviderCache(crypten)
+        budget = HostCacheBudget(1 << 28)
+        cache = StrictProviderCache(crypten, "cpu", torch.device("cpu"), budget)
         cache.install()
         try:
             encrypted = crypten.cryptensor(image, src=0, precision=20)
@@ -165,6 +166,8 @@ def _worker(rank, rendezvous):
                     output = reveal_exact(forward_vit(model, encrypted,
                         CrypTenNativeOperators("chebyshev16", 12.0, "scaled", 256)))
                 cache.end_replay()
+                if budget.used_bytes or budget.peak_bytes <= 0:
+                    raise AssertionError("provider host cache accounting mismatch")
                 if not torch.isfinite(output).all() or (output - approximate).abs().max() > 1.0:
                     raise AssertionError("precomputed provider full forward mismatch")
             try:

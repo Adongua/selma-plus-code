@@ -9,6 +9,7 @@ import argparse
 from collections import Counter
 from contextlib import nullcontext
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -29,7 +30,7 @@ from slayernorm.wide_range import WideLayerNormProfile, prepare_wide_layernorm, 
 from slayernorm.benchmark_crypten_cuda import _aggregate, _barrier, _crypten_measure, _plain, _ring_measure
 from .config import HAttentionConfig
 from .experimental_crypten_truncation import experimental_truncation
-from .offline_materials import StrictProviderCache, StrictRingCache
+from .offline_materials import HostCacheBudget, StrictProviderCache, StrictRingCache
 from .hybrid import prepare_hybrid, secure_hybrid
 from .hybrid_wide_range import prepare_wide_hybrid, secure_wide_hybrid
 from .reference import rsa_attention
@@ -230,8 +231,12 @@ def worker(rank, rendezvous, options):
     crypten.cfg.encoder.precision_bits = 17
     crypten.init(device=device)
     crypten.cfg.communicator.verbose = True
-    provider_cache = StrictProviderCache(crypten) if options["online_only"] else None
-    ring_cache = StrictRingCache() if options["online_only"] else None
+    budget = (HostCacheBudget(int(options["offline_host_limit_gib"] * 2**30))
+              if options["online_only"] and options["offline_cache"] == "cpu" else None)
+    provider_cache = (StrictProviderCache(crypten, options["offline_cache"], device, budget)
+                      if options["online_only"] else None)
+    ring_cache = (StrictRingCache(options["offline_cache"], device, budget)
+                  if options["online_only"] else None)
     if provider_cache:
         provider_cache.install()
     try:
@@ -250,6 +255,10 @@ def worker(rank, rendezvous, options):
         for iteration in range(options["repeats"] + 1):
             provider_preprocessing = ring_precomputed = None
             if provider_cache and iteration:
+                if budget:
+                    if budget.used_bytes:
+                        raise RuntimeError("host cache contains material from a previous iteration")
+                    budget.peak_bytes = 0
                 _, provider_preprocessing = _crypten_measure(device, crypten, provider_cache.prepare)
                 _, ring_precomputed = _ring_measure(device, base, ring_cache.prepare)
             shared, sharing = _crypten_measure(device, crypten, lambda: crypten.cryptensor(
@@ -284,6 +293,8 @@ def worker(rank, rendezvous, options):
                 else:
                     provider_cache.end_replay()
                     ring_cache.end_replay()
+                    if budget and budget.used_bytes:
+                        raise RuntimeError("host cache material was not fully consumed")
             stats = crypten.communicator.get().get_communication_stats()
             crypto = _aggregate(device, 0, stats, bidirectional_counter=True)
             ring = _aggregate(device, wall, {"bytes": base.sent_bytes - sent,
@@ -315,6 +326,11 @@ def worker(rank, rendezvous, options):
                 record.update(crypten_preprocessing=provider_preprocessing,
                               precomputed_provider_requests=len(provider_cache.requests),
                               precomputed_ring_requests=len(ring_cache.requests))
+                if budget:
+                    local = torch.tensor([budget.peak_bytes], dtype=torch.long)
+                    cache_peaks = [torch.zeros_like(local) for _ in range(3)]
+                    dist.all_gather(cache_peaks, local)
+                    record["host_cache_peak_payload_bytes_per_rank"] = [int(p.item()) for p in cache_peaks]
             if rank == 0:
                 records.append(record)
                 print(json.dumps({"event": "iteration_complete", "record": record}), flush=True)
@@ -332,13 +348,15 @@ def worker(rank, rendezvous, options):
                 "public_fixture_range_audit": observations,
                 "precision": "Q17", "numeric_profile": options["numeric_profile"],
                 "preprocessing_mode": "precomputed_strict" if provider_cache else "inline",
+                "offline_cache_storage": options["offline_cache"] if provider_cache else None,
+                "offline_host_limit_gib_per_rank": options["offline_host_limit_gib"] if budget else None,
                 "truncation_method": options["truncation"],
                 "truncation_note": "CrypTen operations only; Ring3 truncation is unchanged. Non-legacy modes use unreviewed secret share-wrap counting.",
                 "numeric_profile_details": numeric_profile_details(options["numeric_profile"], options["mu"]),
                 "mu": options["mu"], "max_abs_error_threshold": options["max_abs_error"], "records": records,
                 "correctness_gate": "public fixture within declared profile; all iterations including warmup must meet max error against this fixed student's plaintext logits",
                 "crypten_import": crypten.__file__, "python": platform.python_version(), "torch": torch.__version__,
-                "timing_note": ("Fresh traced CrypTen provider and Ring3 materials prepared before input sharing and consumed with strict single-use replay; forward wall is online."
+                "timing_note": ("Fresh traced CrypTen provider and Ring3 materials prepared before input sharing and consumed with strict single-use replay; CPU-to-GPU transfers, if used, are included online."
                                 if provider_cache else "forward wall includes just-in-time preprocessing; online time subtracts local preprocessing before rank maximum; CrypTen provider work remains online; sync instrumentation included"),
                 "communication_note": "Ring3 sent payloads and CrypTen bidirectional logs/2 are separate; counters are not equivalent protocol rounds",
                 "numerics_note": "sLayerNorm and sGeLU approximate the trained LayerNorm and GeLU; RSA uses sReLU and bounded reciprocal; secret ranges are unchecked",
@@ -365,6 +383,10 @@ def main():
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--online-only", action="store_true",
                         help="precompute fresh provider and Ring3 materials before input sharing; strict replay may use substantial GPU memory")
+    parser.add_argument("--offline-cache", choices=("device", "cpu"), default="device",
+                        help="store prepared materials on GPU or CPU; CPU-to-GPU transfers count online")
+    parser.add_argument("--offline-host-limit-gib", type=float, default=32.0,
+                        help="approximate tensor-payload limit per party for CPU material cache")
     parser.add_argument("--truncation", choices=("legacy", "experimental", "batched", "carry_save"),
                         default="legacy", help="CrypTen truncation for public-weight linear operations")
     parser.add_argument("--mu", type=float, default=1.4621998268680836)
@@ -377,6 +399,10 @@ def main():
     parser.add_argument("--numeric-profile", choices=("legacy", "wide-range"), default="legacy",
                         help="select legacy operators or the experimental wide-range implementations")
     args = parser.parse_args()
+    if not math.isfinite(args.offline_host_limit_gib) or args.offline_host_limit_gib <= 0:
+        parser.error("--offline-host-limit-gib must be positive and finite")
+    if args.offline_cache == "cpu" and not args.online_only:
+        parser.error("--offline-cache cpu requires --online-only")
     if args.repeats < 1 or not 0.25 <= args.mu <= 4 or not 0 < args.max_abs_error < float("inf"):
         parser.error("invalid repeats, mu or max-abs-error")
     if Path(args.output).exists():

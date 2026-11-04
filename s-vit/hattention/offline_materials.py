@@ -5,10 +5,91 @@ generates fresh materials before input sharing, then must consume exactly that
 recorded sequence. This is an experimental execution mode, not a security proof.
 """
 from collections import deque
+from dataclasses import fields, is_dataclass, replace
 import json
 
 import torch
 import torch.distributed as dist
+
+
+def _material_nbytes(value):
+    """Conservatively count tensor payload bytes, excluding Python overhead."""
+    from crypten.cuda import CUDALongTensor
+    from crypten.mpc.primitives import ArithmeticSharedTensor, BinarySharedTensor
+
+    if isinstance(value, (ArithmeticSharedTensor, BinarySharedTensor)):
+        value = value.share
+    if isinstance(value, CUDALongTensor):
+        value = value.tensor()
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, (tuple, list)):
+        return sum(_material_nbytes(item) for item in value)
+    if isinstance(value, dict):
+        return sum(_material_nbytes(item) for item in value.values())
+    if is_dataclass(value) and not isinstance(value, type):
+        if getattr(value.__dataclass_params__, "frozen", False):
+            return 0
+        return sum(_material_nbytes(getattr(value, field.name)) for field in fields(value)
+                   if field.name not in {"base", "wide", "runtime", "wide_runtime"})
+    return 0
+
+
+class HostCacheBudget:
+    """Bound estimated host tensor payload per party across both material caches."""
+
+    def __init__(self, limit_bytes):
+        if not isinstance(limit_bytes, int) or limit_bytes <= 0:
+            raise ValueError("host cache budget must be a positive integer")
+        self.limit_bytes = limit_bytes
+        self.used_bytes = 0
+        self.peak_bytes = 0
+
+    def reserve(self, value):
+        amount = _material_nbytes(value)
+        if self.used_bytes + amount > self.limit_bytes:
+            raise RuntimeError("host material cache exceeds the per-party budget "
+                               f"({self.limit_bytes / 2**30:.2f} GiB); stop and reassess available RAM")
+        self.used_bytes += amount
+        self.peak_bytes = max(self.peak_bytes, self.used_bytes)
+
+    def release(self, value):
+        self.used_bytes -= _material_nbytes(value)
+        if self.used_bytes < 0:
+            raise RuntimeError("host material cache accounting became negative")
+
+
+def _move_material(value, device):
+    """Move material tensors without moving or replacing protocol runtimes.
+
+    Provider objects retain their sharing/encoder type. Ring3 material
+    dataclasses retain their runtime identity and one-use flags.
+    """
+    from crypten.cuda import CUDALongTensor
+    from crypten.mpc.primitives import ArithmeticSharedTensor, BinarySharedTensor
+
+    device = torch.device(device)
+    if isinstance(value, (ArithmeticSharedTensor, BinarySharedTensor)):
+        share = value.share.tensor() if isinstance(value.share, CUDALongTensor) else value.share
+        share = share.to(device)
+        value.share = CUDALongTensor(share) if share.is_cuda else share
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, tuple):
+        return tuple(_move_material(item, device) for item in value)
+    if isinstance(value, list):
+        return [_move_material(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: _move_material(item, device) for key, item in value.items()}
+    if is_dataclass(value) and not isinstance(value, type):
+        if getattr(value.__dataclass_params__, "frozen", False):
+            return value
+        updates = {field.name: _move_material(getattr(value, field.name), device)
+                   for field in fields(value)
+                   if field.name not in {"base", "wide", "runtime", "wide_runtime"}}
+        return replace(value, **updates)
+    return value
 
 
 def _public_signature(value):
@@ -32,8 +113,15 @@ class StrictProviderCache:
     METHODS = frozenset(("generate_relu_quintuple", "generate_additive_triple", "square",
                          "generate_binary_triple", "wrap_rng", "B2A_rng"))
 
-    def __init__(self, crypten):
+    def __init__(self, crypten, storage="device", device=None, budget=None):
+        if storage not in ("device", "cpu") or (storage == "cpu" and device is None):
+            raise ValueError("CPU material storage requires a replay device")
+        if storage == "cpu" and budget is None:
+            raise ValueError("CPU material storage requires a shared host cache budget")
+        if storage == "device" and budget is not None:
+            raise ValueError("device material storage does not use a host cache budget")
         self.crypten = crypten
+        self.storage, self.device, self.budget = storage, device, budget
         self.original_getter = crypten.mpc.get_default_provider
         self.provider = self.original_getter()
         if self.provider.tracing or self.provider.tuple_cache:
@@ -67,7 +155,9 @@ class StrictProviderCache:
             if signature != expected:
                 raise RuntimeError(f"offline provider request changed: expected {expected}, got {signature}")
             self.calls += 1
-            return value
+            if self.budget:
+                self.budget.release(value)
+            return _move_material(value, self.device) if self.storage == "cpu" else value
         return call
 
     def begin_trace(self):
@@ -86,10 +176,15 @@ class StrictProviderCache:
         # Direct calls bypass this proxy: no online values or tensor inputs are used.
         for index, (signature, args, kwargs) in enumerate(self.requests, 1):
             name = signature[0]
-            self.values.append((signature, getattr(self.provider, name)(*args, **kwargs)))
+            value = getattr(self.provider, name)(*args, **kwargs)
+            if self.storage == "cpu":
+                value = _move_material(value, "cpu")
+                self.budget.reserve(value)
+            self.values.append((signature, value))
             if (not dist.is_initialized() or dist.get_rank() == 0) and (index % 500 == 0 or index == len(self.requests)):
                 print(json.dumps({"event": "offline_provider_progress", "completed": index,
-                                  "total": len(self.requests)}), flush=True)
+                                  "total": len(self.requests), "host_cache_gib_per_rank":
+                                  round(self.budget.used_bytes / 2**30, 3) if self.budget else None}), flush=True)
         self.calls = 0
 
     def begin_replay(self):
@@ -106,7 +201,14 @@ class StrictProviderCache:
 class StrictRingCache:
     """Record public Ring3 material requests and consume fresh results in order."""
 
-    def __init__(self):
+    def __init__(self, storage="device", device=None, budget=None):
+        if storage not in ("device", "cpu") or (storage == "cpu" and device is None):
+            raise ValueError("CPU material storage requires a replay device")
+        if storage == "cpu" and budget is None:
+            raise ValueError("CPU material storage requires a shared host cache budget")
+        if storage == "device" and budget is not None:
+            raise ValueError("device material storage does not use a host cache budget")
+        self.storage, self.device, self.budget = storage, device, budget
         self.mode = "idle"
         self.requests = []
         self.values = deque()
@@ -123,7 +225,9 @@ class StrictRingCache:
         if key != expected:
             raise RuntimeError(f"offline Ring3 request changed: expected {expected}, got {key}")
         self.calls += 1
-        return value
+        if self.budget:
+            self.budget.release(value)
+        return _move_material(value, self.device) if self.storage == "cpu" else value
 
     def begin_trace(self):
         if self.requests or self.values or self.mode != "idle":
@@ -139,10 +243,15 @@ class StrictRingCache:
         if self.mode != "idle" or self.values:
             raise RuntimeError("Ring3 material remains from an earlier iteration")
         for index, (key, factory) in enumerate(self.requests, 1):
-            self.values.append((key, factory()))
+            value = factory()
+            if self.storage == "cpu":
+                value = _move_material(value, "cpu")
+                self.budget.reserve(value)
+            self.values.append((key, value))
             if (not dist.is_initialized() or dist.get_rank() == 0) and (index % 5 == 0 or index == len(self.requests)):
                 print(json.dumps({"event": "offline_ring_progress", "completed": index,
-                                  "total": len(self.requests)}), flush=True)
+                                  "total": len(self.requests), "host_cache_gib_per_rank":
+                                  round(self.budget.used_bytes / 2**30, 3) if self.budget else None}), flush=True)
         self.calls = 0
 
     def begin_replay(self):

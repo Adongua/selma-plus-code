@@ -13,6 +13,7 @@ import platform
 import tempfile
 
 import torch
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sgelu.baseline import crypten_erf_gelu
@@ -25,7 +26,7 @@ from .student_checkpoint import file_sha256
 from .vit_executor import PlainOperators, forward_vit
 from .exact_decode import reveal_exact
 from .experimental_crypten_truncation import experimental_truncation
-from .offline_materials import StrictProviderCache
+from .offline_materials import HostCacheBudget, StrictProviderCache
 
 
 class PlainStandardOperators(PlainOperators):
@@ -122,7 +123,10 @@ def worker(rank, rendezvous, options):
         crypten.cfg.functions.sqrt_nr_iters = options["sqrt_iters"]
     crypten.init(device=device)
     crypten.cfg.communicator.verbose = True
-    material_cache = StrictProviderCache(crypten) if options["online_only"] else None
+    budget = (HostCacheBudget(int(options["offline_host_limit_gib"] * 2**30))
+              if options["online_only"] and options["offline_cache"] == "cpu" else None)
+    material_cache = (StrictProviderCache(crypten, options["offline_cache"], device, budget)
+                      if options["online_only"] else None)
     if material_cache:
         material_cache.install()
     try:
@@ -155,6 +159,10 @@ def worker(rank, rendezvous, options):
         for iteration in range(options["repeats"] + 1):
             preprocessing = None
             if material_cache and iteration:
+                if budget:
+                    if budget.used_bytes:
+                        raise RuntimeError("host cache contains material from a previous iteration")
+                    budget.peak_bytes = 0
                 _, preprocessing = _crypten_measure(device, crypten, material_cache.prepare)
             shared, sharing = _crypten_measure(device, crypten, lambda: crypten.cryptensor(
                 image, src=0, precision=options["precision_bits"], device=device))
@@ -173,6 +181,8 @@ def worker(rank, rendezvous, options):
             output, online = _crypten_measure(device, crypten, forward)
             if material_cache:
                 material_cache.end_trace() if iteration == 0 else material_cache.end_replay()
+                if budget and iteration and budget.used_bytes:
+                    raise RuntimeError("host cache material was not fully consumed")
             opened, reconstruction = _crypten_measure(device, crypten, lambda: reveal_exact(output))
             actual = _plain(opened)
             finite = bool(torch.isfinite(actual).all())
@@ -195,6 +205,11 @@ def worker(rank, rendezvous, options):
             if material_cache:
                 row.update(crypten_preprocessing=preprocessing,
                            precomputed_provider_requests=len(material_cache.requests))
+                if budget:
+                    local = torch.tensor([budget.peak_bytes], dtype=torch.long)
+                    peaks = [torch.zeros_like(local) for _ in range(3)]
+                    dist.all_gather(peaks, local)
+                    row["host_cache_peak_payload_bytes_per_rank"] = [int(p.item()) for p in peaks]
             if rank == 0:
                 records.append(row)
                 print(json.dumps({"event": "iteration_complete", "record": row}), flush=True)
@@ -208,6 +223,8 @@ def worker(rank, rendezvous, options):
                       "softmax_method": options["softmax"],
                       "truncation_method": options["truncation"],
                       "preprocessing_mode": "precomputed_strict" if material_cache else "inline",
+                      "offline_cache_storage": options["offline_cache"] if material_cache else None,
+                      "offline_host_limit_gib_per_rank": options["offline_host_limit_gib"] if budget else None,
                       "truncation_note": "non-legacy modes use unreviewed secret share-wrap counting; not CrypTen native or security validated",
                       "reciprocal_scale": options["reciprocal_scale"] if options["softmax"] == "scaled" else None,
                       "softmax_note": "scaled is a CrypTen adaptation using 1/(d/S)/S; native uses CrypTen softmax unchanged",
@@ -222,7 +239,7 @@ def worker(rank, rendezvous, options):
                       "correctness_gate": "all iterations including warmup must meet max error against selected plaintext formula; exact GeLU model deviation reported separately",
                       "crypten_import": crypten.__file__, "python": platform.python_version(),
                       "torch": torch.__version__,
-                      "timing_note": ("All traced CrypTen provider materials precomputed before input sharing; online forward uses strict single-use replay. Input sharing and reconstruction are separate."
+                      "timing_note": ("All traced CrypTen provider materials precomputed before input sharing; online forward uses strict single-use replay. CPU-to-GPU transfers, if used, are included online. Input sharing and reconstruction are separate."
                                       if material_cache else "CrypTen provider work is included in forward; input sharing and output reconstruction are separate."),
                       "communication_note": "CrypTen bidirectional communicator logs divided by two; collective bytes are estimates.",
                       "security_note": "Numerical execution only; comparison with experimental Ring3 is not a proof of equivalent security."}
@@ -257,8 +274,16 @@ def main():
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--online-only", action="store_true",
                         help="precompute fresh provider materials before input sharing; strict sequence replay may use substantial GPU memory")
+    parser.add_argument("--offline-cache", choices=("device", "cpu"), default="device",
+                        help="store prepared materials on GPU or CPU; CPU-to-GPU transfers count online")
+    parser.add_argument("--offline-host-limit-gib", type=float, default=32.0,
+                        help="approximate tensor-payload limit per party for CPU material cache")
     parser.add_argument("--max-abs-error", type=float, default=1.0)
     args = parser.parse_args()
+    if not math.isfinite(args.offline_host_limit_gib) or args.offline_host_limit_gib <= 0:
+        parser.error("--offline-host-limit-gib must be positive and finite")
+    if args.offline_cache == "cpu" and not args.online_only:
+        parser.error("--offline-cache cpu requires --online-only")
     try:
         validate_reciprocal_scale(args.reciprocal_scale)
     except ValueError as error:

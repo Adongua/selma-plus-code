@@ -1261,3 +1261,17 @@ preparation, not a proof that every conceivable input-independent computation
 has been moved offline. Separate offline and online bytes and total latency are
 also useful when evaluating a deployable system. This is still a public-fixture
 numerical benchmark and does not establish equivalent privacy or security.
+
+With `--online-only --offline-cache cpu`, the benchmark instead transfers each
+fresh material to host RAM after generating it and transfers it back when it is
+consumed. Host-to-GPU transfers are **inside** the measured online forward; they
+are not excluded as preprocessing. Use the same material storage for every
+method. `--offline-host-limit-gib` defaults to 32 GiB per party and bounds an
+estimate of cached tensor payload across the CrypTen and Ring3 caches combined;
+Python objects, allocator overhead, other processes and transient tensors are not
+included, so it is not a hard limit on total RAM usage. The run stops if the
+estimated payload exceeds the limit and reports per-party peak payload bytes.
+Inspect available host memory and swap before use. Fresh material is still
+prepared per iteration and strictly consumed once. CPU storage is a different
+runtime configuration from GPU-resident preprocessing; its online timings
+include the additional data transfers and must not be labelled GPU-resident.
