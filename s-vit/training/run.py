@@ -50,7 +50,9 @@ def report(options, config, spec, records, initial, final, top1=None):
             'training_weights': (weights(options['weights']) if options['update_schedule']=='aggregate' else None),
             'diagnostic_weights': weights(options['weights']),
             'optimizer': 'Adam epsilon outside sqrt; secret v_hat projected nonnegative for fixed-point rounding',
-            'timing': 'wall time includes preprocessing, checks, output delivery and diagnostic queries'}
+            'timing': ('training_update_seconds includes preprocessing, checks and output delivery; '
+                       'evaluation_seconds is measured separately; wall_seconds includes both. '
+                       'For 3PC, each duration is the maximum across parties; maxima may be on different ranks.')}
 
 
 @torch.no_grad()
@@ -75,6 +77,8 @@ def run_plain(options, config):
     initial, _ = loss(adam.z, 0, True)
     records = []
     for step in range(1, options['steps']+1):
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
         started = time.perf_counter()
         u = direction(step, config)
         owner = (step-1)%3 if options['update_schedule']=='round-robin' else None
@@ -83,11 +87,21 @@ def run_plain(options, config):
         plus, _ = loss(adam.z+config.sigma*u, batch_step, options['fixed_batch'], parties)
         minus, _ = loss(adam.z-config.sigma*u, batch_step, options['fixed_batch'], parties)
         adam.update(plus-minus, u)
-        row = {'step': step, 'owner': owner, 'batch_index': batch_step}
-        if step % options['eval_every'] == 0 or step == options['steps']:
-            row['diagnostic_loss'], row['top1'] = loss(adam.z, 0, True)
         if device.type == 'cuda':
             torch.cuda.synchronize(device)
+        updated = time.perf_counter()
+        row = {'step': step, 'owner': owner, 'batch_index': batch_step}
+        evaluation_seconds = None
+        if step % options['eval_every'] == 0 or step == options['steps']:
+            evaluation_started = time.perf_counter()
+            row['diagnostic_loss'], row['top1'] = loss(adam.z, 0, True)
+            if device.type == 'cuda':
+                torch.cuda.synchronize(device)
+            evaluation_seconds = time.perf_counter()-evaluation_started
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        row['training_update_seconds'] = updated-started
+        row['evaluation_seconds'] = evaluation_seconds
         row['wall_seconds'] = time.perf_counter()-started
         records.append(row)
         print(json.dumps({'event': 'training_step', **row}), flush=True)
@@ -279,17 +293,29 @@ def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connect
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
                 event('adam_complete', step=step, owner=owner, seconds_rank0=time.perf_counter()-adam_start)
+                updated = time.perf_counter()
+                event('training_update_complete', step=step, owner=owner, seconds_rank0=updated-started)
                 row = {'step': step, 'owner': owner, 'batch_index': batch_step}
-                if step % options['eval_every'] == 0 or step == options['steps']:
+                evaluated = step % options['eval_every'] == 0 or step == options['steps']
+                evaluation_seconds = 0.0
+                if evaluated:
                     event('evaluation_started', step=step)
+                    evaluation_started = time.perf_counter()
                     value = owner_loss(z, evaluation, eval_y, 'evaluation', step)
                     local_records.append({'step': step, 'loss': value})
                     row['diagnostic_loss'] = aggregate_local_loss(value)
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize(device)
+                    evaluation_seconds = time.perf_counter()-evaluation_started
+                    event('evaluation_complete', step=step, seconds_rank0=evaluation_seconds)
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
-                elapsed = torch.tensor(time.perf_counter()-started, dtype=torch.float64)
+                elapsed = torch.tensor([updated-started, evaluation_seconds, time.perf_counter()-started],
+                                       dtype=torch.float64)
                 dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
-                row['wall_seconds'] = elapsed.item()
+                row['training_update_seconds'] = elapsed[0].item()
+                row['evaluation_seconds'] = elapsed[1].item() if evaluated else None
+                row['wall_seconds'] = elapsed[2].item()
                 records.append(row)
                 event('training_step', **row)
             final = records[-1]['diagnostic_loss']

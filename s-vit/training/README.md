@@ -110,6 +110,8 @@ python -m training.run --backend 3pc --mode secret --device cuda \
 
 默认每步仅对当次数据方做正负各一次前向；初始化诊断和每次评估各额外覆盖三方，因此分别包含三次无扰动前向。`--steps 6` 表示六次 Adam 更新，每方依次参与两次；不是六个完整数据集 epoch。报告中的 wall 时间包含预处理、优化器检查、输入/输出和诊断，不是纯在线双前向时间。暂不缓存或复用协议材料。
 
+`training_step` 和 `report.json` 的每步记录分别给出 `training_update_seconds`（从该步开始到 Adam 更新完成）、`evaluation_seconds`（该步评估时间，未评估时为 `null`）和 `wall_seconds`（含更新、评估和少量日志等开销）。三方模式对每个时间段分别取各方本地时长的最大值，因此三个最大值可能来自不同参与方，不一定严格相加。初始化评估单独由 `training_started` 中的 `initial_evaluation_seconds_rank0` 报告，不在每步时间中。更新和评估时间均包含即时预处理、通信、输出交付与同步，不等于纯在线时间。
+
 三方运行默认打印模型加载、每次正负前向、差分分享、Adam 和评估的起止事件，并逐条写入输出目录下的 `progress.jsonl`，可在另一个终端用 `tail -f "$OUTPUT/progress.jsonl"` 查看。三方运行的 `--debug-progress` 额外打印每个 block、Ring3 材料准备起止和每 30 秒 `forward_heartbeat`；可用 `--heartbeat-seconds 10` 修改心跳间隔。`block_complete` 和 `forward_complete` 中的 `ring3_prepare_seconds_rank0`、`range_check_seconds_rank0` 是 rank 0 的本地墙钟时间，准备和检查以外的时间仍包含 CrypTen provider、通信、运算和等待，不等于纯在线时间；最后的 classifier LayerNorm 也有准备事件，但不属于某个 block。启用详细计时会增加 rank 0 GPU 同步、改变时间和等待行为，不能作为无插桩的性能基准；心跳只能说明日志线程存活，不能单独证明计算有进度。
 
 默认秘密前向不执行中间值范围检查，与已有的推理基准口径一致；`run.json` 和 `report.json` 会记录该设置。需要诊断时加入 `--check-forward-ranges`，检查前向中的输入、RSA 分数和分母等秘密值，并在检测到越界时中止；这会增加三方交互开销。全秘密 Adam 的状态范围检查始终执行。关闭前向检查不代表训练过程中一定没有越界；应结合诊断运行、loss 和明文对照评估数值行为。
