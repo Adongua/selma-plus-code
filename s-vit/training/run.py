@@ -1,0 +1,306 @@
+"""CLI: python -m training.run --backend plaintext|3pc --fixture ..."""
+import argparse
+from dataclasses import asdict
+import json
+import math
+import os
+from pathlib import Path
+import tempfile
+import time
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import torch.nn.functional as F
+
+from .core import ZOConfig, PlainAdam, basis, direction, weights
+from .data import PartyData
+from .model import fixture, load_backbone, PlainOps, forward
+
+
+def write_json(path, data):
+    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False)+'\n')
+
+
+def load(options):
+    return fixture() if options['fixture'] else load_backbone(options['checkpoint'], options['mpcvit_root'], options['fixed_student'])
+
+
+def datasets(options, spec, parties):
+    return {i: PartyData(i, spec, (options['dataset_roots'] or [None]*3)[i],
+                        (options['manifests'] or [None]*3)[i]) for i in parties}
+
+
+def report(options, config, spec, records, initial, final, top1=None):
+    loss_checked = initial is not None and final is not None
+    decreased = (final < initial-options['min_loss_drop']) if loss_checked else None
+    return {'status': ('smoke_passed_not_security_validated' if decreased else
+                       'loss_decrease_not_observed' if loss_checked else 'numerical_run_completed_loss_not_disclosed'),
+            'backend': options['backend'], 'mode': options['mode'], 'config': asdict(config),
+            'model': spec, 'weights': weights(options['weights']), 'steps': records,
+            'initial_loss': initial, 'final_loss': final, 'loss_decreased': decreased,
+            'top1_diagnostic_only': top1, 'prompt_injection': 'additive_patch_embeddings_no_extra_tokens',
+            'public_fixture': options['fixture'], 'diagnostic_loss_disclosure': options['diagnostic_loss'] or options['fixture'],
+            'public_numerical_failure_flags': True,
+            'scope': 'training diagnostic; no validation accuracy or privacy proof',
+            'backbone_frozen': True, 'backbone_weights_secret_in_3pc': options['backend']=='3pc',
+            'optimizer': 'Adam epsilon outside sqrt; secret v_hat projected nonnegative for fixed-point rounding',
+            'timing': 'wall time includes preprocessing, checks, output delivery and diagnostic queries'}
+
+
+@torch.no_grad()
+def run_plain(options, config):
+    device = torch.device(options['device'])
+    spec, params = load(options)
+    params = {k: v.to(device) for k, v in params.items()}
+    ops = PlainOps(params)
+    data = datasets(options, spec, range(3))
+    b = basis(spec['patches']*spec['dim'], config).to(device)
+    w = weights(options['weights'])
+    adam = PlainAdam(config)
+    def loss(z, step, fixed):
+        losses, correct, total = [], 0, 0
+        for party in range(3):
+            x, y = data[party].batch(step, options['batch_size'], fixed)
+            logits = forward(spec, ops, x.to(device), b.matmul(z.to(device)))
+            losses.append(F.cross_entropy(logits, y.to(device)).item())
+            correct += (logits.argmax(-1).cpu() == y).sum().item()
+            total += y.numel()
+        return sum(a*v for a, v in zip(w, losses)), correct/total
+    initial, _ = loss(adam.z, 0, True)
+    records = []
+    for step in range(1, options['steps']+1):
+        started = time.perf_counter()
+        u = direction(step, config)
+        plus, _ = loss(adam.z+config.sigma*u, step-1, options['fixed_batch'])
+        minus, _ = loss(adam.z-config.sigma*u, step-1, options['fixed_batch'])
+        adam.update(plus-minus, u)
+        row = {'step': step}
+        if step % options['eval_every'] == 0 or step == options['steps']:
+            row['diagnostic_loss'], row['top1'] = loss(adam.z, 0, True)
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        row['wall_seconds'] = time.perf_counter()-started
+        records.append(row)
+        print(json.dumps({'event': 'training_step', **row}), flush=True)
+    final, top1 = loss(adam.z, 0, True)
+    torch.save({'format': 'zo_prompt_plain_v1', **adam.state(), 'spec': spec}, Path(options['output'])/'prompt.pt')
+    result = report(options, config, spec, records, initial, final, top1)
+    write_json(Path(options['output'])/'report.json', result)
+
+
+def public_owner_error(owner, function):
+    """All parties fail coherently before the next collective, without data logging."""
+    result, error = None, None
+    if dist.get_rank() == owner:
+        try:
+            result = function()
+        except Exception as exc:
+            error = type(exc).__name__ + ': owner input/model preparation failed'
+    errors = [error]
+    dist.broadcast_object_list(errors, src=owner)
+    if errors[0]:
+        raise RuntimeError(errors[0])
+    return result
+
+
+@torch.no_grad()
+def worker(rank, rendezvous, options, config, incoming, outgoing):
+    from .secure import SecretOps, SecretAdam, open_to, precision, raw_share
+    from .trusted import pack, receive
+    from hattention.experimental_crypten_truncation import experimental_truncation
+    device = torch.device(f'cuda:{rank}' if options['device'] == 'cuda' else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    torch.set_num_threads(1)
+    os.environ.update(RANK=str(rank), WORLD_SIZE='3', RENDEZVOUS=rendezvous, DISTRIBUTED_BACKEND='gloo')
+    import crypten
+    crypten.cfg.encoder.precision_bits = 17
+    crypten.init(device=device)
+    root = Path(options['output'])
+    try:
+        loaded = public_owner_error(0, lambda: load(options))
+        package = [None]
+        if rank == 0:
+            spec, values = loaded
+            if any(not torch.isfinite(v).all() or v.abs().max() > 64 for v in values.values()):
+                # Signal before parameter sharing rather than leave peers blocked.
+                package[0] = {'error': 'invalid frozen model values'}
+            else:
+                package[0] = {'spec': spec, 'shapes': {k: list(v.shape) for k, v in values.items()}}
+        dist.broadcast_object_list(package, src=0)
+        if 'error' in package[0]:
+            raise ValueError(package[0]['error'])
+        spec, shapes = package[0]['spec'], package[0]['shapes']
+        params = {}
+        for key, shape in shapes.items():
+            value = values[key].to(device) if rank == 0 else torch.zeros(shape, device=device, dtype=torch.float64)
+            params[key] = crypten.cryptensor(value, src=0, precision=17, device=device)
+        if rank == 0:
+            del loaded, values
+        # Each process opens only its own data manifest.
+        data = None
+        for owner in range(3):
+            local = public_owner_error(owner, lambda: datasets(options, spec, [owner])[owner])
+            if owner == rank:
+                data = local
+        ops = SecretOps(params, device)
+        b = basis(spec['patches']*spec['dim'], config).to(device)
+        w = weights(options['weights'])
+        diagnostic = options['fixture'] or options['diagnostic_loss']
+        records, local_records = [], []
+
+        def share_batch(step, fixed):
+            shared = []
+            local_y = None
+            for owner in range(3):
+                item = public_owner_error(owner, lambda: data.batch(step, options['batch_size'], fixed))
+                if rank == owner:
+                    x, local_y = item
+                else:
+                    x = torch.zeros(options['batch_size'], *spec['image_shape'], dtype=torch.float64)
+                shared.append(crypten.cryptensor(x.to(device), src=owner, precision=17, device=device))
+            return shared, local_y
+
+        def owner_loss(z, batches, label):
+            prompt = precision(z.matmul(b.t()), 17)
+            local_loss = None
+            for owner in range(3):
+                logits = forward(spec, ops, batches[owner], prompt)
+                opened = open_to(logits, owner)
+                def compute():
+                    if not torch.isfinite(opened).all():
+                        raise ArithmeticError('nonfinite authorized logits')
+                    return F.cross_entropy(opened, label.to(device)).item()
+                value = public_owner_error(owner, compute)
+                if rank == owner:
+                    local_loss = value
+            return local_loss
+
+        def aggregate_local_loss(value):
+            if not diagnostic:
+                return None
+            # Authorized smoke/diagnostic output, independent from secret delta.
+            total = torch.tensor(value*w[rank], dtype=torch.float64)
+            dist.all_reduce(total)
+            return total.item()
+
+        with experimental_truncation('carry_save'):
+            adam = SecretAdam(config, device) if options['mode'] == 'secret' else None
+            z = adam.z if adam else receive(outgoing[rank], config, device)
+            evaluation, eval_y = share_batch(0, True)
+            first = owner_loss(z, evaluation, eval_y)
+            initial = aggregate_local_loss(first)
+            local_records.append({'step': 0, 'loss': first})
+            if rank == 0:
+                print(json.dumps({'event': 'training_started', 'initial_loss': initial, 'mode': options['mode']}), flush=True)
+            for step in range(1, options['steps']+1):
+                started = time.perf_counter()
+                batches, labels = share_batch(step-1, options['fixed_batch'])
+                u = direction(step, config).to(device)
+                plus = owner_loss(z+config.sigma*u, batches, labels)
+                minus = owner_loss(z-config.sigma*u, batches, labels)
+                delta = None
+                for owner in range(3):
+                    value = torch.tensor(plus-minus if rank == owner else 0., dtype=torch.float64, device=device)
+                    term = crypten.cryptensor(value, src=owner, precision=24, device=device)*w[owner]
+                    delta = term if delta is None else delta+term
+                if adam:
+                    z = adam.update(delta, u)
+                else:
+                    # Each party sends ONLY its aggregated delta SHARE to T.
+                    incoming.put((rank, step, pack(raw_share(delta))))
+                    z = receive(outgoing[rank], config, device)
+                row = {'step': step}
+                if step % options['eval_every'] == 0 or step == options['steps']:
+                    value = owner_loss(z, evaluation, eval_y)
+                    local_records.append({'step': step, 'loss': value})
+                    row['diagnostic_loss'] = aggregate_local_loss(value)
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                elapsed = torch.tensor(time.perf_counter()-started, dtype=torch.float64)
+                dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+                row['wall_seconds'] = elapsed.item()
+                records.append(row)
+                if rank == 0:
+                    print(json.dumps({'event': 'training_step', **row}), flush=True)
+            final = records[-1]['diagnostic_loss']
+            state = adam.state() if adam else {'z_share': raw_share(z).cpu(), 'precision': 24, 'step': options['steps']}
+            private_root = root / f'party-{rank}'
+            private_root.mkdir(mode=0o700)
+            torch.save({'format': 'zo_prompt_share_v1', 'party': rank, 'spec': spec,
+                        'config': asdict(config), **state}, private_root/'prompt-share.pt')
+            write_json(private_root/'local-loss.json', local_records)
+            if rank == 0:
+                write_json(root/'report.json', report(options, config, spec, records, initial, final))
+    finally:
+        crypten.uninit()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--backend', choices=['plaintext', '3pc'], required=True)
+    p.add_argument('--mode', choices=['secret', 'trusted'], default='secret')
+    p.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
+    p.add_argument('--fixture', action='store_true', help='PUBLIC mini-transformer overfit diagnostic')
+    p.add_argument('--checkpoint')
+    p.add_argument('--fixed-student')
+    p.add_argument('--mpcvit-root')
+    p.add_argument('--manifests', nargs=3)
+    p.add_argument('--dataset-roots', nargs=3)
+    p.add_argument('--weights', nargs=3, type=float, default=[1, 1, 1])
+    p.add_argument('--steps', type=int, default=10)
+    p.add_argument('--batch-size', type=int, default=1)
+    p.add_argument('--eval-every', type=int, default=5)
+    p.add_argument('--fixed-batch', action='store_true', help='overfit diagnostic, not generalization evaluation')
+    p.add_argument('--diagnostic-loss', action='store_true', help='explicitly authorize aggregate evaluation loss disclosure')
+    p.add_argument('--min-loss-drop', type=float, default=.001)
+    for name in ('rank', 'sigma', 'lr', 'beta1', 'beta2', 'epsilon', 'seed', 'c_bound', 'z_bound', 'sqrt_iters', 'reciprocal_iters'):
+        default = getattr(ZOConfig(), name)
+        p.add_argument('--'+name.replace('_', '-'), type=type(default), default=default)
+    p.add_argument('--output', type=Path, required=True)
+    args = p.parse_args()
+    config = ZOConfig(**{k: getattr(args, k) for k in asdict(ZOConfig())}).validate()
+    weights(args.weights)
+    if min(args.steps, args.batch_size, args.eval_every) < 1 or not math.isfinite(args.min_loss_drop) or args.min_loss_drop < 0:
+        p.error('positive steps, batch and evaluation interval required')
+    if not args.fixture and not all((args.checkpoint, args.fixed_student, args.mpcvit_root, args.manifests, args.dataset_roots)):
+        p.error('real model requires checkpoint, fixed-student, mpcvit-root, 3 manifests and 3 dataset-roots')
+    if args.device == 'cuda' and torch.cuda.device_count() < (3 if args.backend == '3pc' else 1):
+        p.error('insufficient visible CUDA devices')
+    root = args.output.resolve()
+    root.mkdir(parents=True, exist_ok=False, mode=0o700)
+    options = vars(args).copy()
+    options['output'] = str(root)
+    write_json(root/'run.json', {'options': options, 'config': asdict(config)})
+    torch.set_num_threads(1)
+    if args.backend == 'plaintext':
+        run_plain(options, config)
+    else:
+        ctx = mp.get_context('spawn')
+        incoming, outgoing, service = None, None, None
+        if args.mode == 'trusted':
+            from .trusted import serve
+            incoming, outgoing = ctx.Queue(), [ctx.Queue() for _ in range(3)]
+            service_root = root/'trusted-service'
+            service_root.mkdir(mode=0o700)
+            service = ctx.Process(target=serve, args=(config, args.steps, incoming, outgoing, service_root/'state.pt'))
+            service.start()
+        try:
+            with tempfile.TemporaryDirectory(prefix='rendezvous-', dir=root) as tmp:
+                mp.spawn(worker, args=(Path(tmp, 'store').as_uri(), options, config, incoming, outgoing), nprocs=3, join=True)
+            if service:
+                service.join(timeout=10)
+                if service.exitcode != 0:
+                    raise RuntimeError('trusted service did not exit successfully')
+        finally:
+            if service and service.is_alive():
+                service.terminate()
+                service.join(timeout=5)
+    result = json.loads((root/'report.json').read_text())
+    print(json.dumps({'event': 'training_complete', 'report': str(root/'report.json'), 'status': result['status']}), flush=True)
+    if result['loss_decreased'] is False:
+        raise SystemExit(2)
+
+
+if __name__ == '__main__':
+    main()
