@@ -64,7 +64,7 @@ def check_secret(value, bound, site, lower=None):
 
 
 class SecretOps:
-    def __init__(self, params, device, trace=None):
+    def __init__(self, params, device, trace=None, check_forward_ranges=False):
         if device.type == 'cpu':
             from sgelu.runtime import Ring3, Ring3Wide
             self.base = Ring3()
@@ -75,6 +75,7 @@ class SecretOps:
             self.wide = CudaRing3Wide(self.base)
         self.params = params
         self.trace = trace
+        self.check_forward_ranges = check_forward_ranges
 
     def span(self, category, site):
         return self.trace.span(category, site) if self.trace else nullcontext()
@@ -92,6 +93,8 @@ class SecretOps:
         return crypten.cat(tensors, dim=dim)
 
     def check(self, x, bound, site):
+        if not self.check_forward_ranges:
+            return
         with self.span('range_check', site):
             check_secret(x, bound, site)
 
@@ -140,8 +143,9 @@ class SecretOps:
                 self.check(from_share(score, 17), 16 - 2**-17, 'rsa.score')
                 positive = ruler_srelu(self.base, self.wide, score, mat.srelu)
                 denominator = positive.sum(-1, keepdim=True) + self.base.public(round(mat.profile.epsilon*2**17))
-                with self.span('range_check', 'rsa.denominator'):
-                    check_secret(from_share(denominator, 17), 2048, 'rsa.denominator', lower=.0005)
+                if self.check_forward_ranges:
+                    with self.span('range_check', 'rsa.denominator'):
+                        check_secret(from_share(denominator, 17), 2048, 'rsa.denominator', lower=.0005)
                 inv = wide_reciprocal(self.base, denominator, mat.reciprocal, mat.profile)
                 weighted = trunc('weight', self.base.mul(positive, inv))
                 group = trunc('output', secure_matmul(self.base, weighted, vr))

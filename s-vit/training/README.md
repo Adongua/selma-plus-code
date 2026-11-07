@@ -108,11 +108,17 @@ python -m training.run --backend 3pc --mode secret --device cuda \
 
 此命令使用公开 Tiny-ImageNet 诊断数据，`--diagnostic-loss` **显式允许公开聚合的评估 loss**。实际私有数据默认不输出全局 loss；各方在自己的 `party-i/local-loss.json` 保存其获授权的本地损失。不要将三方的私有目录集中交给任一计算方，当前同机目录隔离仅用于实验组织，不构成 OS 级隐私边界。
 
-默认每步仅对当次数据方做正负各一次前向；初始化诊断和每次评估各额外覆盖三方，因此分别包含三次无扰动前向。`--steps 6` 表示六次 Adam 更新，每方依次参与两次；不是六个完整数据集 epoch。报告中的 wall 时间包含预处理、检查、输入/输出和诊断，不是纯在线双前向时间。暂不缓存或复用协议材料。
+默认每步仅对当次数据方做正负各一次前向；初始化诊断和每次评估各额外覆盖三方，因此分别包含三次无扰动前向。`--steps 6` 表示六次 Adam 更新，每方依次参与两次；不是六个完整数据集 epoch。报告中的 wall 时间包含预处理、优化器检查、输入/输出和诊断，不是纯在线双前向时间。暂不缓存或复用协议材料。
 
 三方运行默认打印模型加载、每次正负前向、差分分享、Adam 和评估的起止事件，并逐条写入输出目录下的 `progress.jsonl`，可在另一个终端用 `tail -f "$OUTPUT/progress.jsonl"` 查看。三方运行的 `--debug-progress` 额外打印每个 block、Ring3 材料准备起止和每 30 秒 `forward_heartbeat`；可用 `--heartbeat-seconds 10` 修改心跳间隔。`block_complete` 和 `forward_complete` 中的 `ring3_prepare_seconds_rank0`、`range_check_seconds_rank0` 是 rank 0 的本地墙钟时间，准备和检查以外的时间仍包含 CrypTen provider、通信、运算和等待，不等于纯在线时间；最后的 classifier LayerNorm 也有准备事件，但不属于某个 block。启用详细计时会增加 rank 0 GPU 同步、改变时间和等待行为，不能作为无插桩的性能基准；心跳只能说明日志线程存活，不能单独证明计算有进度。
 
-若需要可信模式，将 `--mode secret` 改成 `--mode trusted` 并更换输出目录。若检查到 RSA 分母、GeLU/LayerNorm 输入或 Adam 状态越界，先保存完整报错；不要通过关闭数值检查宣布通过。
+默认秘密前向不执行中间值范围检查，与已有的推理基准口径一致；`run.json` 和 `report.json` 会记录该设置。需要诊断时加入 `--check-forward-ranges`，检查前向中的输入、RSA 分数和分母等秘密值，并在检测到越界时中止；这会增加三方交互开销。全秘密 Adam 的状态范围检查始终执行。关闭前向检查不代表训练过程中一定没有越界；应结合诊断运行、loss 和明文对照评估数值行为。
+
+为加快测试，可在三方命令中加入 `--ring3-truncation-preprocessing trusted-dealer`。本机独立进程根据公开的张量形状和截断位数，生成全新的随机截断关联材料并分发三方份额；每次请求均生成新材料，不复用。此选项替代 Ring3 概率截断材料的分布式生成，RSA、LayerNorm、GeLU 的其他准备工作以及 CrypTen provider 和 Adam 仍会产生开销。`ring3_prepare_seconds_rank0` 包含可信进程生成及传输等待，不能直接视为在线时间；对比运行时应使用相同的日志设置。
+
+这是本机可信预处理模拟，使用 NumPy 随机数与本地进程通信，没有经过密码学安全验证，也不代表独立机器上的安全部署。默认 `distributed` 模式继续使用原有实现；`run.json`、`report.json` 和启动事件会记录所选模式。
+
+若需要可信模式，将 `--mode secret` 改成 `--mode trusted` 并更换输出目录。
 
 ## 5. 明文微调与独立清单评估
 

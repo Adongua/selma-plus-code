@@ -42,6 +42,8 @@ def report(options, config, spec, records, initial, final, top1=None):
             'top1_diagnostic_only': top1, 'prompt_injection': 'additive_patch_embeddings_no_extra_tokens',
             'public_fixture': options['fixture'], 'diagnostic_loss_disclosure': options['diagnostic_loss'] or options['fixture'],
             'public_numerical_failure_flags': True,
+            'secret_forward_range_checks': options['backend'] == '3pc' and options['check_forward_ranges'],
+            'ring3_truncation_preprocessing': options['ring3_truncation_preprocessing'],
             'scope': 'training diagnostic; no validation accuracy or privacy proof',
             'backbone_frozen': True, 'backbone_weights_secret_in_3pc': options['backend']=='3pc',
             'update_schedule': options['update_schedule'],
@@ -111,11 +113,12 @@ def public_owner_error(owner, function):
 
 
 @torch.no_grad()
-def worker(rank, rendezvous, options, config, incoming, outgoing):
+def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connections):
     from .secure import SecretOps, SecretAdam, open_to, precision, raw_share
     from .trusted import pack, receive
     from hattention.experimental_crypten_truncation import experimental_truncation
     from .trace import ProgressTrace
+    from .truncation_dealer import trusted_truncations
     device = torch.device(f'cuda:{rank}' if options['device'] == 'cuda' else 'cpu')
     if device.type == 'cuda':
         torch.cuda.set_device(device)
@@ -166,7 +169,9 @@ def worker(rank, rendezvous, options, config, incoming, outgoing):
             local = public_owner_error(owner, lambda: datasets(options, spec, [owner])[owner])
             if owner == rank:
                 data = local
-        ops = SecretOps(params, device, trace)
+        ops = SecretOps(params, device, trace, check_forward_ranges=options['check_forward_ranges'])
+        event('forward_range_checks_configured', enabled=options['check_forward_ranges'])
+        event('ring3_truncation_preprocessing_configured', mode=options['ring3_truncation_preprocessing'])
         b = basis(spec['patches']*spec['dim'], config).to(device)
         w = weights(options['weights'])
         diagnostic = options['fixture'] or options['diagnostic_loss']
@@ -226,7 +231,8 @@ def worker(rank, rendezvous, options, config, incoming, outgoing):
             dist.all_reduce(total)
             return total.item()
 
-        with experimental_truncation('carry_save'):
+        dealer_connection = dealer_connections[rank] if dealer_connections else None
+        with experimental_truncation('carry_save'), trusted_truncations(dealer_connection):
             event('initial_evaluation_started')
             initial_start = time.perf_counter()
             adam = SecretAdam(config, device) if options['mode'] == 'secret' else None
@@ -319,6 +325,10 @@ def main():
     p.add_argument('--update-schedule', choices=['round-robin', 'aggregate'], default='round-robin',
                    help='round-robin: one owner batch and update per step; aggregate: all owners per update')
     p.add_argument('--debug-progress', action='store_true', help='rank-0 block and Ring3 preparation timing (adds GPU synchronizations)')
+    p.add_argument('--check-forward-ranges', action='store_true',
+                   help='enable secret runtime checks for forward numerical ranges (extra MPC work)')
+    p.add_argument('--ring3-truncation-preprocessing', choices=['distributed', 'trusted-dealer'],
+                   default='distributed', help='trusted-dealer is a local performance simulation, not security validated')
     p.add_argument('--heartbeat-seconds', type=float, default=30., help='debug forward heartbeat interval')
     p.add_argument('--min-loss-drop', type=float, default=.001)
     for name in ('rank', 'sigma', 'lr', 'beta1', 'beta2', 'epsilon', 'seed', 'c_bound', 'z_bound', 'sqrt_iters', 'reciprocal_iters'):
@@ -335,6 +345,8 @@ def main():
         p.error('real model requires checkpoint, fixed-student, mpcvit-root, 3 manifests and 3 dataset-roots')
     if args.device == 'cuda' and torch.cuda.device_count() < (3 if args.backend == '3pc' else 1):
         p.error('insufficient visible CUDA devices')
+    if args.backend != '3pc' and args.ring3_truncation_preprocessing != 'distributed':
+        p.error('trusted-dealer preprocessing requires the 3pc backend')
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False, mode=0o700)
     options = vars(args).copy()
@@ -346,6 +358,7 @@ def main():
     else:
         ctx = mp.get_context('spawn')
         incoming, outgoing, service = None, None, None
+        dealer, dealer_clients, dealer_servers = None, None, None
         if args.mode == 'trusted':
             from .trusted import serve
             incoming, outgoing = ctx.Queue(), [ctx.Queue() for _ in range(3)]
@@ -354,13 +367,28 @@ def main():
             service = ctx.Process(target=serve, args=(config, args.steps, incoming, outgoing, service_root/'state.pt'))
             service.start()
         try:
+            if args.ring3_truncation_preprocessing == 'trusted-dealer':
+                from .truncation_dealer import serve as serve_truncations
+                pipes = [ctx.Pipe() for _ in range(3)]
+                dealer_servers, dealer_clients = zip(*pipes)
+                dealer = ctx.Process(target=serve_truncations, args=(dealer_servers,))
+                dealer.start()
+                for connection in dealer_servers:
+                    connection.close()
+                dealer_servers = None
             with tempfile.TemporaryDirectory(prefix='rendezvous-', dir=root) as tmp:
-                mp.spawn(worker, args=(Path(tmp, 'store').as_uri(), options, config, incoming, outgoing), nprocs=3, join=True)
+                mp.spawn(worker, args=(Path(tmp, 'store').as_uri(), options, config, incoming, outgoing, dealer_clients), nprocs=3, join=True)
             if service:
                 service.join(timeout=10)
                 if service.exitcode != 0:
                     raise RuntimeError('trusted service did not exit successfully')
         finally:
+            if dealer:
+                if dealer.is_alive():
+                    dealer.terminate()
+                dealer.join(timeout=5)
+            for connection in (dealer_servers or ()) + (dealer_clients or ()):
+                connection.close()
             if service and service.is_alive():
                 service.terminate()
                 service.join(timeout=5)

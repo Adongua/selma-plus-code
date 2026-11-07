@@ -33,6 +33,17 @@ def worker(rank, rendezvous):
             spec, params = fixture()
             secret_params = {k: crypten.cryptensor(v, src=0, precision=17) for k,v in params.items()}
             ops = SecretOps(secret_params, torch.device('cpu'))
+            # Forward range checks are opt-in; the same violating secret is
+            # accepted by the inference-style path and rejected in diagnostics.
+            ops.check(signs, 8., 'disabled-forward-check')
+            ops.check_forward_ranges = True
+            try:
+                ops.check(signs, 8., 'enabled-forward-check')
+            except ArithmeticError:
+                pass
+            else:
+                raise AssertionError('enabled forward range violation was missed')
+            ops.check_forward_ranges = False
             image = torch.full((1,3,4,4), .1, dtype=torch.float64)
             prompt = torch.linspace(-.05,.05,spec['patches']*spec['dim'], dtype=torch.float64)
             expected = forward(spec, PlainOps(params), image, prompt)
