@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import torch
 import torch.distributed as dist
@@ -43,6 +44,9 @@ def report(options, config, spec, records, initial, final, top1=None):
             'public_numerical_failure_flags': True,
             'scope': 'training diagnostic; no validation accuracy or privacy proof',
             'backbone_frozen': True, 'backbone_weights_secret_in_3pc': options['backend']=='3pc',
+            'update_schedule': options['update_schedule'],
+            'training_weights': (weights(options['weights']) if options['update_schedule']=='aggregate' else None),
+            'diagnostic_weights': weights(options['weights']),
             'optimizer': 'Adam epsilon outside sqrt; secret v_hat projected nonnegative for fixed-point rounding',
             'timing': 'wall time includes preprocessing, checks, output delivery and diagnostic queries'}
 
@@ -57,24 +61,27 @@ def run_plain(options, config):
     b = basis(spec['patches']*spec['dim'], config).to(device)
     w = weights(options['weights'])
     adam = PlainAdam(config)
-    def loss(z, step, fixed):
+    def loss(z, step, fixed, parties=range(3)):
         losses, correct, total = [], 0, 0
-        for party in range(3):
+        for party in parties:
             x, y = data[party].batch(step, options['batch_size'], fixed)
             logits = forward(spec, ops, x.to(device), b.matmul(z.to(device)))
             losses.append(F.cross_entropy(logits, y.to(device)).item())
             correct += (logits.argmax(-1).cpu() == y).sum().item()
             total += y.numel()
-        return sum(a*v for a, v in zip(w, losses)), correct/total
+        return (sum(w[i]*v for i, v in zip(parties, losses)) if len(losses)>1 else losses[0]), correct/total
     initial, _ = loss(adam.z, 0, True)
     records = []
     for step in range(1, options['steps']+1):
         started = time.perf_counter()
         u = direction(step, config)
-        plus, _ = loss(adam.z+config.sigma*u, step-1, options['fixed_batch'])
-        minus, _ = loss(adam.z-config.sigma*u, step-1, options['fixed_batch'])
+        owner = (step-1)%3 if options['update_schedule']=='round-robin' else None
+        parties = [owner] if owner is not None else range(3)
+        batch_step = (step-1)//3 if owner is not None else step-1
+        plus, _ = loss(adam.z+config.sigma*u, batch_step, options['fixed_batch'], parties)
+        minus, _ = loss(adam.z-config.sigma*u, batch_step, options['fixed_batch'], parties)
         adam.update(plus-minus, u)
-        row = {'step': step}
+        row = {'step': step, 'owner': owner, 'batch_index': batch_step}
         if step % options['eval_every'] == 0 or step == options['steps']:
             row['diagnostic_loss'], row['top1'] = loss(adam.z, 0, True)
         if device.type == 'cuda':
@@ -108,6 +115,7 @@ def worker(rank, rendezvous, options, config, incoming, outgoing):
     from .secure import SecretOps, SecretAdam, open_to, precision, raw_share
     from .trusted import pack, receive
     from hattention.experimental_crypten_truncation import experimental_truncation
+    from .trace import ProgressTrace
     device = torch.device(f'cuda:{rank}' if options['device'] == 'cuda' else 'cpu')
     if device.type == 'cuda':
         torch.cuda.set_device(device)
@@ -117,7 +125,20 @@ def worker(rank, rendezvous, options, config, incoming, outgoing):
     crypten.cfg.encoder.precision_bits = 17
     crypten.init(device=device)
     root = Path(options['output'])
+    event_lock = threading.Lock()
+    def emit(record):
+        if rank == 0:
+            line = json.dumps(record, allow_nan=False)
+            with event_lock:
+                print(line, flush=True)
+                with (root/'progress.jsonl').open('a', encoding='utf-8') as output:
+                    output.write(line+'\n')
+    trace = ProgressTrace(options['debug_progress'] and rank == 0, device, options['heartbeat_seconds'], emit)
+    def event(name, **fields):
+        emit({'event': name, **fields})
     try:
+        event('model_loading_started')
+        setup_start = time.perf_counter()
         loaded = public_owner_error(0, lambda: load(options))
         package = [None]
         if rank == 0:
@@ -131,41 +152,55 @@ def worker(rank, rendezvous, options, config, incoming, outgoing):
         if 'error' in package[0]:
             raise ValueError(package[0]['error'])
         spec, shapes = package[0]['spec'], package[0]['shapes']
+        event('model_sharing_started', tensors=len(shapes), seconds_since_load_start=time.perf_counter()-setup_start)
         params = {}
         for key, shape in shapes.items():
             value = values[key].to(device) if rank == 0 else torch.zeros(shape, device=device, dtype=torch.float64)
             params[key] = crypten.cryptensor(value, src=0, precision=17, device=device)
         if rank == 0:
             del loaded, values
+        event('model_sharing_complete', tensors=len(shapes), seconds_since_load_start=time.perf_counter()-setup_start)
         # Each process opens only its own data manifest.
         data = None
         for owner in range(3):
             local = public_owner_error(owner, lambda: datasets(options, spec, [owner])[owner])
             if owner == rank:
                 data = local
-        ops = SecretOps(params, device)
+        ops = SecretOps(params, device, trace)
         b = basis(spec['patches']*spec['dim'], config).to(device)
         w = weights(options['weights'])
         diagnostic = options['fixture'] or options['diagnostic_loss']
         records, local_records = [], []
 
-        def share_batch(step, fixed):
-            shared = []
+        def share_batch(step, fixed, owners):
+            shared = {}
             local_y = None
-            for owner in range(3):
+            for owner in owners:
                 item = public_owner_error(owner, lambda: data.batch(step, options['batch_size'], fixed))
                 if rank == owner:
                     x, local_y = item
                 else:
                     x = torch.zeros(options['batch_size'], *spec['image_shape'], dtype=torch.float64)
-                shared.append(crypten.cryptensor(x.to(device), src=owner, precision=17, device=device))
+                shared[owner] = crypten.cryptensor(x.to(device), src=owner, precision=17, device=device)
             return shared, local_y
 
-        def owner_loss(z, batches, label):
+        def owner_loss(z, batches, label, query, step):
+            event('prompt_projection_started', step=step, query=query)
+            trace.sync()
+            projection_start = time.perf_counter()
             prompt = precision(z.matmul(b.t()), 17)
+            trace.sync()
+            event('prompt_projection_complete', step=step, query=query,
+                  seconds_rank0=time.perf_counter()-projection_start)
             local_loss = None
-            for owner in range(3):
-                logits = forward(spec, ops, batches[owner], prompt)
+            for owner in batches:
+                trace.context = {'step': step, 'owner': owner, 'query': query}
+                event('forward_started', step=step, owner=owner, query=query)
+                trace.sync()
+                trace_before = trace.totals.copy()
+                start = time.perf_counter()
+                with trace.heartbeat():
+                    logits = forward(spec, ops, batches[owner], prompt)
                 opened = open_to(logits, owner)
                 def compute():
                     if not torch.isfinite(opened).all():
@@ -174,6 +209,13 @@ def worker(rank, rendezvous, options, config, incoming, outgoing):
                 value = public_owner_error(owner, compute)
                 if rank == owner:
                     local_loss = value
+                trace.sync()
+                timing = {}
+                if trace.enabled:
+                    timing = {'ring3_prepare_seconds_rank0': trace.totals['ring3_prepare']-trace_before['ring3_prepare'],
+                              'range_check_seconds_rank0': trace.totals['range_check']-trace_before['range_check']}
+                event('forward_complete', step=step, owner=owner, query=query,
+                      seconds_rank0=time.perf_counter()-start, **timing)
             return local_loss
 
         def aggregate_local_loss(value):
@@ -185,34 +227,56 @@ def worker(rank, rendezvous, options, config, incoming, outgoing):
             return total.item()
 
         with experimental_truncation('carry_save'):
+            event('initial_evaluation_started')
+            initial_start = time.perf_counter()
             adam = SecretAdam(config, device) if options['mode'] == 'secret' else None
             z = adam.z if adam else receive(outgoing[rank], config, device)
-            evaluation, eval_y = share_batch(0, True)
-            first = owner_loss(z, evaluation, eval_y)
+            evaluation, eval_y = share_batch(0, True, range(3))
+            first = owner_loss(z, evaluation, eval_y, 'initial_evaluation', 0)
             initial = aggregate_local_loss(first)
             local_records.append({'step': 0, 'loss': first})
-            if rank == 0:
-                print(json.dumps({'event': 'training_started', 'initial_loss': initial, 'mode': options['mode']}), flush=True)
+            event('training_started', initial_loss=initial, mode=options['mode'],
+                  initial_evaluation_seconds_rank0=time.perf_counter()-initial_start)
             for step in range(1, options['steps']+1):
                 started = time.perf_counter()
-                batches, labels = share_batch(step-1, options['fixed_batch'])
+                owner = (step-1)%3 if options['update_schedule']=='round-robin' else None
+                owners = [owner] if owner is not None else range(3)
+                batch_step = (step-1)//3 if owner is not None else step-1
+                event('step_started', step=step, owner=owner, batch_index=batch_step)
+                trace.sync()
+                share_start = time.perf_counter()
+                batches, labels = share_batch(batch_step, options['fixed_batch'], owners)
+                trace.sync()
+                event('batch_shared', step=step, owner=owner, seconds_rank0=time.perf_counter()-share_start)
                 u = direction(step, config).to(device)
-                plus = owner_loss(z+config.sigma*u, batches, labels)
-                minus = owner_loss(z-config.sigma*u, batches, labels)
+                plus = owner_loss(z+config.sigma*u, batches, labels, 'plus', step)
+                minus = owner_loss(z-config.sigma*u, batches, labels, 'minus', step)
+                event('delta_sharing_started', step=step, owner=owner)
+                trace.sync()
+                delta_start = time.perf_counter()
                 delta = None
-                for owner in range(3):
-                    value = torch.tensor(plus-minus if rank == owner else 0., dtype=torch.float64, device=device)
-                    term = crypten.cryptensor(value, src=owner, precision=24, device=device)*w[owner]
+                for data_owner in owners:
+                    value = torch.tensor(plus-minus if rank == data_owner else 0., dtype=torch.float64, device=device)
+                    weight = w[data_owner] if owner is None else 1.
+                    term = crypten.cryptensor(value, src=data_owner, precision=24, device=device)*weight
                     delta = term if delta is None else delta+term
+                trace.sync()
+                event('delta_sharing_complete', step=step, owner=owner, seconds_rank0=time.perf_counter()-delta_start)
+                event('adam_started', step=step, owner=owner)
+                adam_start = time.perf_counter()
                 if adam:
                     z = adam.update(delta, u)
                 else:
                     # Each party sends ONLY its aggregated delta SHARE to T.
                     incoming.put((rank, step, pack(raw_share(delta))))
                     z = receive(outgoing[rank], config, device)
-                row = {'step': step}
+                if device.type == 'cuda':
+                    torch.cuda.synchronize(device)
+                event('adam_complete', step=step, owner=owner, seconds_rank0=time.perf_counter()-adam_start)
+                row = {'step': step, 'owner': owner, 'batch_index': batch_step}
                 if step % options['eval_every'] == 0 or step == options['steps']:
-                    value = owner_loss(z, evaluation, eval_y)
+                    event('evaluation_started', step=step)
+                    value = owner_loss(z, evaluation, eval_y, 'evaluation', step)
                     local_records.append({'step': step, 'loss': value})
                     row['diagnostic_loss'] = aggregate_local_loss(value)
                 if device.type == 'cuda':
@@ -221,8 +285,7 @@ def worker(rank, rendezvous, options, config, incoming, outgoing):
                 dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
                 row['wall_seconds'] = elapsed.item()
                 records.append(row)
-                if rank == 0:
-                    print(json.dumps({'event': 'training_step', **row}), flush=True)
+                event('training_step', **row)
             final = records[-1]['diagnostic_loss']
             state = adam.state() if adam else {'z_share': raw_share(z).cpu(), 'precision': 24, 'step': options['steps']}
             private_root = root / f'party-{rank}'
@@ -253,6 +316,10 @@ def main():
     p.add_argument('--eval-every', type=int, default=5)
     p.add_argument('--fixed-batch', action='store_true', help='overfit diagnostic, not generalization evaluation')
     p.add_argument('--diagnostic-loss', action='store_true', help='explicitly authorize aggregate evaluation loss disclosure')
+    p.add_argument('--update-schedule', choices=['round-robin', 'aggregate'], default='round-robin',
+                   help='round-robin: one owner batch and update per step; aggregate: all owners per update')
+    p.add_argument('--debug-progress', action='store_true', help='rank-0 block and Ring3 preparation timing (adds GPU synchronizations)')
+    p.add_argument('--heartbeat-seconds', type=float, default=30., help='debug forward heartbeat interval')
     p.add_argument('--min-loss-drop', type=float, default=.001)
     for name in ('rank', 'sigma', 'lr', 'beta1', 'beta2', 'epsilon', 'seed', 'c_bound', 'z_bound', 'sqrt_iters', 'reciprocal_iters'):
         default = getattr(ZOConfig(), name)
@@ -261,7 +328,8 @@ def main():
     args = p.parse_args()
     config = ZOConfig(**{k: getattr(args, k) for k in asdict(ZOConfig())}).validate()
     weights(args.weights)
-    if min(args.steps, args.batch_size, args.eval_every) < 1 or not math.isfinite(args.min_loss_drop) or args.min_loss_drop < 0:
+    if (min(args.steps, args.batch_size, args.eval_every) < 1 or not math.isfinite(args.min_loss_drop)
+            or args.min_loss_drop < 0 or not math.isfinite(args.heartbeat_seconds) or args.heartbeat_seconds <= 0):
         p.error('positive steps, batch and evaluation interval required')
     if not args.fixture and not all((args.checkpoint, args.fixed_student, args.mpcvit_root, args.manifests, args.dataset_roots)):
         p.error('real model requires checkpoint, fixed-student, mpcvit-root, 3 manifests and 3 dataset-roots')

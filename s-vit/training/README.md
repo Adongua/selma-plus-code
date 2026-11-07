@@ -6,10 +6,10 @@
 
 - 提示位置：在 tokenizer 之后给 **patch embedding 加提示**，CLS 和 token 数不变，不追加 prompt token。固定公共基 `B` 通过带固定种子的高斯矩阵 QR 构造，`p=Bz`；列向量在浮点参考中正交归一，定点投影存在量化误差。
 - 冻结骨干：所有参与前向的权重、偏置、CLS 和位置向量均通过 CrypTen 秘密分享。程序只有模型输入方 P0 读取权重，P1/P2 只接收公开结构和份额。当前模型所有者由 P0 兼任；未实现独立第四方模型输入服务。
-- 每步：公开单位球面方向、同批次正负扰动、两次覆盖三方批次的前向。当前按数据所有者顺序执行，因此有 6 次本地批次前向；不表示算法需要 6 个不同方向。关闭训练随机层，不建立反向图。
-- 各方只重构自己批次的 logits、在本地计算交叉熵，重新分享 `L_plus-L_minus` 后秘密加权。`g=r*delta*u/(2*sigma)`。
+- 默认 `--update-schedule round-robin`：每步按 P0、P1、P2 轮流选择一方的一个 batch，正、负扰动各做一次三方联合安全前向，将该方 loss 差秘密分享后更新一次共享 prompt。每个 step 使用新方向，三步才覆盖三方各一个 batch。每方独立维护批次游标；`--fixed-batch` 使其始终使用各自首批样本。无反向图。
+- 可选 `--update-schedule aggregate`：旧方案，每步各方各处理一个 batch，用同一方向计算三个 loss 差，秘密加权聚合后更新一次；每步六次安全前向。`g=r*delta*u/(2*sigma)`。
 - `secret`：z/m/v 为 Q24 份额，二阶矩使用一次秘密标量 `c*c` 与公开 `u*u`。平方根用固定次数秘密二分，倒数用固定次数 Newton 迭代；epsilon 加在平方根外。由定点舍入造成的负二阶矩通过秘密选择投影到非负域，这是数值实现细节，不是替换 Adam 的归一化公式。
-- `trusted`：独立的本地 T 进程（不在三方进程组中）接收三方各自的聚合差分份额，重构差分并执行明文 Adam；重新生成三份 Q24 z。T 不接收图片、标签、logits 或单方损失差。Queue 仅模拟本机服务传输，不是认证加密的远程服务。
+- `trusted`：独立的本地 T 进程（不在三方进程组中）接收三方的差分份额、重构并执行明文 Adam，再重新分享 Q24 z。**轮流更新时重构的是当前数据方的单方 loss 差**；聚合模式才是聚合后的 loss 差。使用前须授权 T 获取该信息。T 不直接接收图片、标签或 logits。Queue 仅模拟本机服务传输，不是认证加密的远程服务。
 - `plaintext`：相同基、方向、样本顺序、CE 和 Adam；前向使用同一布局、sReLU/G2 明文公式及量化后的 LayerNorm epsilon。其结果与 3PC 不要求逐位一致。
 
 全秘密指优化状态不向协调方打开，不表示整个程序没有授权输出。当前范围检查会公开**是否越界的失败位**；最终输出采用数据所有者授权重构。原有 Ruler 打开消息及 CrypTen provider 假设没有因本目录实现而得到安全证明。
@@ -21,6 +21,7 @@
 | `core.py` | 超参数、正交基、球面方向、明文 Adam |
 | `model.py` | 冻结 ViTLite 导入、公开小模型、共用前向与提示注入 |
 | `secure.py` | 秘密权重算子、按所有者重构、范围位检查、秘密 Adam |
+| `trace.py` | 可选进度心跳、分块时间和 Ring3 准备计时 |
 | `trusted.py` | 三方组以外的可信 Adam 进程与提示重新分享 |
 | `data.py` | 所有者本地样本清单与固定/轮换批次 |
 | `run.py` | 明文 / 3PC 训练入口、检查点和报告 |
@@ -63,7 +64,7 @@ python -m unittest training.tests.test_core training.tests.test_secure
 
 `report.json` 给出 `initial_loss`、`final_loss`、`loss_decreased` 及每个诊断点。默认最终 loss 至少降低 0.001 才标记 `smoke_passed_not_security_validated`；未下降标记 `loss_decrease_not_observed` 并返回退出码 2。范围错误直接终止，不自动换明文或裁掉异常样本。loss 不要求每一步严格单调。
 
-本次本地 CPU 验证：8 步全秘密运行约 `3.35031 → 3.33888`，可信服务模式约 `3.35026 → 3.33891`，相同明文配置约 `3.35021 → 3.33886`。具体以运行报告为准；预处理随机性和硬件状态会造成变化，不能推断完整 ViT 或 GPU 已通过。
+旧的聚合模式曾完成本地 CPU 8 步验证；不同更新模式的一个 step 所含数据量不同，应分别查看运行报告。预处理随机性和硬件状态会造成变化，不能据小模型推断完整 ViT 或 GPU 已通过。
 
 另外已验证 9 层 `0.3-kd` 骨干导入：零提示前向与原模型在相同 GeLU、RSA epsilon、LayerNorm epsilon 下的明文输出一致。该检查验证模型布局和权重导入，不替代两个蒸馏后 hAttention 检查点的三方验证。
 
@@ -100,14 +101,16 @@ python -m training.run --backend 3pc --mode secret --device cuda \
   --dataset-roots "$DATA" "$DATA" "$DATA" \
   --manifests "$SPLIT/party-0.json" "$SPLIT/party-1.json" "$SPLIT/party-2.json" \
   --rank 4 --sigma 0.1 --lr 0.03 --epsilon 0.01 \
-  --batch-size 1 --steps 5 --fixed-batch --eval-every 5 \
-  --diagnostic-loss \
-  --output "$HOME/home/tmp/zo-prompt-vit-secret-v1"
+  --batch-size 1 --steps 6 --fixed-batch --eval-every 6 \
+  --diagnostic-loss --update-schedule round-robin --debug-progress \
+  --output "$HOME/home/tmp/zo-prompt-vit-round-robin-v1"
 ```
 
 此命令使用公开 Tiny-ImageNet 诊断数据，`--diagnostic-loss` **显式允许公开聚合的评估 loss**。实际私有数据默认不输出全局 loss；各方在自己的 `party-i/local-loss.json` 保存其获授权的本地损失。不要将三方的私有目录集中交给任一计算方，当前同机目录隔离仅用于实验组织，不构成 OS 级隐私边界。
 
-首次运行比原先公开权重推理更贵：模型权重也成为秘密输入，每步有正负两次覆盖三方数据的前向，还有安全范围检查。诊断 loss 需要额外的无扰动前向；报告中的 wall 时间包含预处理、检查、输入/输出和诊断，不是纯在线双前向时间。暂不缓存或复用协议材料。
+默认每步仅对当次数据方做正负各一次前向；初始化诊断和每次评估各额外覆盖三方，因此分别包含三次无扰动前向。`--steps 6` 表示六次 Adam 更新，每方依次参与两次；不是六个完整数据集 epoch。报告中的 wall 时间包含预处理、检查、输入/输出和诊断，不是纯在线双前向时间。暂不缓存或复用协议材料。
+
+三方运行默认打印模型加载、每次正负前向、差分分享、Adam 和评估的起止事件，并逐条写入输出目录下的 `progress.jsonl`，可在另一个终端用 `tail -f "$OUTPUT/progress.jsonl"` 查看。三方运行的 `--debug-progress` 额外打印每个 block、Ring3 材料准备起止和每 30 秒 `forward_heartbeat`；可用 `--heartbeat-seconds 10` 修改心跳间隔。`block_complete` 和 `forward_complete` 中的 `ring3_prepare_seconds_rank0`、`range_check_seconds_rank0` 是 rank 0 的本地墙钟时间，准备和检查以外的时间仍包含 CrypTen provider、通信、运算和等待，不等于纯在线时间；最后的 classifier LayerNorm 也有准备事件，但不属于某个 block。启用详细计时会增加 rank 0 GPU 同步、改变时间和等待行为，不能作为无插桩的性能基准；心跳只能说明日志线程存活，不能单独证明计算有进度。
 
 若需要可信模式，将 `--mode secret` 改成 `--mode trusted` 并更换输出目录。若检查到 RSA 分母、GeLU/LayerNorm 输入或 Adam 状态越界，先保存完整报错；不要通过关闭数值检查宣布通过。
 
@@ -126,7 +129,7 @@ CUDA_VISIBLE_DEVICES=0 python -m training.run \
   --output "$HOME/home/tmp/zo-prompt-vit-plain-v1"
 ```
 
-上例是调用形式，不是推荐用 12 张图像评估模型效用。应先用更大的新清单替换 `$SPLIT`，例如 `--classes 200 --per-party-per-class 10 --eval-per-class 5`。按样本数加权可传 `--weights n0 n1 n2`；程序归一化这些公开权重。默认三方等权。
+上例是调用形式，不是推荐用 12 张图像评估模型效用。应先用更大的新清单替换 `$SPLIT`，例如 `--classes 200 --per-party-per-class 10 --eval-per-class 5`。轮流模式每方依次出现一次，`--weights` 只影响诊断 loss 的聚合，不能改变轮流频率；不同数据量时不会自动按样本量采样。聚合模式可用 `--weights n0 n1 n2` 指定训练与诊断权重，程序归一化权重。
 
 训练日志中的诊断 loss 始终在各方固定首批样本上计算，因此只能用于快速观测。完整明文评估使用单独的 manifest：
 
@@ -145,7 +148,7 @@ CUDA_VISIBLE_DEVICES=0 python -m training.evaluate \
 
 - 前向 Q17、优化器 Q24，转换显式执行安全截断。平方根外 epsilon 默认 0.01；这是当前定点数值配置，不是 PyTorch 常见的 1e-8。`c_bound`、`z_bound` 默认 8；越界即失败，不静默裁剪方向估计或提示。
 - 新增的精度独立秘密符号位避免本仓库 CrypTen 全局 Q17 配置比较 Q24 状态时可能产生的错误；回归测试同时覆盖正负数和授权重构。
-- 当前循环没有安全反向传播，骨干参数不更新；3PC 不公开 delta、梯度或矩状态。可信模式 T 获得聚合 delta 和自身优化状态，这是授权输出。
+- 当前循环没有安全反向传播，骨干参数不更新；全秘密模式不公开 delta、梯度或矩状态。可信模式 T 获得当前 step 的 delta：轮流模式为单方 delta，聚合模式为聚合 delta。
 - 范围检查公开一个失败位，是调试协议的额外可见信息；Ruler 的盲化打开和底层预处理 provider 的安全性仍须独立论证。
 - 一次小模型 loss 下降不等于真实模型训练通过；必须在服务器执行第 4 节检查。明文效用实验也不能替代私有数据的最终验证。
 - 三方输出目录只供本地复现。T 的 `trusted-service/state.pt` 包含明文提示与 Adam 状态，应只由 T 持有；`party-i/prompt-share.pt` 为第 i 方份额，不应集中公开。

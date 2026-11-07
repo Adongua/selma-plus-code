@@ -123,6 +123,9 @@ def forward(spec, ops, images, prompt):
         x = x + p['pos']
     for i, block in enumerate(spec['blocks']):
         key = f'b{i}'
+        trace = getattr(ops, 'trace', None)
+        if trace:
+            trace.block_start(i + 1)
         ops.check(x, 64, key+'.pre_input')
         y = ops.norm(x, key+'.pre', block['pre_eps'])
         h = len(block['paths'])
@@ -137,6 +140,8 @@ def forward(spec, ops, images, prompt):
         y = ops.linear(x, key+'.fc1')
         ops.check(y, 12, key+'.gelu_input')
         x = x + ops.linear(ops.gelu(y), key+'.fc2')
+        if trace:
+            trace.block_end(i + 1)
     ops.check(x, 64, 'final_norm_input')
     out = ops.linear(ops.norm(x, 'norm', spec['norm_eps'])[:, 0], 'head')
     ops.check(out, 64, 'logits')

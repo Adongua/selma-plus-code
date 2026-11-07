@@ -6,6 +6,7 @@ protocols, not security-validated implementations.
 import math
 import torch
 import torch.distributed as dist
+from contextlib import nullcontext
 
 
 def open_to(value, dst):
@@ -63,7 +64,7 @@ def check_secret(value, bound, site, lower=None):
 
 
 class SecretOps:
-    def __init__(self, params, device):
+    def __init__(self, params, device, trace=None):
         if device.type == 'cpu':
             from sgelu.runtime import Ring3, Ring3Wide
             self.base = Ring3()
@@ -73,6 +74,10 @@ class SecretOps:
             self.base = CudaRing3(device=device, reveal_mode='p2p')
             self.wide = CudaRing3Wide(self.base)
         self.params = params
+        self.trace = trace
+
+    def span(self, category, site):
+        return self.trace.span(category, site) if self.trace else nullcontext()
 
     def linear(self, x, name):
         out = x.matmul(self.params[name+'.weight'].t())
@@ -87,20 +92,23 @@ class SecretOps:
         return crypten.cat(tensors, dim=dim)
 
     def check(self, x, bound, site):
-        check_secret(x, bound, site)
+        with self.span('range_check', site):
+            check_secret(x, bound, site)
 
     def norm(self, x, name, epsilon):
         from slayernorm.wide_range import WideLayerNormProfile, prepare_wide_layernorm, wide_layernorm
         for key in ('weight', 'bias'):
             self.check(self.params[name+'.'+key], 4, name+'.'+key)
-        mat = prepare_wide_layernorm(self.base, self.wide, tuple(x.shape), WideLayerNormProfile(epsilon=epsilon))
+        with self.span('ring3_prepare', name+'.layernorm'):
+            mat = prepare_wide_layernorm(self.base, self.wide, tuple(x.shape), WideLayerNormProfile(epsilon=epsilon))
         out = wide_layernorm(self.base, self.wide, raw_share(x), raw_share(self.params[name+'.weight']),
                              raw_share(self.params[name+'.bias']), mat)
         return from_share(out, 17)
 
     def gelu(self, x):
         from sgelu.wide_range import prepare_wide_gelu, wide_gelu
-        mat = prepare_wide_gelu(self.base, self.wide, tuple(x.shape))
+        with self.span('ring3_prepare', 'gelu'):
+            mat = prepare_wide_gelu(self.base, self.wide, tuple(x.shape))
         return from_share(wide_gelu(self.base, self.wide, raw_share(x), mat), 17)
 
     def attention(self, q, k, v, block, spec):
@@ -121,7 +129,8 @@ class SecretOps:
             qr, kr, vr = [raw_share(value) for value in (qs, ks, vs)]
             shape = tuple(qr.shape)
             if path == 'rsa':
-                mat = prepare_wide_rsa(self.base, self.wide, shape)
+                with self.span('ring3_prepare', 'rsa'):
+                    mat = prepare_wide_rsa(self.base, self.wide, shape)
                 mat.used = True
                 def trunc(name, value):
                     shift, correlation = mat.truncations[name]
@@ -131,12 +140,14 @@ class SecretOps:
                 self.check(from_share(score, 17), 16 - 2**-17, 'rsa.score')
                 positive = ruler_srelu(self.base, self.wide, score, mat.srelu)
                 denominator = positive.sum(-1, keepdim=True) + self.base.public(round(mat.profile.epsilon*2**17))
-                check_secret(from_share(denominator, 17), 2048, 'rsa.denominator', lower=.0005)
+                with self.span('range_check', 'rsa.denominator'):
+                    check_secret(from_share(denominator, 17), 2048, 'rsa.denominator', lower=.0005)
                 inv = wide_reciprocal(self.base, denominator, mat.reciprocal, mat.profile)
                 weighted = trunc('weight', self.base.mul(positive, inv))
                 group = trunc('output', secure_matmul(self.base, weighted, vr))
             elif path == 'lsa':
-                mat = prepare_lsa(self.base, shape, shape[-1]**-.5, FixedPointProfile(input_bound=16))
+                with self.span('ring3_prepare', 'lsa'):
+                    mat = prepare_lsa(self.base, shape, shape[-1]**-.5, FixedPointProfile(input_bound=16))
                 group = secure_lsa(self.base, qr, kr, vr, mat)
             else:
                 group = mixer_attention(vr, tuple(spec['grid']), True)
