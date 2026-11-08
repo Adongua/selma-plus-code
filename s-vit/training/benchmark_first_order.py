@@ -89,7 +89,7 @@ def worker(rank, rendezvous, options, config):
             if index % 10 == 0 or index == len(shapes):
                 event('model_sharing_progress', completed=index, total=len(shapes))
         if rank == 0:
-            reference_values = values
+            reference_values = None if options['skip_numerical_audit'] else values
             del source, values
         prompt = (crypten.cryptensor(torch.zeros(spec['patches'], spec['dim'], device=device), src=0,
                                      precision=options['precision_bits'], requires_grad=True)
@@ -104,49 +104,53 @@ def worker(rank, rendezvous, options, config):
         optimizer = SecretVectorAdam(config, allow_numerical_failure=options['cost_only'], span=optimizer_span)
         records = []
         with experimental_truncation('carry_save'):
-            # The owner validates one public/authorized fixture against the
-            # corresponding plaintext formula before any timing is accepted.
-            event('numerical_audit_started')
-            audit_item = public_owner_error(0, lambda: data.batch(0, options['batch_size'], True))
-            audit_images = (audit_item[0] if rank == 0 else
-                            torch.zeros(options['batch_size'], *spec['image_shape']))
-            audit_secret = crypten.cryptensor(audit_images.to(device), src=0,
-                                              precision=options['precision_bits'], device=device)
-            progress.location = 'numerical_audit'
-            with progress.heartbeat(), crypten.no_grad():
-                audit_output = forward(spec, params, audit_secret, prompt,
-                                       softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
-                                       gelu_method=options['gelu_method'])
-            audit_opened = open_to(audit_output, 0)
-            audit = [None]
-            if rank == 0:
-                with torch.no_grad():
-                    plain_prompt = torch.zeros(spec['patches'], spec['dim'], dtype=torch.float64) if prompt is not None else None
-                    reference = forward(spec, reference_values, audit_images.double(), plain_prompt,
-                                        softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
-                                        gelu_method=options['gelu_method'])
-                difference = (audit_opened.cpu() - reference).abs()
-                finite = bool(torch.isfinite(difference).all())
-                max_error = float(difference.max()) if finite else None
-                details = {'finite': finite, 'max_abs_error': max_error,
-                           'passed': finite and max_error <= options['max_audit_error'],
-                           'scope': 'one owner batch, plaintext model reference; not a security proof',
-                           'gelu_method': options['gelu_method']}
-                private_root = Path(options['output'])/'party-0'
-                private_root.mkdir(mode=0o700)
-                write_json(private_root/'numerical-audit.json', details)
-                audit[0] = {'passed': details['passed'], 'scope': details['scope']}
-                if options['fixture']:
-                    audit[0]['max_abs_error'] = max_error
-                del reference_values
-            dist.broadcast_object_list(audit, src=0)
-            event('numerical_audit_complete', **audit[0])
-            if not audit[0]['passed'] and not options['cost_only']:
+            if options['skip_numerical_audit']:
+                audit = [{'passed': None, 'skipped': True, 'scope': 'not performed'}]
+                event('numerical_audit_skipped', reason='explicit cost-only option')
+            else:
+                # The owner validates one public/authorized fixture against the
+                # corresponding plaintext formula before any timing is accepted.
+                event('numerical_audit_started')
+                audit_item = public_owner_error(0, lambda: data.batch(0, options['batch_size'], True))
+                audit_images = (audit_item[0] if rank == 0 else
+                                torch.zeros(options['batch_size'], *spec['image_shape']))
+                audit_secret = crypten.cryptensor(audit_images.to(device), src=0,
+                                                  precision=options['precision_bits'], device=device)
+                progress.location = 'numerical_audit'
+                with progress.heartbeat(), crypten.no_grad():
+                    audit_output = forward(spec, params, audit_secret, prompt,
+                                           softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
+                                           gelu_method=options['gelu_method'])
+                audit_opened = open_to(audit_output, 0)
+                audit = [None]
                 if rank == 0:
-                    write_json(Path(options['output'])/'audit.json', audit[0])
-                raise ArithmeticError('standard ViT numerical audit failed; benchmark was not measured')
-            if not audit[0]['passed']:
-                event('numerical_audit_failed_continuing_cost_only')
+                    with torch.no_grad():
+                        plain_prompt = torch.zeros(spec['patches'], spec['dim'], dtype=torch.float64) if prompt is not None else None
+                        reference = forward(spec, reference_values, audit_images.double(), plain_prompt,
+                                            softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
+                                            gelu_method=options['gelu_method'])
+                    difference = (audit_opened.cpu() - reference).abs()
+                    finite = bool(torch.isfinite(difference).all())
+                    max_error = float(difference.max()) if finite else None
+                    details = {'finite': finite, 'max_abs_error': max_error,
+                               'passed': finite and max_error <= options['max_audit_error'],
+                               'scope': 'one owner batch, plaintext model reference; not a security proof',
+                               'gelu_method': options['gelu_method']}
+                    private_root = Path(options['output'])/'party-0'
+                    private_root.mkdir(mode=0o700)
+                    write_json(private_root/'numerical-audit.json', details)
+                    audit[0] = {'passed': details['passed'], 'scope': details['scope']}
+                    if options['fixture']:
+                        audit[0]['max_abs_error'] = max_error
+                    del reference_values
+                dist.broadcast_object_list(audit, src=0)
+                event('numerical_audit_complete', **audit[0])
+                if not audit[0]['passed'] and not options['cost_only']:
+                    if rank == 0:
+                        write_json(Path(options['output'])/'audit.json', audit[0])
+                    raise ArithmeticError('standard ViT numerical audit failed; benchmark was not measured')
+                if not audit[0]['passed']:
+                    event('numerical_audit_failed_continuing_cost_only')
             for step in range(1, options['steps']+1):
                 owner = (step-1) % 3
                 event('step_started', step=step, owner=owner)
@@ -232,7 +236,8 @@ def worker(rank, rendezvous, options, config):
                       'options': options, 'config': asdict(config), 'steps': records,
                       'optimizer_numerical_failures': optimizer.numerical_failures,
                       'numeric_note': f"Q20 scaled softmax, CrypTen LayerNorm, {options['gelu_method']} GeLU; "
-                                      'one-batch forward audit, gradients require further full-model validation',
+                                      + ('audit skipped; ' if options['skip_numerical_audit'] else 'one-batch forward audit; ')
+                                      + 'gradients require further full-model validation',
                       'timing_note': 'inline provider subtraction estimate; synchronized instrumentation changes timing',
                       'communication_note': 'CrypTen bidirectional counter sum / 2; public control metadata excluded',
                       'privacy_note': 'owner receives own logits and shares its logit gradient; no privacy proof'}
@@ -263,6 +268,8 @@ def main():
     parser.add_argument('--gelu-method', choices=['erf', 'chebyshev16'], default='erf')
     parser.add_argument('--cost-only', action='store_true',
                         help='continue after audit and Adam numerical check failures; results are diagnostic only')
+    parser.add_argument('--skip-numerical-audit', action='store_true',
+                        help='skip initial reference forward (requires --cost-only)')
     parser.add_argument('--optimizer-progress', action='store_true',
                         help='log synchronized rank-0 Adam stage wall times including preprocessing')
     parser.add_argument('--max-audit-error', type=float, default=.25,
@@ -272,6 +279,8 @@ def main():
     parser.add_argument('--epsilon', type=float, default=.01)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
+    if args.skip_numerical_audit and not args.cost_only:
+        parser.error('--skip-numerical-audit requires --cost-only')
     if min(args.steps, args.batch_size, args.sqrt_iters_ln) < 1 or args.precision_bits != 20:
         parser.error('positive steps/batch/iterations and Q20 precision required')
     if (args.softmax_scale < 1 or args.softmax_scale & (args.softmax_scale-1)
