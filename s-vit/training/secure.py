@@ -53,6 +53,11 @@ def negative_bit(value):
     return from_share(raw, 0)
 
 
+def project_nonnegative(value):
+    """Secret projection with a Q0 mask, avoiding post-projection truncation."""
+    return value * (1-negative_bit(value))
+
+
 def check_secret(value, bound, site, lower=None):
     # Explicit public abort bit. No secret value, loss or optimizer state opened.
     lo = -bound if lower is None else lower
@@ -186,11 +191,9 @@ class SecretAdam:
         self.v = p.beta2*self.v + (1-p.beta2)*(c*c)*u.square()
         mh = self.m / (1-p.beta1**self.step)
         vh = self.v / (1-p.beta2**self.step)
-        # Tiny negative values can arise from fixed-point rounding. Project the
-        # second moment to its mathematical nonnegative domain, secretly.
-        # CrypTen comparison outputs use the global encoder, which may be Q17
-        # while this state is Q24. Align explicitly BEFORE secret multiplication.
-        vh = vh * precision(1-negative_bit(vh), 24)
+        # The sign mask is Q0. Multiplying Q24 by Q0 preserves precision without
+        # truncation, so a projected zero cannot acquire a new negative value.
+        vh = project_nonnegative(vh)
         check_secret(vh, p.c_bound**2 + .01, 'adam.v_hat', lower=0)
         hi = vh*0 + math.sqrt(p.c_bound**2 + .01)
         lo = vh*0

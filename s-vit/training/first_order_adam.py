@@ -2,7 +2,7 @@
 import math
 from contextlib import nullcontext
 
-from .secure import check_secret, negative_bit, precision
+from .secure import check_secret, negative_bit, precision, project_nonnegative
 
 
 class SecretVectorAdam:
@@ -38,7 +38,7 @@ class SecretVectorAdam:
         # The sign is Q0; multiplying by it keeps Q24 without a truncation,
         # avoiding a fresh negative rounding error on exact zero entries.
         with self.span('variance_check'):
-            vh = vh * (1-negative_bit(vh))
+            vh = project_nonnegative(vh)
             self.check(vh, p.c_bound**2 + .01, 'adam.v_hat', lower=0)
         with self.span('sqrt_init'):
             hi, lo = vh*0 + math.sqrt(p.c_bound**2+.01), vh*0

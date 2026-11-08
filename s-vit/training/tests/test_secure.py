@@ -11,7 +11,8 @@ def worker(rank, rendezvous):
     os.environ.update(RANK=str(rank), WORLD_SIZE='3', RENDEZVOUS=rendezvous, DISTRIBUTED_BACKEND='gloo')
     import crypten
     from training.core import ZOConfig, PlainAdam, direction
-    from training.secure import SecretAdam, SecretOps, open_to, precision, negative_bit, check_secret
+    from training.secure import (SecretAdam, SecretOps, open_to, precision,
+                                 negative_bit, check_secret, project_nonnegative)
     from hattention.experimental_crypten_truncation import experimental_truncation
     crypten.init()
     try:
@@ -22,6 +23,16 @@ def worker(rank, rendezvous):
             actual_signs = open_to(negative_bit(signs), 0)
             if rank == 0:
                 torch.testing.assert_close(actual_signs, torch.tensor([1.,1.,0.,0.,0.], dtype=torch.float64))
+            # Repeatedly re-share zero and one-Q24-unit values: a Q24 mask
+            # multiplication used to truncate projected zero below zero.
+            near_zero = torch.tensor([0., 0., 0., 2**-24, 2**-23], dtype=torch.float64)
+            for _ in range(12):
+                value = crypten.cryptensor(near_zero, src=0, precision=24)
+                projected = project_nonnegative(value)
+                check_secret(projected, 1., 'nonnegative-projection', lower=0)
+                observed = open_to(projected, 0)
+                if rank == 0:
+                    torch.testing.assert_close(observed, near_zero, rtol=0, atol=0)
             try:
                 check_secret(signs, 8., 'expected-test-failure')
             except ArithmeticError:
