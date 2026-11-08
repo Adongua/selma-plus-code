@@ -38,6 +38,7 @@ def main():
         results.append({'method': name, 'status': report['status'],
                         'measured_steps': len(report['steps']) - args.skip,
                         'source': path, 'model': model_info,
+                        'model_source': report.get('source'),
                         'precision_bits': options.get('precision_bits', 17 if report.get('backend') == '3pc' else None),
                         'trainable_parameters': report.get('trainable_parameters', report.get('config', {}).get('rank')),
                         'stages': summarize(report, args.skip)})
@@ -62,6 +63,7 @@ def main():
     for result in results:
         lines.append(f'- {result["method"]}: status={result["status"]}; '
                      f'Q{result["precision_bits"]}; model={result["model"]}; '
+                     f'model source={result["model_source"]}; '
                      f'trainable parameters={result["trainable_parameters"]}; '
                      f'measured steps={result["measured_steps"]}')
     args.output.mkdir(parents=True, exist_ok=False)

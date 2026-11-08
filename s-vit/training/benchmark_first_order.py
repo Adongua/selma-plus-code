@@ -25,6 +25,14 @@ from .standard_vit import extract_teacher, fixture, forward
 
 
 def load_source(options):
+    if options['model_source'] == 'standard-vitlite-random':
+        from .standard_vitlite import fixture as lite_fixture, random_backbone
+        spec, params = (lite_fixture() if options['fixture'] else
+                        random_backbone(options['mpcvit_root'], options['model_seed']))
+        return spec, params, list(range(spec['classes'])), {
+            'kind': 'public_fixture' if options['fixture'] else 'random_vitlite_standard_softmax',
+            'initialization_seed': options['model_seed'], 'weights_pretrained': False,
+            'attention': 'standard_softmax', 'accuracy_scope': 'cost benchmark only'}
     if options['fixture']:
         spec, params = fixture()
         return spec, params, list(range(spec['classes'])), {'kind': 'public_fixture'}
@@ -46,6 +54,9 @@ def worker(rank, rendezvous, options, config):
     from .secure import open_to
     from .step_benchmark import StepBenchmark, aggregate_stages
     from .trace import ProgressTrace
+    from .standard_vitlite import forward as lite_forward
+    from .data import PartyData
+    forward_model = lite_forward if options['model_source'] == 'standard-vitlite-random' else forward
     crypten.cfg.encoder.precision_bits = options['precision_bits']
     crypten.cfg.functions.sqrt_nr_iters = options['sqrt_iters_ln']
     crypten.init(device=device)
@@ -74,9 +85,12 @@ def worker(rank, rendezvous, options, config):
         permutation = torch.tensor(package[0]['permutation'], dtype=torch.long, device=device)
         data = None
         for owner in range(3):
-            local = public_owner_error(owner, lambda: StandardPartyData(
-                owner, spec, (options['dataset_roots'] or [None]*3)[owner],
-                (options['manifests'] or [None]*3)[owner], options['teacher_dir']))
+            local = public_owner_error(owner, lambda: (
+                PartyData(owner, spec, (options['dataset_roots'] or [None]*3)[owner],
+                          (options['manifests'] or [None]*3)[owner])
+                if options['model_source'] == 'standard-vitlite-random' else
+                StandardPartyData(owner, spec, (options['dataset_roots'] or [None]*3)[owner],
+                                  (options['manifests'] or [None]*3)[owner], options['teacher_dir'])))
             if owner == rank:
                 data = local
         event('model_sharing_started', tensors=len(shapes))
@@ -118,7 +132,7 @@ def worker(rank, rendezvous, options, config):
                                                   precision=options['precision_bits'], device=device)
                 progress.location = 'numerical_audit'
                 with progress.heartbeat(), crypten.no_grad():
-                    audit_output = forward(spec, params, audit_secret, prompt,
+                    audit_output = forward_model(spec, params, audit_secret, prompt,
                                            softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
                                            gelu_method=options['gelu_method'])
                 audit_opened = open_to(audit_output, 0)
@@ -126,7 +140,7 @@ def worker(rank, rendezvous, options, config):
                 if rank == 0:
                     with torch.no_grad():
                         plain_prompt = torch.zeros(spec['patches'], spec['dim'], dtype=torch.float64) if prompt is not None else None
-                        reference = forward(spec, reference_values, audit_images.double(), plain_prompt,
+                        reference = forward_model(spec, reference_values, audit_images.double(), plain_prompt,
                                             softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
                                             gelu_method=options['gelu_method'])
                     difference = (audit_opened.cpu() - reference).abs()
@@ -165,7 +179,7 @@ def worker(rank, rendezvous, options, config):
                     labels = None
                 images = crypten.cryptensor(images.to(device), src=owner, precision=options['precision_bits'], device=device)
                 with progress.heartbeat():
-                    logits = forward(spec, params, images, prompt,
+                    logits = forward_model(spec, params, images, prompt,
                                      softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
                                      gelu_method=options['gelu_method'])
                 if not logits.requires_grad:
@@ -254,6 +268,9 @@ def main():
     parser.add_argument('--method', required=True, choices=['sft', 'pt'])
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
     parser.add_argument('--fixture', action='store_true')
+    parser.add_argument('--model-source', choices=['teacher', 'standard-vitlite-random'], default='teacher')
+    parser.add_argument('--mpcvit-root', help='source tree for random standard ViTLite')
+    parser.add_argument('--model-seed', type=int, default=20261107)
     parser.add_argument('--teacher-dir')
     parser.add_argument('--dataset-roots', nargs=3)
     parser.add_argument('--manifests', nargs=3)
@@ -287,8 +304,12 @@ def main():
             or any(not math.isfinite(x) or x <= 0 for x in
                    (args.gelu_bound, args.max_audit_error, args.heartbeat_seconds))):
         parser.error('positive power-of-two softmax scale and positive GeLU bound required')
-    if not args.fixture and not all((args.teacher_dir, args.dataset_roots, args.manifests)):
-        parser.error('teacher-dir, three dataset-roots and three manifests required')
+    if not args.fixture and not all((args.dataset_roots, args.manifests)):
+        parser.error('three dataset-roots and three manifests required')
+    if not args.fixture and args.model_source == 'teacher' and not args.teacher_dir:
+        parser.error('teacher-dir required for teacher model')
+    if not args.fixture and args.model_source == 'standard-vitlite-random' and not args.mpcvit_root:
+        parser.error('mpcvit-root required for random ViTLite')
     if args.device == 'cuda' and torch.cuda.device_count() < 3:
         parser.error('three visible CUDA devices required')
     config = ZOConfig(lr=args.lr, epsilon=args.epsilon).validate()

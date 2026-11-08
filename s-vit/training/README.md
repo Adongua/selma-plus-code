@@ -134,19 +134,20 @@ python -m training.run --backend 3pc --mode secret --device cuda \
 
 排查优化器耗时可加 `--optimizer-progress`：按参数打包、梯度和方差检查、平方根及倒数的各轮迭代等输出 `optimizer_stage_started` 和 `optimizer_stage_complete`，心跳也显示当前阶段。阶段时间是 rank 0 同步后的墙钟时间，包含预处理和等待；额外同步与日志会改变性能，因此应使用单独运行排查，正式计时去掉该选项。该选项只影响新启动的进程。
 
-设置 `DATA`、`SPLIT`、`CHECKPOINT`、`FIXED` 后，下面的命令每种方法做 4 个更新步骤，汇总时跳过第 1 步作为预热。首次运行建议将各命令的 `--steps` 改为 `1` 并使用独立输出目录，确认显存、数值审计和完成情况后再进行正式测量。单个 SFT 步骤的全模型梯度与 Adam 状态可能占用大量显存；当前只在公开小模型上验证过三方流程。
+与 FoT 对齐模型规模可指定 `--model-source standard-vitlite-random --mpcvit-root "$PWD/mpcvit"`。该模式使用 `vit_9_12_64` 的随机初始化参数，并以标准 Softmax 替换所有注意力头，输入和预处理与 FoT 相同：9 层、12 头、192 维、64×64 图像和 257 token，MLP 宽度为 384。模型种子由 `--model-seed` 设置；类别索引直接使用清单中的标签。随机模型只用于开销测量，不代表预训练分类准确率。PT 更新 256×192 个加性提示参数，FoT 更新 4 个子空间参数；两者的优化器、算子和数值精度也有区别。
+
+设置 `DATA`、`SPLIT`、`CHECKPOINT`、`FIXED` 后，下面的命令每种方法做 4 个更新步骤，汇总时跳过第 1 步作为预热。首次运行建议将各命令的 `--steps` 改为 `1` 并使用独立输出目录，确认显存和完成情况后再进行正式测量。单个 SFT 步骤的全模型梯度与 Adam 状态可能占用大量显存；当前只在公开小模型上验证过三方流程。
 
 ```bash
 ROOT="$HOME/home/tmp/zo-step-benchmark-v1"
-TEACHER="$HOME/home/models/tiny-imagenet-vit-teacher"
-
 for method in pt sft; do
   CUDA_VISIBLE_DEVICES=1,2,3 timeout 21600 \
   python -m training.benchmark_first_order \
-    --method "$method" --device cuda --teacher-dir "$TEACHER" \
+    --method "$method" --device cuda \
+    --model-source standard-vitlite-random --mpcvit-root "$PWD/mpcvit" \
     --dataset-roots "$DATA" "$DATA" "$DATA" \
     --manifests "$SPLIT/party-0.json" "$SPLIT/party-1.json" "$SPLIT/party-2.json" \
-    --mapping first-name --gelu-method erf --cost-only --batch-size 1 --steps 4 --fixed-batch \
+    --gelu-method erf --cost-only --skip-numerical-audit --batch-size 1 --steps 4 --fixed-batch \
     --output "$ROOT/$method" || break
 done
 
