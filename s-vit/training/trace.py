@@ -49,6 +49,25 @@ class ProgressTrace:
             thread.join()
 
     @contextmanager
+    def optimizer_span(self, site):
+        """Diagnostic wall time on rank 0; includes preprocessing and waits."""
+        if not self.enabled:
+            yield
+            return
+        self.sync()
+        start = time.perf_counter()
+        previous = self.location
+        self.location = 'optimizer:' + site
+        self.event('optimizer_stage_started', site=site)
+        try:
+            yield
+        finally:
+            self.sync()
+            self.event('optimizer_stage_complete', site=site,
+                       seconds_rank0=time.perf_counter()-start)
+            self.location = previous
+
+    @contextmanager
     def span(self, category, site):
         if not self.enabled:
             yield

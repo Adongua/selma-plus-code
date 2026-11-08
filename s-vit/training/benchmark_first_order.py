@@ -4,6 +4,7 @@ Uses CrypTen autograd and a bounded, fixed-iteration secret Adam. Online
 figures are instrumented inline estimates, not precomputed offline replay.
 """
 import argparse
+from contextlib import nullcontext
 from dataclasses import asdict
 import json
 import math
@@ -99,7 +100,8 @@ def worker(rank, rendezvous, options, config):
         event('model_sharing_complete', method=options['method'], trainable_parameters=parameter_count)
         meter = StepBenchmark(crypten, device, SimpleNamespace(sent_bytes=0))
         meter.install()
-        optimizer = SecretVectorAdam(config, allow_numerical_failure=options['cost_only'])
+        optimizer_span = progress.optimizer_span if options['optimizer_progress'] else lambda site: nullcontext()
+        optimizer = SecretVectorAdam(config, allow_numerical_failure=options['cost_only'], span=optimizer_span)
         records = []
         with experimental_truncation('carry_save'):
             # The owner validates one public/authorized fixture against the
@@ -198,19 +200,21 @@ def worker(rank, rendezvous, options, config):
                     if any(value.grad is None for value in selected):
                         missing = [name for name, value in zip(names, selected) if value.grad is None]
                         raise RuntimeError('missing parameter gradients: ' + ', '.join(missing))
-                    flat_grad = crypten.cat([value.grad.reshape(-1) for value in selected])
-                    flat_values = crypten.cat([value.detach().reshape(-1) for value in selected])
+                    with optimizer_span('pack_parameters'):
+                        flat_grad = crypten.cat([value.grad.reshape(-1) for value in selected])
+                        flat_values = crypten.cat([value.detach().reshape(-1) for value in selected])
                     updated = optimizer.update(flat_values, flat_grad)
-                    offset = 0
-                    for name, shape in zip(names, shapes_train):
-                        count = int(torch.tensor(shape).prod().item())
-                        value = updated.narrow(0, offset, count).reshape(shape).detach()
-                        value.requires_grad = True
-                        if name == 'prompt':
-                            prompt = value
-                        else:
-                            params[name] = value
-                        offset += count
+                    with optimizer_span('unpack_parameters'):
+                        offset = 0
+                        for name, shape in zip(names, shapes_train):
+                            count = int(torch.tensor(shape).prod().item())
+                            value = updated.narrow(0, offset, count).reshape(shape).detach()
+                            value.requires_grad = True
+                            if name == 'prompt':
+                                prompt = value
+                            else:
+                                params[name] = value
+                            offset += count
                 optimizer_cost = meter.finish(before)
                 failures = [failure for failure in optimizer.numerical_failures if failure['step'] == step]
                 if failures:
@@ -259,6 +263,8 @@ def main():
     parser.add_argument('--gelu-method', choices=['erf', 'chebyshev16'], default='erf')
     parser.add_argument('--cost-only', action='store_true',
                         help='continue after audit and Adam numerical check failures; results are diagnostic only')
+    parser.add_argument('--optimizer-progress', action='store_true',
+                        help='log synchronized rank-0 Adam stage wall times including preprocessing')
     parser.add_argument('--max-audit-error', type=float, default=.25,
                         help='maximum absolute logit error on the first owner batch')
     parser.add_argument('--heartbeat-seconds', type=float, default=30.)

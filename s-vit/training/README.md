@@ -130,6 +130,8 @@ python -m training.run --backend 3pc --mode secret --device cuda \
 
 基线每次运行先由 P0 对自己的首个 batch 做明文参考与三方 logits 对照，超过 `--max-audit-error` 默认停止。`--cost-only` 允许审计或秘密 Adam 数值检查失败后继续，相关失败仍记录，结果状态为 `benchmark_completed_cost_only_not_numerically_validated`，仅供开销诊断；非有限的本地 logits 或梯度等无法继续的错误仍会终止。其他方只获得审计通过/失败标记；具体误差保存在 P0 的 `party-0/numerical-audit.json`，同机目录隔离只用于实验组织。此检查只覆盖一个 batch 和前向；完整教师模型的梯度、Adam 边界和多样本行为仍需验证。`first-name` 标签映射沿用现有教师设置，其中存在需要核实的类别对应关系。
 
+排查优化器耗时可加 `--optimizer-progress`：按参数打包、梯度和方差检查、平方根及倒数的各轮迭代等输出 `optimizer_stage_started` 和 `optimizer_stage_complete`，心跳也显示当前阶段。阶段时间是 rank 0 同步后的墙钟时间，包含预处理和等待；额外同步与日志会改变性能，因此应使用单独运行排查，正式计时去掉该选项。该选项只影响新启动的进程。
+
 设置 `DATA`、`SPLIT`、`CHECKPOINT`、`FIXED` 后，下面的命令每种方法做 4 个更新步骤，汇总时跳过第 1 步作为预热。首次运行建议将各命令的 `--steps` 改为 `1` 并使用独立输出目录，确认显存、数值审计和完成情况后再进行正式测量。单个 SFT 步骤的全模型梯度与 Adam 状态可能占用大量显存；当前只在公开小模型上验证过三方流程。
 
 ```bash
