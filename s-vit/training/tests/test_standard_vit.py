@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import torch
 
 from training.standard_vit import forward
@@ -33,6 +34,19 @@ def fixture():
 
 
 class StandardViTTests(unittest.TestCase):
+    def test_sum_backward_allocates_on_gradient_device(self):
+        from crypten.gradients import AutogradSum
+
+        ctx = mock.Mock()
+        ctx.saved_tensors = (torch.Size([2, 3]), 1, True)
+        gradient = mock.Mock()
+        gradient.device = torch.device('cuda:2')
+        ones = object()
+        with mock.patch('crypten.gradients.torch.ones', return_value=ones) as allocate:
+            AutogradSum.backward(ctx, gradient)
+        allocate.assert_called_once_with(torch.Size([2, 3]), device=gradient.device)
+        gradient.mul.assert_called_once_with(ones)
+
     def test_prompt_and_full_model_have_gradients(self):
         spec, params = fixture()
         params = {name: value.requires_grad_() for name, value in params.items()}
