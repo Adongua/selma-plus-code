@@ -6,7 +6,7 @@ protocols, not security-validated implementations.
 import math
 import torch
 import torch.distributed as dist
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 
 def open_to(value, dst):
@@ -76,9 +76,15 @@ class SecretOps:
         self.params = params
         self.trace = trace
         self.check_forward_ranges = check_forward_ranges
+        self.step_benchmark = None
 
+    @contextmanager
     def span(self, category, site):
-        return self.trace.span(category, site) if self.trace else nullcontext()
+        trace = self.trace.span(category, site) if self.trace else nullcontext()
+        measured = (self.step_benchmark.preparation() if self.step_benchmark and category == 'ring3_prepare'
+                    else nullcontext())
+        with trace, measured:
+            yield
 
     def linear(self, x, name):
         out = x.matmul(self.params[name+'.weight'].t())

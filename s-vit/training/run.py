@@ -44,6 +44,16 @@ def report(options, config, spec, records, initial, final, top1=None):
             'public_numerical_failure_flags': True,
             'secret_forward_range_checks': options['backend'] == '3pc' and options['check_forward_ranges'],
             'ring3_truncation_preprocessing': options['ring3_truncation_preprocessing'],
+            'step_benchmark_note': ('Inline wall-minus-provider-and-Ring3-preparation estimate; '
+                                    'not a precomputed online run. CrypTen communication is the '
+                                    'sum of bidirectional counters divided by two; Ring3 sent '
+                                    'payload is summed. Raw torch.distributed metadata, dealer '
+                                    'IPC and metric gathering are not counted. '
+                                    'Forward includes input sharing, both perturbation queries, '
+                                    'loss and delta sharing; evaluation is excluded. '
+                                    'Local randomness and untimed preprocessing remain online. '
+                                    'Instrumentation and synchronization change timing.'
+                                    if options['benchmark_step'] else None),
             'scope': 'training diagnostic; no validation accuracy or privacy proof',
             'backbone_frozen': True, 'backbone_weights_secret_in_3pc': options['backend']=='3pc',
             'update_schedule': options['update_schedule'],
@@ -141,6 +151,8 @@ def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connect
     import crypten
     crypten.cfg.encoder.precision_bits = 17
     crypten.init(device=device)
+    if options['benchmark_step']:
+        crypten.cfg.communicator.verbose = True
     root = Path(options['output'])
     event_lock = threading.Lock()
     def emit(record):
@@ -153,6 +165,7 @@ def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connect
     trace = ProgressTrace(options['debug_progress'] and rank == 0, device, options['heartbeat_seconds'], emit)
     def event(name, **fields):
         emit({'event': name, **fields})
+    meter = None
     try:
         event('model_loading_started')
         setup_start = time.perf_counter()
@@ -184,6 +197,11 @@ def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connect
             if owner == rank:
                 data = local
         ops = SecretOps(params, device, trace, check_forward_ranges=options['check_forward_ranges'])
+        if options['benchmark_step']:
+            from .step_benchmark import StepBenchmark
+            meter = StepBenchmark(crypten, device, ops.base)
+            meter.install()
+            ops.step_benchmark = meter
         event('forward_range_checks_configured', enabled=options['check_forward_ranges'])
         event('ring3_truncation_preprocessing_configured', mode=options['ring3_truncation_preprocessing'])
         b = basis(spec['patches']*spec['dim'], config).to(device)
@@ -263,6 +281,7 @@ def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connect
                 owners = [owner] if owner is not None else range(3)
                 batch_step = (step-1)//3 if owner is not None else step-1
                 event('step_started', step=step, owner=owner, batch_index=batch_step)
+                forward_snapshot = meter.start() if meter else None
                 trace.sync()
                 share_start = time.perf_counter()
                 batches, labels = share_batch(batch_step, options['fixed_batch'], owners)
@@ -282,8 +301,10 @@ def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connect
                     delta = term if delta is None else delta+term
                 trace.sync()
                 event('delta_sharing_complete', step=step, owner=owner, seconds_rank0=time.perf_counter()-delta_start)
+                forward_cost = meter.finish(forward_snapshot) if meter else None
                 event('adam_started', step=step, owner=owner)
                 adam_start = time.perf_counter()
+                optimizer_snapshot = meter.start() if meter else None
                 if adam:
                     z = adam.update(delta, u)
                 else:
@@ -292,10 +313,14 @@ def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connect
                     z = receive(outgoing[rank], config, device)
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
+                optimizer_cost = meter.finish(optimizer_snapshot) if meter else None
                 event('adam_complete', step=step, owner=owner, seconds_rank0=time.perf_counter()-adam_start)
                 updated = time.perf_counter()
                 event('training_update_complete', step=step, owner=owner, seconds_rank0=updated-started)
                 row = {'step': step, 'owner': owner, 'batch_index': batch_step}
+                if meter:
+                    from .step_benchmark import aggregate_stages
+                    row['benchmark'] = aggregate_stages({'forward': forward_cost, 'optimizer': optimizer_cost})
                 evaluated = step % options['eval_every'] == 0 or step == options['steps']
                 evaluation_seconds = 0.0
                 if evaluated:
@@ -328,6 +353,8 @@ def worker(rank, rendezvous, options, config, incoming, outgoing, dealer_connect
             if rank == 0:
                 write_json(root/'report.json', report(options, config, spec, records, initial, final))
     finally:
+        if meter:
+            meter.close()
         crypten.uninit()
 
 
@@ -353,6 +380,8 @@ def main():
     p.add_argument('--debug-progress', action='store_true', help='rank-0 block and Ring3 preparation timing (adds GPU synchronizations)')
     p.add_argument('--check-forward-ranges', action='store_true',
                    help='enable secret runtime checks for forward numerical ranges (extra MPC work)')
+    p.add_argument('--benchmark-step', action='store_true',
+                   help='instrument CrypTen/Ring3 preprocessing and step online cost estimates')
     p.add_argument('--ring3-truncation-preprocessing', choices=['distributed', 'trusted-dealer'],
                    default='distributed', help='trusted-dealer is a local performance simulation, not security validated')
     p.add_argument('--heartbeat-seconds', type=float, default=30., help='debug forward heartbeat interval')
@@ -373,6 +402,8 @@ def main():
         p.error('insufficient visible CUDA devices')
     if args.backend != '3pc' and args.ring3_truncation_preprocessing != 'distributed':
         p.error('trusted-dealer preprocessing requires the 3pc backend')
+    if args.benchmark_step and (args.backend != '3pc' or args.mode != 'secret'):
+        p.error('--benchmark-step requires --backend 3pc --mode secret')
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False, mode=0o700)
     options = vars(args).copy()

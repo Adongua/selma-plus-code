@@ -120,6 +120,51 @@ python -m training.run --backend 3pc --mode secret --device cuda \
 
 这是本机可信预处理模拟，使用 NumPy 随机数与本地进程通信，没有经过密码学安全验证，也不代表独立机器上的安全部署。默认 `distributed` 模式继续使用原有实现；`run.json`、`report.json` 和启动事件会记录所选模式。
 
+需要记录每步开销时可在全秘密三方训练命令中加入 `--benchmark-step`。每个 `training_step` 的 `benchmark` 包含 `forward`、`backward`、`optimizer`、`total`；FoT 的前向包含输入分享、两次扰动前向、损失和差值分享，反向为零，评估不计入。各阶段提供 `online_estimate_seconds` 和 `online_communication_bytes`，并保存每方原始计数。时间为即时执行时逐方扣除已计时的 CrypTen provider 与 Ring3 准备，再对各方取最大值；`total` 先在每方相加再取最大值。同步插桩改变运行时，局部随机生成和未计时的预处理仍在估计值内，因此这些数字不是严格预计算后的纯在线时间。
+
+通信量按 CrypTen 双向计数的各方总和除以二，加上 Ring3 的各方发送载荷；计数口径为协议载荷估算，不包含 `torch.distributed` 直接发送的公共控制元数据、可信预处理进程 IPC 或指标收集，不能当作抓包测量。每次只使用新材料。基线的实现、数值正确性和统一统计口径需单独验证后才能把其数值与 FoT 放在同一个结果表中。
+
+### 三种微调方法的每步开销
+
+`training.benchmark_first_order` 提供标准 Hugging Face ViT 的三方 SFT 与 PT 基线：SFT 更新完整模型，PT 冻结模型、对所有 patch 的加性提示求梯度。三方均持有模型的秘密份额；当前数据所有者接收自己的 logits，用本地标签计算 logits 梯度，再秘密分享梯度供三方反向传播。两者使用 Q20 CrypTen、缩放 Softmax、CrypTen LayerNorm、16 阶 Chebyshev GeLU 和秘密 Adam。FoT 使用现有 Q17 hAttention、秩 4 加性提示和秘密 Adam。不同模型的参数量、输入尺寸、定点精度和算子都可能不同；因此这是端到端方案比较，不能将差异仅归因于零阶优化。
+
+基线每次运行先由 P0 对自己的首个 batch 做明文近似公式与三方 logits 对照，超过 `--max-audit-error` 会停止并保存 `audit.json`。其他方只获得通过/失败标记；具体误差保存在 P0 的 `party-0/numerical-audit.json`，同机目录隔离只用于实验组织。此检查只覆盖一个 batch 和前向；完整教师模型的梯度、Adam 边界和多样本行为仍需验证。`first-name` 标签映射沿用现有教师设置，其中存在需要核实的类别对应关系。
+
+设置 `DATA`、`SPLIT`、`CHECKPOINT`、`FIXED` 后，下面的命令每种方法做 4 个更新步骤，汇总时跳过第 1 步作为预热。首次运行建议将各命令的 `--steps` 改为 `1` 并使用独立输出目录，确认显存、数值审计和完成情况后再进行正式测量。单个 SFT 步骤的全模型梯度与 Adam 状态可能占用大量显存；当前只在公开小模型上验证过三方流程。
+
+```bash
+ROOT="$HOME/home/tmp/zo-step-benchmark-v1"
+TEACHER="$HOME/home/models/tiny-imagenet-vit-teacher"
+
+for method in pt sft; do
+  CUDA_VISIBLE_DEVICES=1,2,3 timeout 21600 \
+  python -m training.benchmark_first_order \
+    --method "$method" --device cuda --teacher-dir "$TEACHER" \
+    --dataset-roots "$DATA" "$DATA" "$DATA" \
+    --manifests "$SPLIT/party-0.json" "$SPLIT/party-1.json" "$SPLIT/party-2.json" \
+    --mapping first-name --batch-size 1 --steps 4 --fixed-batch \
+    --output "$ROOT/$method" || break
+done
+
+CUDA_VISIBLE_DEVICES=1,2,3 timeout 21600 \
+python -m training.run --backend 3pc --mode secret --device cuda \
+  --checkpoint "$CHECKPOINT" --fixed-student "$FIXED" --mpcvit-root "$PWD/mpcvit" \
+  --dataset-roots "$DATA" "$DATA" "$DATA" \
+  --manifests "$SPLIT/party-0.json" "$SPLIT/party-1.json" "$SPLIT/party-2.json" \
+  --ring3-truncation-preprocessing trusted-dealer --benchmark-step \
+  --update-schedule round-robin --rank 4 --sigma 0.1 --lr 0.03 --epsilon 0.01 \
+  --batch-size 1 --steps 4 --fixed-batch --eval-every 4 --min-loss-drop 0 \
+  --diagnostic-loss --output "$ROOT/fot"
+
+python -m training.summarize_step_benchmark \
+  --report "MPC-SFT=$ROOT/sft/report.json" \
+  --report "MPC-PT=$ROOT/pt/report.json" \
+  --report "MPC-FoT=$ROOT/fot/report.json" \
+  --skip 1 --output "$ROOT/summary"
+```
+
+每次运行必须使用新输出目录。结果表是同步插桩的在线时间估计，记录的网络为实际运行时设置的网络；默认单机 Gloo 不等于自动配置 LAN/WAN。正式报告时应使用相同网络环境、batch size、采样方式和预热/重复次数，并记录不同方法的输入尺寸、token 数、模型参数量与优化器设置。
+
 若需要可信模式，将 `--mode secret` 改成 `--mode trusted` 并更换输出目录。
 
 ## 5. 明文微调与独立清单评估
