@@ -126,9 +126,9 @@ python -m training.run --backend 3pc --mode secret --device cuda \
 
 ### 三种微调方法的每步开销
 
-`training.benchmark_first_order` 提供标准 Hugging Face ViT 的三方 SFT 与 PT 基线：SFT 更新完整模型，PT 冻结模型、对所有 patch 的加性提示求梯度。三方均持有模型的秘密份额；当前数据所有者接收自己的 logits，用本地标签计算 logits 梯度，再秘密分享梯度供三方反向传播。两者使用 Q20 CrypTen、缩放 Softmax、CrypTen LayerNorm、16 阶 Chebyshev GeLU 和秘密 Adam。FoT 使用现有 Q17 hAttention、秩 4 加性提示和秘密 Adam。不同模型的参数量、输入尺寸、定点精度和算子都可能不同；因此这是端到端方案比较，不能将差异仅归因于零阶优化。
+`training.benchmark_first_order` 提供标准 Hugging Face ViT 的三方 SFT 与 PT 基线：SFT 更新完整模型，PT 冻结模型、对所有 patch 的加性提示求梯度。三方均持有模型的秘密份额；当前数据所有者接收自己的 logits，用本地标签计算 logits 梯度，再秘密分享梯度供三方反向传播。两者使用 Q20 CrypTen、缩放 Softmax、CrypTen LayerNorm、CrypTen erf 近似 GeLU 和秘密 Adam。可用 `--gelu-method chebyshev16` 选择先前的实现。FoT 使用现有 Q17 hAttention、秩 4 加性提示和秘密 Adam。不同模型的参数量、输入尺寸、定点精度和算子都可能不同；因此这是端到端方案比较，不能将差异仅归因于零阶优化。
 
-基线每次运行先由 P0 对自己的首个 batch 做明文近似公式与三方 logits 对照，超过 `--max-audit-error` 会停止并保存 `audit.json`。其他方只获得通过/失败标记；具体误差保存在 P0 的 `party-0/numerical-audit.json`，同机目录隔离只用于实验组织。此检查只覆盖一个 batch 和前向；完整教师模型的梯度、Adam 边界和多样本行为仍需验证。`first-name` 标签映射沿用现有教师设置，其中存在需要核实的类别对应关系。
+基线每次运行先由 P0 对自己的首个 batch 做明文参考与三方 logits 对照，超过 `--max-audit-error` 默认停止。`--cost-only` 允许审计或秘密 Adam 数值检查失败后继续，相关失败仍记录，结果状态为 `benchmark_completed_cost_only_not_numerically_validated`，仅供开销诊断；非有限的本地 logits 或梯度等无法继续的错误仍会终止。其他方只获得审计通过/失败标记；具体误差保存在 P0 的 `party-0/numerical-audit.json`，同机目录隔离只用于实验组织。此检查只覆盖一个 batch 和前向；完整教师模型的梯度、Adam 边界和多样本行为仍需验证。`first-name` 标签映射沿用现有教师设置，其中存在需要核实的类别对应关系。
 
 设置 `DATA`、`SPLIT`、`CHECKPOINT`、`FIXED` 后，下面的命令每种方法做 4 个更新步骤，汇总时跳过第 1 步作为预热。首次运行建议将各命令的 `--steps` 改为 `1` 并使用独立输出目录，确认显存、数值审计和完成情况后再进行正式测量。单个 SFT 步骤的全模型梯度与 Adam 状态可能占用大量显存；当前只在公开小模型上验证过三方流程。
 
@@ -142,7 +142,7 @@ for method in pt sft; do
     --method "$method" --device cuda --teacher-dir "$TEACHER" \
     --dataset-roots "$DATA" "$DATA" "$DATA" \
     --manifests "$SPLIT/party-0.json" "$SPLIT/party-1.json" "$SPLIT/party-2.json" \
-    --mapping first-name --batch-size 1 --steps 4 --fixed-batch \
+    --mapping first-name --gelu-method erf --cost-only --batch-size 1 --steps 4 --fixed-batch \
     --output "$ROOT/$method" || break
 done
 

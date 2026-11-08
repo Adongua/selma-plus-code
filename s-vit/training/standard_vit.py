@@ -71,7 +71,10 @@ def _norm(x, params, name, epsilon):
     return crypten_native_layernorm(x, params[name+'.weight'], params[name+'.bias'], epsilon)
 
 
-def forward(spec, params, image, prompt=None, *, softmax_scale=256, gelu_bound=12.0, trace=None):
+def forward(spec, params, image, prompt=None, *, softmax_scale=256, gelu_bound=12.0,
+            gelu_method='chebyshev16', trace=None):
+    if gelu_method not in ('chebyshev16', 'erf'):
+        raise ValueError('unknown GeLU method')
     stem = 'vit.embeddings.patch_embeddings.projection'
     if isinstance(image, torch.Tensor):
         x = F.conv2d(image, params[stem+'.weight'], params.get(stem+'.bias'),
@@ -95,7 +98,7 @@ def forward(spec, params, image, prompt=None, *, softmax_scale=256, gelu_bound=1
     if trace:
         trace('tokens', x)
     heads, width = spec['heads'], spec['dim'] // spec['heads']
-    coefficients = _chebyshev_coefficients(16, gelu_bound)
+    coefficients = _chebyshev_coefficients(16, gelu_bound) if gelu_method == 'chebyshev16' else None
     for i in range(spec['layers']):
         root = f'vit.encoder.layer.{i}'
         y = _norm(x, params, root+'.layernorm_before', spec['epsilon'])
@@ -116,7 +119,13 @@ def forward(spec, params, image, prompt=None, *, softmax_scale=256, gelu_bound=1
         x = x + _linear(y, params, root+'.attention.output.dense')
         y = _norm(x, params, root+'.layernorm_after', spec['epsilon'])
         y = _linear(y, params, root+'.intermediate.dense')
-        y = chebyshev_gelu(y, gelu_bound, coefficients)
+        if gelu_method == 'chebyshev16':
+            y = chebyshev_gelu(y, gelu_bound, coefficients)
+        elif isinstance(y, torch.Tensor):
+            y = F.gelu(y, approximate='none')
+        else:
+            from sgelu.baseline import crypten_erf_gelu
+            y = crypten_erf_gelu(y)
         x = x + _linear(y, params, root+'.output.dense')
         if trace:
             trace('block', x)

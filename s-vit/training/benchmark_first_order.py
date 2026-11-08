@@ -99,7 +99,7 @@ def worker(rank, rendezvous, options, config):
         event('model_sharing_complete', method=options['method'], trainable_parameters=parameter_count)
         meter = StepBenchmark(crypten, device, SimpleNamespace(sent_bytes=0))
         meter.install()
-        optimizer = SecretVectorAdam(config)
+        optimizer = SecretVectorAdam(config, allow_numerical_failure=options['cost_only'])
         records = []
         with experimental_truncation('carry_save'):
             # The owner validates one public/authorized fixture against the
@@ -113,20 +113,23 @@ def worker(rank, rendezvous, options, config):
             progress.location = 'numerical_audit'
             with progress.heartbeat(), crypten.no_grad():
                 audit_output = forward(spec, params, audit_secret, prompt,
-                                       softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'])
+                                       softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
+                                       gelu_method=options['gelu_method'])
             audit_opened = open_to(audit_output, 0)
             audit = [None]
             if rank == 0:
                 with torch.no_grad():
                     plain_prompt = torch.zeros(spec['patches'], spec['dim'], dtype=torch.float64) if prompt is not None else None
                     reference = forward(spec, reference_values, audit_images.double(), plain_prompt,
-                                        softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'])
+                                        softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
+                                        gelu_method=options['gelu_method'])
                 difference = (audit_opened.cpu() - reference).abs()
                 finite = bool(torch.isfinite(difference).all())
                 max_error = float(difference.max()) if finite else None
                 details = {'finite': finite, 'max_abs_error': max_error,
                            'passed': finite and max_error <= options['max_audit_error'],
-                           'scope': 'one owner batch, own plaintext approximation; not a security proof'}
+                           'scope': 'one owner batch, plaintext model reference; not a security proof',
+                           'gelu_method': options['gelu_method']}
                 private_root = Path(options['output'])/'party-0'
                 private_root.mkdir(mode=0o700)
                 write_json(private_root/'numerical-audit.json', details)
@@ -136,10 +139,12 @@ def worker(rank, rendezvous, options, config):
                 del reference_values
             dist.broadcast_object_list(audit, src=0)
             event('numerical_audit_complete', **audit[0])
-            if not audit[0]['passed']:
+            if not audit[0]['passed'] and not options['cost_only']:
                 if rank == 0:
                     write_json(Path(options['output'])/'audit.json', audit[0])
                 raise ArithmeticError('standard ViT numerical audit failed; benchmark was not measured')
+            if not audit[0]['passed']:
+                event('numerical_audit_failed_continuing_cost_only')
             for step in range(1, options['steps']+1):
                 owner = (step-1) % 3
                 event('step_started', step=step, owner=owner)
@@ -155,7 +160,8 @@ def worker(rank, rendezvous, options, config):
                 images = crypten.cryptensor(images.to(device), src=owner, precision=options['precision_bits'], device=device)
                 with progress.heartbeat():
                     logits = forward(spec, params, images, prompt,
-                                     softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'])
+                                     softmax_scale=options['softmax_scale'], gelu_bound=options['gelu_bound'],
+                                     gelu_method=options['gelu_method'])
                 if not logits.requires_grad:
                     raise RuntimeError('logits detached from the gradient graph')
                 opened = open_to(logits, owner)
@@ -206,16 +212,22 @@ def worker(rank, rendezvous, options, config):
                             params[name] = value
                         offset += count
                 optimizer_cost = meter.finish(before)
+                failures = [failure for failure in optimizer.numerical_failures if failure['step'] == step]
+                if failures:
+                    event('optimizer_numerical_failure_continuing_cost_only', step=step, sites=failures)
                 costs = aggregate_stages({'forward': forward_cost, 'backward': backward_cost,
                                           'optimizer': optimizer_cost})
                 records.append({'step': step, 'owner': owner, 'benchmark': costs})
                 event('step_complete', step=step, owner=owner, benchmark=costs)
         if rank == 0:
-            report = {'status': 'benchmark_completed_one_batch_audit_not_security_validated',
+            status = ('benchmark_completed_cost_only_not_numerically_validated' if options['cost_only'] else
+                      'benchmark_completed_one_batch_audit_not_security_validated')
+            report = {'status': status,
                       'method': 'MPC-' + options['method'].upper(), 'model': spec,
                       'source': package[0]['metadata'], 'trainable_parameters': parameter_count, 'audit': audit[0],
                       'options': options, 'config': asdict(config), 'steps': records,
-                      'numeric_note': 'Q20 scaled softmax, CrypTen LayerNorm, degree-16 Chebyshev GeLU; '
+                      'optimizer_numerical_failures': optimizer.numerical_failures,
+                      'numeric_note': f"Q20 scaled softmax, CrypTen LayerNorm, {options['gelu_method']} GeLU; "
                                       'one-batch forward audit, gradients require further full-model validation',
                       'timing_note': 'inline provider subtraction estimate; synchronized instrumentation changes timing',
                       'communication_note': 'CrypTen bidirectional counter sum / 2; public control metadata excluded',
@@ -244,6 +256,9 @@ def main():
     parser.add_argument('--softmax-scale', type=int, default=256)
     parser.add_argument('--sqrt-iters-ln', type=int, default=7)
     parser.add_argument('--gelu-bound', type=float, default=12.)
+    parser.add_argument('--gelu-method', choices=['erf', 'chebyshev16'], default='erf')
+    parser.add_argument('--cost-only', action='store_true',
+                        help='continue after audit and Adam numerical check failures; results are diagnostic only')
     parser.add_argument('--max-audit-error', type=float, default=.25,
                         help='maximum absolute logit error on the first owner batch')
     parser.add_argument('--heartbeat-seconds', type=float, default=30.)

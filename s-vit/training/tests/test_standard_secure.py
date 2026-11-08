@@ -26,7 +26,7 @@ def worker(rank, rendezvous):
         images = torch.randn(1, 3, 4, 4, dtype=torch.float64) * .1
         plain_params = {name: value.clone().requires_grad_() for name, value in params.items()}
         plain_prompt = torch.zeros(4, 4, dtype=torch.float64, requires_grad=True)
-        plain = forward(spec, plain_params, images, plain_prompt, softmax_scale=8)
+        plain = forward(spec, plain_params, images, plain_prompt, softmax_scale=8, gelu_method='erf')
         torch.nn.functional.cross_entropy(plain, torch.tensor([1])).backward()
         secret_params = {name: crypten.cryptensor(value, src=0, precision=20, requires_grad=True)
                          for name, value in params.items()}
@@ -34,7 +34,7 @@ def worker(rank, rendezvous):
         secret_image = crypten.cryptensor(images, src=1, precision=20)
         states = {}
         with experimental_truncation('carry_save'):
-            result = forward(spec, secret_params, secret_image, prompt, softmax_scale=8,
+            result = forward(spec, secret_params, secret_image, prompt, softmax_scale=8, gelu_method='erf',
                              trace=lambda name, value: states.update({name: value.requires_grad}))
             if not result.requires_grad:
                 raise AssertionError('secure logits detached from graph')
