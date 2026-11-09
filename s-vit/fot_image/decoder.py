@@ -37,15 +37,15 @@ def nearest_upsample(x, height, width):
 
 
 def image_prompt(feature, theta, ops, image_shape):
-    if tuple(feature.shape) != (1, FEATURE_DIM):
-        raise ValueError('decoder requires a single feature vector')
+    if len(feature.shape) != 2 or feature.shape[1] != FEATURE_DIM or feature.shape[0] < 1:
+        raise ValueError('decoder requires [batch, feature_dim] features')
     n1 = HIDDEN_CHANNELS*INPUT_CHANNELS*3*3
     w1 = theta[:n1].reshape(HIDDEN_CHANNELS, INPUT_CHANNELS, 3, 3)
     b1 = theta[n1:n1+HIDDEN_CHANNELS].reshape(1, HIDDEN_CHANNELS, 1, 1)
     n2 = n1+HIDDEN_CHANNELS
     w2 = theta[n2:n2+3*HIDDEN_CHANNELS].reshape(3, HIDDEN_CHANNELS, 1, 1)
     b2 = theta[n2+3*HIDDEN_CHANNELS:].reshape(1, 3, 1, 1)
-    x = feature.reshape(1, INPUT_CHANNELS, GRID, GRID)
+    x = feature.reshape(feature.shape[0], INPUT_CHANNELS, GRID, GRID)
     x = ops.conv(x, w1, padding=1) + b1
     x = ops.activation(x)
     x = nearest_upsample(x, image_shape[-2], image_shape[-1])

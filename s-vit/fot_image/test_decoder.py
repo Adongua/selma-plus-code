@@ -21,9 +21,9 @@ def worker(rank, rendezvous):
     crypten.cfg.encoder.precision_bits = 17
     crypten.init()
     try:
-        feature = torch.linspace(-.5, .5, FEATURE_DIM, dtype=torch.float64).reshape(1, -1)
+        feature = torch.linspace(-.5, .5, 4*FEATURE_DIM, dtype=torch.float64).reshape(4, -1)
         theta = initial_parameters()
-        image = torch.linspace(-1., 1., 3*64*64, dtype=torch.float64).reshape(1,3,64,64)
+        image = torch.linspace(-1., 1., 4*3*64*64, dtype=torch.float64).reshape(4,3,64,64)
         expected_prompt = image_prompt(feature, theta, PlainDecoderOps(), image.shape[1:])
         expected = perturb_image(image, expected_prompt, .1)
         with experimental_truncation('carry_save'):
@@ -35,7 +35,7 @@ def worker(rank, rendezvous):
             result = perturb_image(secret_image, prompt, .1)
             observed = open_to(result, 1)
         if rank == 1:
-            assert tuple(observed.shape) == (1,3,64,64)
+            assert tuple(observed.shape) == (4,3,64,64)
             torch.testing.assert_close(observed, expected, rtol=0, atol=.003)
         elif observed is not None:
             raise AssertionError('image leaked to unauthorized rank')
@@ -55,6 +55,9 @@ class DecoderTests(unittest.TestCase):
         b = image_prompt(y, theta, PlainDecoderOps(), (3,64,64))
         self.assertEqual(tuple(a.shape), (1,3,64,64))
         self.assertGreater((a-b).abs().max().item(), 1e-5)
+        batched = image_prompt(torch.cat([x,y]), theta, PlainDecoderOps(), (3,64,64))
+        torch.testing.assert_close(batched[0], a[0])
+        torch.testing.assert_close(batched[1], b[0])
 
     def test_real_shape_three_party(self):
         with tempfile.TemporaryDirectory() as tmp:

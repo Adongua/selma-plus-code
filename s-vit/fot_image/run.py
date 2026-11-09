@@ -74,7 +74,7 @@ def plaintext(a):
     for step in range(1, a.steps+1):
         owner = (step-1)%3
         started = time.perf_counter()
-        x,y = parties[owner].batch((step-1)//3, 1, a.fixed_batch)
+        x,y = parties[owner].batch((step-1)//3, a.batch_size, a.fixed_batch)
         x,y = x.to(device), y.to(device)
         feature = encoder(x)
         u = rademacher(step, a.seed).to(device)
@@ -94,6 +94,8 @@ def plaintext(a):
             row['perturbation_loss_mean'] = (plus+minus)/2
         if step % a.eval_every == 0 or step == a.steps:
             row['evaluation'] = evaluate()
+            torch.save({'theta':theta.cpu(), 'velocity':velocity.cpu(), 'step':step,
+                        'options':vars(a)}, Path(a.output)/f'step-{step:06d}.pt')
         rows.append(row)
         emit('step_complete', **row)
     torch.save({'theta':theta.cpu(), 'velocity':velocity.cpu(), 'options':vars(a)}, Path(a.output)/'state.pt')
@@ -160,8 +162,8 @@ def secure(rank, rendezvous, a, connections):
                 owner = (step-1)%3
                 event('step_started', step=step, owner=owner)
                 before = meter.start()
-                item = public_owner_error(owner, lambda: local_data.batch((step-1)//3, 1, a.fixed_batch))
-                x,y = item if rank == owner else (torch.zeros(1,*spec['image_shape'], dtype=torch.float64), None)
+                item = public_owner_error(owner, lambda: local_data.batch((step-1)//3, a.batch_size, a.fixed_batch))
+                x,y = item if rank == owner else (torch.zeros(a.batch_size,*spec['image_shape'], dtype=torch.float64), None)
                 x = x.to(device)
                 feature_seconds = 0.
                 if rank == owner:
@@ -171,7 +173,7 @@ def secure(rank, rendezvous, a, connections):
                     if device.type == 'cuda': torch.cuda.synchronize(device)
                     feature_seconds = time.perf_counter()-started
                 else:
-                    feat = torch.zeros(1, FEATURE_DIM, dtype=torch.float64, device=device)
+                    feat = torch.zeros(a.batch_size, FEATURE_DIM, dtype=torch.float64, device=device)
                 duration = [feature_seconds if rank == owner else None]
                 dist.broadcast_object_list(duration, src=owner)
                 shared_x = crypten.cryptensor(x, src=owner, precision=17, device=device)
@@ -209,7 +211,7 @@ def secure(rank, rendezvous, a, connections):
                 check_secret(theta, a.parameter_bound, 'image_spsa.theta')
                 optimizer_cost = meter.finish(before)
                 measured = aggregate_stages({'forward':forward_cost, 'optimizer':optimizer_cost})
-                row = {'step':step, 'owner':owner, 'feature_extraction_seconds_owner':duration[0],
+                row = {'step':step, 'owner':owner, 'batch_size':a.batch_size, 'feature_extraction_seconds_owner':duration[0],
                        'benchmark':measured}
                 if a.diagnostic_loss:
                     local = torch.tensor([(losses[0]+losses[1])/2 if rank==owner else 0.], dtype=torch.float64)
@@ -239,6 +241,7 @@ def main():
     p.add_argument('--eval-root'); p.add_argument('--eval-manifest')
     p.add_argument('--device', choices=['cpu','cuda'], default='cpu')
     p.add_argument('--steps', type=int, default=5); p.add_argument('--eval-every', type=int, default=5)
+    p.add_argument('--batch-size', type=int, default=1)
     p.add_argument('--sigma', type=float, default=.05); p.add_argument('--lr', type=float, default=.01)
     p.add_argument('--prompt-scale', type=float, default=.1); p.add_argument('--momentum', type=float, default=.9)
     p.add_argument('--coefficient-bound', type=float, default=8.); p.add_argument('--parameter-bound', type=float, default=8.)
@@ -250,7 +253,7 @@ def main():
     p.add_argument('--heartbeat-seconds', type=float, default=30.)
     p.add_argument('--output', required=True)
     a = p.parse_args()
-    if min(a.steps,a.eval_every)<1 or any(not math.isfinite(v) or v<=0 for v in (a.sigma,a.lr,a.prompt_scale,a.coefficient_bound,a.parameter_bound,a.heartbeat_seconds)) or not 0 <= a.momentum < 1: p.error('invalid hyperparameters')
+    if min(a.steps,a.eval_every,a.batch_size)<1 or any(not math.isfinite(v) or v<=0 for v in (a.sigma,a.lr,a.prompt_scale,a.coefficient_bound,a.parameter_bound,a.heartbeat_seconds)) or not 0 <= a.momentum < 1: p.error('invalid hyperparameters')
     if not a.fixture and not all((a.checkpoint,a.fixed_student,a.mpcvit_root,a.dataset_roots,a.manifests,a.mae_path)): p.error('real experiment requires model, data, and local MAE')
     if not a.fixture and a.encoder!='mae': p.error('real experiment requires --encoder mae')
     if a.fixture and a.encoder!='fixture': p.error('fixture requires fixture encoder')
