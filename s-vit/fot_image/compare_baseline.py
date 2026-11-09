@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 from training.core import ZOConfig, PlainAdam, basis, direction
 from training.data import PartyData
-from training.model import fixture, load_backbone, PlainOps, forward
+from training.model import fixture, load_backbone, forward
+from .plaintext_ops import AccuracyPlainOps
 
 
 @torch.no_grad()
@@ -23,6 +24,8 @@ def main():
     p.add_argument('--rank', type=int, default=4); p.add_argument('--sigma', type=float, default=.1)
     p.add_argument('--lr', type=float, default=.03); p.add_argument('--epsilon', type=float, default=.01)
     p.add_argument('--seed', type=int, default=20261107); p.add_argument('--output', required=True)
+    p.add_argument('--allow-plaintext-gelu-out-of-range', action='store_true',
+                   help='accuracy-only: continue on finite GeLU input outside MPC range and record violations')
     a = p.parse_args()
     if min(a.steps,a.eval_every,a.batch_size)<1: p.error('positive steps, evaluation interval and batch size required')
     if not a.fixture and not all((a.checkpoint,a.fixed_student,a.mpcvit_root,a.dataset_roots,a.manifests,a.eval_root,a.eval_manifest)):
@@ -33,7 +36,7 @@ def main():
     torch.set_num_threads(1)
     spec, params = fixture() if a.fixture else load_backbone(a.checkpoint,a.mpcvit_root,a.fixed_student)
     device = torch.device(a.device)
-    ops = PlainOps({k:v.to(device) for k,v in params.items()})
+    ops = AccuracyPlainOps({k:v.to(device) for k,v in params.items()}, a.allow_plaintext_gelu_out_of_range)
     parties = [PartyData(i,spec,None if a.fixture else a.dataset_roots[i],None if a.fixture else a.manifests[i]) for i in range(3)]
     validation = parties if a.fixture else [PartyData(0,spec,a.eval_root,a.eval_manifest)]
     cfg = ZOConfig(rank=a.rank,sigma=a.sigma,lr=a.lr,epsilon=a.epsilon,seed=a.seed).validate()
@@ -70,7 +73,8 @@ def main():
         print(json.dumps({'event':'step_complete',**row}),flush=True)
     result = {'status':'completed','backend':'plaintext','method':'original_fot_adam',
               'initial':initial,'steps':rows,'batch_size':a.batch_size,
-              'scope':'public fixture' if a.fixture else 'explicit independent manifest'}
+              'scope':'public fixture' if a.fixture else 'explicit independent manifest',
+              'plaintext_range_audit':ops.range_report()}
     (out/'report.json').write_text(json.dumps(result,indent=2,allow_nan=False)+'\n')
     print(json.dumps({'event':'complete','report':str(out/'report.json')}),flush=True)
 

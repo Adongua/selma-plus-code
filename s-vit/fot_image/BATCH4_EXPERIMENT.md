@@ -44,6 +44,8 @@ PY
 
 每方案 300 次更新，每步每个数据方拿 4 张，轮换数据方，固定相同的顺序；每 50 步评估同一 1,000 张留出图并保存 checkpoint。评估耗时不纳入每步训练 benchmark。请在 GPU 0 空闲时依次执行，两命令不能写入同一输出目录；实际评估 1,000 张图需耗时。参数当前按两方法各自已使用的设置，超参未经过公平调优。
 
+默认沿用三方 sGeLU 的 ±12 输入限制。如果明文数据集触发 `gelu_input` 范围错误，可在两条明文命令中**同时**加入 `--allow-plaintext-gelu-out-of-range`，使用 g2 明文公式对有限的越界输入继续评估，并在报告 `plaintext_range_audit` 中统计触发次数、元素数和最大值。重复查询会重复计数；该选项不是安全算子扩域，不代表越界时三方协议正确，非有限值和其他算子的范围检查仍然生效。3PC 禁止使用此选项。明文准确率和三方数值验证应分别报告。
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m fot_image.compare_baseline \
   --device cuda --checkpoint "$CKPT" --fixed-student "$FIXED" --mpcvit-root "$PWD/mpcvit" \

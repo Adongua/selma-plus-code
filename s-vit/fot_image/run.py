@@ -15,10 +15,11 @@ import torch.nn.functional as F
 
 from fot_explore.conditioning import LocalEncoder
 from training.data import PartyData
-from training.model import fixture, load_backbone, PlainOps, forward
+from training.model import fixture, load_backbone, forward
 from training.run import public_owner_error
 from .decoder import (FEATURE_DIM, PARAMS, PlainDecoderOps, SecretDecoderOps,
                       image_prompt, initial_parameters, perturb_image, rademacher)
+from .plaintext_ops import AccuracyPlainOps
 
 
 def emit(event, **fields):
@@ -46,7 +47,7 @@ def exact_loss(spec, backbone, decoder, images, labels, feature, theta, a):
 def plaintext(a):
     device = torch.device(a.device)
     spec, values = model(a)
-    backbone = PlainOps({k:v.to(device) for k,v in values.items()})
+    backbone = AccuracyPlainOps({k:v.to(device) for k,v in values.items()}, a.allow_plaintext_gelu_out_of_range)
     decoder = PlainDecoderOps()
     encoder = LocalEncoder(a.encoder, FEATURE_DIM, device, a.mae_path, seed=a.seed+44)
     parties = [dataset(a, spec, i) for i in range(3)]
@@ -102,7 +103,7 @@ def plaintext(a):
     return {'backend':'plaintext', 'status':'completed', 'parameters':PARAMS, 'initial':initial,
             'steps':rows, 'prompt_space':'pixel', 'pixel_clipping':False,
             'evaluation_scope':'explicit manifest' if a.eval_manifest else 'training data',
-            'encoder':a.encoder, 'model':spec}
+            'encoder':a.encoder, 'model':spec, 'plaintext_range_audit':backbone.range_report()}
 
 
 def secure(rank, rendezvous, a, connections):
@@ -248,6 +249,8 @@ def main():
     p.add_argument('--seed', type=int, default=20261107)
     p.add_argument('--fixed-batch', action='store_true'); p.add_argument('--trusted-dealer', action='store_true')
     p.add_argument('--diagnostic-loss', action='store_true', help='explicitly disclose the owner training loss diagnostic')
+    p.add_argument('--allow-plaintext-gelu-out-of-range', action='store_true',
+                   help='accuracy-only: continue on finite GeLU input outside MPC range and record violations')
     p.add_argument('--check-forward-ranges', action='store_true')
     p.add_argument('--debug-progress', action='store_true', help='log per-block and preprocessing progress with extra synchronizations')
     p.add_argument('--heartbeat-seconds', type=float, default=30.)
@@ -259,6 +262,7 @@ def main():
     if a.fixture and a.encoder!='fixture': p.error('fixture requires fixture encoder')
     if bool(a.eval_root)!=bool(a.eval_manifest): p.error('specify eval root and manifest together')
     if a.backend=='3pc' and a.eval_manifest: p.error('independent evaluation currently plaintext only')
+    if a.backend=='3pc' and a.allow_plaintext_gelu_out_of_range: p.error('plaintext range option cannot be used with 3pc')
     if a.device=='cuda' and torch.cuda.device_count() < (3 if a.backend=='3pc' else 1): p.error('insufficient visible GPUs')
     root = Path(a.output).resolve(); root.mkdir(parents=True, exist_ok=False, mode=0o700); a.output = str(root)
     (root/'options.json').write_text(json.dumps(vars(a),indent=2)+'\n')
