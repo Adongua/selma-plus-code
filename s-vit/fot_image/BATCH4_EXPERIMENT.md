@@ -154,3 +154,30 @@ CUDA_VISIBLE_DEVICES=0 python -m fot_image.evaluate_official \
 完成 smoke 后，将 `--max-samples` 改为 `0` 并选择新的输出文件，可评价完整验证集。有限的 sGeLU 输入越界仅在明确指定选项时按明文 g2 公式继续，其他检查仍在；不代表三方协议可在越界时正确执行。官方验证集已用于先前模型和 checkpoint 的评估，不能再称为独立最终测试集。这里全部使用训练脚本的明文近似算子，之前 `hattention.evaluate_fixed` 使用的固定模型计算路径不同，不应把旧的 59.29% 作为完全同口径的无提示行。不要将 200 张 smoke 结果与 10,000 张结果混用。
 
 只需比较无提示和初始 CNN 时，可不传其他 checkpoint 列表，改为传入 `--image-initial-from "$ROOT/fot-accuracy-b4-image-v2/step-000200.pt"`。程序从该 checkpoint 读取初始化 seed、投影配置和缩放系数，用当前代码重新生成 CNN 初始参数，并在报告中记录该配置来源及其 SHA-256。此结果是重建的初始参数，并不是读取 checkpoint 中已训练的 theta；若初始化代码或预训练 MAE 权重曾变化，需要另行核对。
+
+## 明文梯度诊断和一阶参照
+
+`fot_image.diagnose_training` 与已有方法实现隔离，不改变三方训练协议。`gradient` 模式在同一 batch 和参数点计算 CNN 参数的自动微分梯度，然后比较多个独立 Rademacher 对称扰动；逐 sigma 输出方向导数相对 RMSE、平均方向数为 1/4/16 等时的梯度余弦，以及系数超过现有 8 界限的次数。方向数为 q 时需要 2q 次 ViT+CNN 前向；各 sigma 使用相同方向以便对照。91 维中单个方向的余弦天然偏低，不能单凭单次结果认定 SPSA 错误；应看多个 batch、重复次数和 q 的变化。本测试在明文中使用允许记录 GeLU 越界的 g2 公式，不验证 MPC 梯度或安全性。
+
+`first-order` 以相同数据顺序、MAE、CNN 初始参数和冻结 ViT 运行明文 autograd + PyTorch Adam，只作为诊断上界参考，不是可直接迁移到三方的训练协议。每 50 步在同一留出 manifest 评估并保存 checkpoint；两方法更新算法、学习率尺度和每步调用次数不同，不能按 step 等同计算开销。与 FoT 曲线对照时记录相同数据和 seed，反复调参后需要新的独立测试集。当前批处理和评估沿用每张留出图单独前向，可能很慢，但每 100 张会输出进度。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m fot_image.diagnose_training --experiment gradient \
+  --device cuda --encoder mae --mae-path "$MAE" \
+  --checkpoint "$CKPT" --fixed-student "$FIXED" --mpcvit-root "$PWD/mpcvit" \
+  --dataset-roots "$DATA" "$DATA" "$DATA" \
+  --manifests "$ACC_SPLIT/party-0.json" "$ACC_SPLIT/party-1.json" "$ACC_SPLIT/party-2.json" \
+  --batch-size 4 --batches 3 --directions 16 --repeats 2 --sigmas 0.01 0.05 0.1 \
+  --prompt-scale 0.1 --seed 20261107 --allow-plaintext-gelu-out-of-range \
+  --output "$HOME/home/tmp/fot-image-gradient-diagnostic-v1"
+
+CUDA_VISIBLE_DEVICES=0 python -m fot_image.diagnose_training --experiment first-order \
+  --device cuda --encoder mae --mae-path "$MAE" \
+  --checkpoint "$CKPT" --fixed-student "$FIXED" --mpcvit-root "$PWD/mpcvit" \
+  --dataset-roots "$DATA" "$DATA" "$DATA" \
+  --manifests "$ACC_SPLIT/party-0.json" "$ACC_SPLIT/party-1.json" "$ACC_SPLIT/party-2.json" \
+  --eval-root "$DATA" --eval-manifest "$ACC_SPLIT/eval.json" \
+  --batch-size 4 --steps 300 --eval-every 50 --lr 0.001 --prompt-scale 0.1 --seed 20261107 \
+  --allow-plaintext-gelu-out-of-range \
+  --output "$HOME/home/tmp/fot-image-first-order-v1"
+```
