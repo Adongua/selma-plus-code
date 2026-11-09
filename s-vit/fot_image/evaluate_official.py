@@ -15,7 +15,7 @@ from hattention.search_data import SearchDataset, collate_search
 from hattention.search_mixer import balanced_items
 from hattention.student_checkpoint import file_sha256
 from hattention.validate_teacher import validation_items
-from .decoder import FEATURE_DIM, PARAMS, PlainDecoderOps, image_prompt, perturb_image
+from .decoder import FEATURE_DIM, PARAMS, PlainDecoderOps, image_prompt, initial_parameters, perturb_image
 from .plaintext_ops import AccuracyPlainOps
 
 
@@ -37,6 +37,13 @@ def load_prompt(path, kind, source_path, device):
     return {'kind':kind, 'value':value.to(device).double(), 'options':options,
             'path':str(Path(path).resolve()), 'sha256':file_sha256(path),
             'step':int(artifact.get('step', 0))}
+
+
+def initial_image_variant(source, device):
+    """Recreate the original CNN; trained values in source are never reused."""
+    seed = int(source['options']['seed'])
+    return {'kind':'image', 'value':initial_parameters(seed).to(device),
+            'prompt_scale':float(source['options']['prompt_scale'])}
 
 
 def evaluate_batches(spec, params, batches, variants, encoder, device, allow_gelu, progress_every=0):
@@ -95,8 +102,9 @@ def main():
     p.add_argument('--checkpoint', required=True); p.add_argument('--fixed-student', required=True)
     p.add_argument('--mpcvit-root', required=True); p.add_argument('--dataset-root', required=True)
     p.add_argument('--mae-path', required=True)
-    p.add_argument('--baseline-checkpoints', nargs=2, required=True)
-    p.add_argument('--image-checkpoints', nargs=2, required=True)
+    p.add_argument('--baseline-checkpoints', nargs='+', default=[])
+    p.add_argument('--image-checkpoints', nargs='+', default=[])
+    p.add_argument('--image-initial-from', help='recreate initial CNN using the seed and settings stored in this image checkpoint')
     p.add_argument('--batch-size', type=int, default=4)
     p.add_argument('--max-samples', type=int, default=0, help='0: all official validation images; otherwise balanced subset')
     p.add_argument('--seed', type=int, default=20261030)
@@ -140,8 +148,19 @@ def main():
         name=f'image_step_{v["step"]}'
         if name in variants: raise ValueError(f'duplicate checkpoint step: {name}')
         variants[name]=v
-    if len(set(configs))!=1 or configs[0][1]!='mae': raise ValueError('CNN checkpoints require same MAE projection configuration')
-    encoder=LocalEncoder('mae',FEATURE_DIM,device,a.mae_path,seed=configs[0][0]+44)
+    initial_source = None
+    if a.image_initial_from:
+        source=load_prompt(a.image_initial_from,'image',a.fixed_student,device)
+        seed=int(source['options']['seed'])
+        configs.append((seed,source['options']['encoder']))
+        name='image_initial'
+        variants[name]=initial_image_variant(source, device)
+        initial_source={'checkpoint':source['path'], 'checkpoint_sha256':source['sha256'],
+                        'seed':seed, 'prompt_scale':variants[name]['prompt_scale'],
+                        'note':'Initial parameters regenerated from the current code and saved seed; not loaded from the trained theta.'}
+    if configs and (len(set(configs))!=1 or configs[0][1]!='mae'):
+        raise ValueError('CNN checkpoints require same MAE projection configuration')
+    encoder=LocalEncoder('mae',FEATURE_DIM,device,a.mae_path,seed=configs[0][0]+44) if configs else None
     loader=DataLoader(SearchDataset(root,items),batch_size=a.batch_size,shuffle=False,collate_fn=collate_search,num_workers=0)
     batches=((x,y) for x,_,y in loader)
     print(json.dumps({'event':'evaluation_started','samples':len(items),'batch_size':a.batch_size,'variants':list(variants)}),flush=True)
@@ -149,7 +168,7 @@ def main():
     report={'status':'evaluated_plaintext_not_security_validated','scope':'official validation' if not a.max_samples else 'balanced official validation subset',
             'samples':len(items),'manifest_sha256':digest.hexdigest(), 'batch_size':a.batch_size,
             'fixed_student_sha256':file_sha256(a.fixed_student),'source_checkpoint_sha256':file_sha256(a.checkpoint),
-            'mae_path':str(Path(a.mae_path).resolve()),'metrics':metrics,
+            'mae_path':str(Path(a.mae_path).resolve()),'image_initialization_source':initial_source,'metrics':metrics,
             'note':'All variants use the same plaintext training forward including g2 GeLU; not directly identical to evaluate_fixed; no secure accuracy claim. Official validation was previously used for model selection. Checkpoint provenance relies on recorded paths, not a saved weight hash.'}
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')

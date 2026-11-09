@@ -152,3 +152,5 @@ CUDA_VISIBLE_DEVICES=0 python -m fot_image.evaluate_official \
 ```
 
 完成 smoke 后，将 `--max-samples` 改为 `0` 并选择新的输出文件，可评价完整验证集。有限的 sGeLU 输入越界仅在明确指定选项时按明文 g2 公式继续，其他检查仍在；不代表三方协议可在越界时正确执行。官方验证集已用于先前模型和 checkpoint 的评估，不能再称为独立最终测试集。这里全部使用训练脚本的明文近似算子，之前 `hattention.evaluate_fixed` 使用的固定模型计算路径不同，不应把旧的 59.29% 作为完全同口径的无提示行。不要将 200 张 smoke 结果与 10,000 张结果混用。
+
+只需比较无提示和初始 CNN 时，可不传其他 checkpoint 列表，改为传入 `--image-initial-from "$ROOT/fot-accuracy-b4-image-v2/step-000200.pt"`。程序从该 checkpoint 读取初始化 seed、投影配置和缩放系数，用当前代码重新生成 CNN 初始参数，并在报告中记录该配置来源及其 SHA-256。此结果是重建的初始参数，并不是读取 checkpoint 中已训练的 theta；若初始化代码或预训练 MAE 权重曾变化，需要另行核对。

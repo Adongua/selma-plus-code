@@ -9,10 +9,17 @@ from training.core import ZOConfig, basis
 from training.data import PartyData
 from training.model import fixture
 from .decoder import FEATURE_DIM, initial_parameters
-from .evaluate_official import evaluate_batches, load_prompt
+from .evaluate_official import evaluate_batches, initial_image_variant, load_prompt
 
 
 class OfficialEvaluationTests(unittest.TestCase):
+    def test_initial_cnn_uses_saved_seed_not_trained_theta(self):
+        source = {'options':{'seed':123,'prompt_scale':.1}, 'value':torch.full((91,),7.)}
+        initial = initial_image_variant(source, 'cpu')
+        torch.testing.assert_close(initial['value'], initial_parameters(123))
+        self.assertFalse(torch.equal(initial['value'],source['value'].double()))
+        self.assertEqual(initial['prompt_scale'], .1)
+
     def test_batched_matches_single_and_counts_last_batch(self):
         torch.set_num_threads(1)
         spec, params = fixture()
