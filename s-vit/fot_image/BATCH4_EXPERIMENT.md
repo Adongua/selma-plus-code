@@ -133,3 +133,22 @@ PY
 ```
 
 一条 3PC step 包含所有者本地 MAE、输入及特征分享、两次 CNN+ViT、差值分享及一次优化器更新。仅成本可与现有 batch=4 旧 FoT 在相似条件下做初步比较；未同步控制 GPU、通信和数值精度前，不是严格结论。指标为插桩估计、不是严格离线预处理后纯在线重放；通信不包含 dealer IPC/所有控制元数据。MAE 时间已包含在 forward 范围内。可信 dealer 仅是模拟，状态 `completed_not_security_validated` 不是安全或精度证明。
+
+## 官方验证集上的统一明文对照
+
+`fot_image.evaluate_official` 同时比较无提示、两份原 FoT checkpoint 和两份 MAE-CNN checkpoint。使用与微调相同的训练前向算子、同一 MAE 特征和相同 64×64 输入，在官方验证标注上计算 Top-1、Top-5、CE 和逐样本相对无提示配置的预测变化；batch 化并每 100 张汇报一次进度。`--max-samples 200` 为按类别平衡的 smoke 子集，不是完整验证集；`--max-samples 0` 使用全部官方验证图像。报告包含模型和 checkpoint 的 SHA-256，以及每个配置的 sGeLU 越界统计。checkpoint 旧格式没有保存来源权重 hash，程序只核对保存的路径，无法证明文件曾未被替换。
+
+示例依赖本文环境变量和已完成的 `fot-accuracy-b4-baseline-v2` 与 `fot-accuracy-b4-image-v2`：
+
+```bash
+ROOT="$HOME/home/tmp"
+CUDA_VISIBLE_DEVICES=0 python -m fot_image.evaluate_official \
+  --device cuda --dataset-root "$DATA" \
+  --checkpoint "$CKPT" --fixed-student "$FIXED" --mpcvit-root "$PWD/mpcvit" --mae-path "$MAE" \
+  --baseline-checkpoints "$ROOT/fot-accuracy-b4-baseline-v2/step-000200.pt" "$ROOT/fot-accuracy-b4-baseline-v2/step-000300.pt" \
+  --image-checkpoints "$ROOT/fot-accuracy-b4-image-v2/step-000200.pt" "$ROOT/fot-accuracy-b4-image-v2/step-000300.pt" \
+  --batch-size 4 --max-samples 200 --allow-plaintext-gelu-out-of-range \
+  --output "$ROOT/fot-official-eval-smoke-v1.json"
+```
+
+完成 smoke 后，将 `--max-samples` 改为 `0` 并选择新的输出文件，可评价完整验证集。有限的 sGeLU 输入越界仅在明确指定选项时按明文 g2 公式继续，其他检查仍在；不代表三方协议可在越界时正确执行。官方验证集已用于先前模型和 checkpoint 的评估，不能再称为独立最终测试集。这里全部使用训练脚本的明文近似算子，之前 `hattention.evaluate_fixed` 使用的固定模型计算路径不同，不应把旧的 59.29% 作为完全同口径的无提示行。不要将 200 张 smoke 结果与 10,000 张结果混用。
