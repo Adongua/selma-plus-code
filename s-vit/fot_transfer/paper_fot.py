@@ -87,6 +87,7 @@ def main():
     p.add_argument('--test-max-samples', type=int, default=0, help='smoke only; 0 evaluates full test split')
     p.add_argument('--optimizer', choices=('zo','adam'), default='zo')
     p.add_argument('--basis-file', help='reuse a learned subspace basis')
+    p.add_argument('--extend-random-columns', type=int, default=0, help='append orthogonal random columns to a loaded basis')
     p.add_argument('--initial-decoder', help='BlackVIP checkpoint for subspace initialization')
     p.add_argument('--device', choices=('cpu','cuda'), default='cuda')
     p.add_argument('--epochs', type=int, default=1)
@@ -110,10 +111,12 @@ def main():
     p.add_argument('--log-every', type=int, default=20)
     p.add_argument('--allow-plaintext-gelu-out-of-range', action='store_true')
     a = p.parse_args()
-    if min(a.epochs,a.batch_size,a.eval_batch_size,a.directions,a.subspace_columns,a.projection_width,a.subspace_steps,a.log_every)<1 or min(a.val_samples,a.max_batches,a.random_columns,a.test_max_samples)<0 or min(a.sigma,a.lr,a.prompt_scale)<=0 or not 0<=a.momentum<1:
+    if min(a.epochs,a.batch_size,a.eval_batch_size,a.directions,a.subspace_columns,a.projection_width,a.subspace_steps,a.log_every)<1 or min(a.val_samples,a.max_batches,a.random_columns,a.test_max_samples,a.extend_random_columns)<0 or min(a.sigma,a.lr,a.prompt_scale)<=0 or not 0<=a.momentum<1:
         p.error('invalid configuration')
-    if (a.optimizer == 'adam' or a.basis_file) and a.method != 'subspace':
-        p.error('optimizer adam and basis-file require subspace method')
+    if a.basis_file and a.method != 'subspace':
+        p.error('basis-file requires subspace method')
+    if a.extend_random_columns and not a.basis_file:
+        p.error('extending a basis requires --basis-file')
     if a.phase == 'test' and not a.test_checkpoint:
         p.error('test phase requires --test-checkpoint')
     if a.phase == 'train' and a.method=='subspace' and not a.initial_decoder:
@@ -238,6 +241,12 @@ def main():
                 if len(learned) != 2 or any(item.ndim != 2 or item.shape[0] != dim or not torch.isfinite(item).all() for item,dim in zip(learned,(trigger_dim,initial.numel()-trigger_dim))) or learned[0].shape[1] != learned[1].shape[1]:
                     raise ValueError('invalid basis shape or values')
                 emit('subspace_loaded', basis_sha256=file_sha256(a.basis_file), columns=learned[0].shape[1])
+                if a.extend_random_columns:
+                    for i,dim in enumerate((trigger_dim,initial.numel()-trigger_dim)):
+                        extra=random_projection(dim,a.extend_random_columns,learned[i],generator,device)
+                        learned[i]=torch.cat((learned[i],extra),dim=1)
+                    torch.save({'basis':learned,'initial_sha256':file_sha256(a.initial_decoder)},root/'basis.pt')
+                    emit('subspace_extended', columns=learned[0].shape[1])
             else:
                 learned=[initial.new_empty((trigger_dim,0)),initial.new_empty((initial.numel()-trigger_dim,0))]
                 public_batches=list(data['public'].chunks(a.batch_size))
@@ -267,6 +276,9 @@ def main():
                 optimizer = torch.optim.Adam([z], lr=a.lr)
         weights=initial.clone()
         momentum=torch.zeros_like(weights)
+        if a.method == 'blackvip' and a.optimizer == 'adam':
+            weights = torch.nn.Parameter(weights)
+            optimizer = torch.optim.Adam([weights], lr=a.lr)
         step=0
         for epoch in range(1,a.epochs+1):
             total=count=0
@@ -280,7 +292,17 @@ def main():
                 step+=1
                 x,y=x.to(device),y.to(device)
                 feature=encoder(x)
-                if a.method=='blackvip':
+                if a.method == 'blackvip' and a.optimizer == 'adam':
+                    with torch.enable_grad():
+                        optimizer.zero_grad(set_to_none=True)
+                        objective = F.cross_entropy(predict(x,feature,weights),y)
+                        objective.backward()
+                        if weights.grad is None or not torch.isfinite(weights.grad).all():
+                            raise ArithmeticError('invalid decoder gradient')
+                        optimizer.step()
+                    calls['train'] += 1
+                    value = objective.item()
+                elif a.method=='blackvip':
                     lr=a.lr/(step+a.offset)**a.alpha
                     sigma=a.sigma/step**a.gamma
                     estimate=torch.zeros_like(weights)
@@ -323,10 +345,10 @@ def main():
             row={'epoch':epoch,'step':step,'samples':count,'validation':validation,'queries':dict(calls),
                  'training_loss':total/count, 'training_loss_kind':'pre_update_ce' if a.optimizer == 'adam' else 'mean_perturbed_ce'}
             rows.append(row)
-            save(root/f'epoch-{epoch:04d}.pt',weights,epoch)
+            save(root/f'epoch-{epoch:04d}.pt',weights.detach(),epoch)
             report={'status':'completed' if epoch==a.epochs else 'running','method':a.method,
                     'initial_validation':initial_val,'epochs':rows,'options':vars(a),
-                    'hashes':hashes,'basis_sha256':file_sha256(a.basis_file) if a.basis_file else (file_sha256(root/'basis.pt') if a.method == 'subspace' else None),'queries':calls,'range_audit':ops.range_report(),
+                    'hashes':hashes,'basis_sha256':(file_sha256(root/'basis.pt') if (root/'basis.pt').exists() else file_sha256(a.basis_file)) if a.method == 'subspace' else None,'queries':calls,'range_audit':ops.range_report(),
                     'note':'Plaintext adaptation; no MPC or security validation. Frozen decoder BN statistics. MAE features use deterministic full-token inference. Official test has been previously inspected during development.'}
             (root/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
             emit('epoch_complete',**row)
