@@ -85,6 +85,8 @@ def main():
     p.add_argument('--training-split', choices=('party','public'), default='party')
     p.add_argument('--test-checkpoint')
     p.add_argument('--test-max-samples', type=int, default=0, help='smoke only; 0 evaluates full test split')
+    p.add_argument('--optimizer', choices=('zo','adam'), default='zo')
+    p.add_argument('--basis-file', help='reuse a learned subspace basis')
     p.add_argument('--initial-decoder', help='BlackVIP checkpoint for subspace initialization')
     p.add_argument('--device', choices=('cpu','cuda'), default='cuda')
     p.add_argument('--epochs', type=int, default=1)
@@ -110,6 +112,8 @@ def main():
     a = p.parse_args()
     if min(a.epochs,a.batch_size,a.eval_batch_size,a.directions,a.subspace_columns,a.projection_width,a.subspace_steps,a.log_every)<1 or min(a.val_samples,a.max_batches,a.random_columns,a.test_max_samples)<0 or min(a.sigma,a.lr,a.prompt_scale)<=0 or not 0<=a.momentum<1:
         p.error('invalid configuration')
+    if (a.optimizer == 'adam' or a.basis_file) and a.method != 'subspace':
+        p.error('optimizer adam and basis-file require subspace method')
     if a.phase == 'test' and not a.test_checkpoint:
         p.error('test phase requires --test-checkpoint')
     if a.phase == 'train' and a.method=='subspace' and not a.initial_decoder:
@@ -226,29 +230,41 @@ def main():
     learned=None
     with torch.no_grad():
         if a.method=='subspace':
-            learned=[initial.new_empty((trigger_dim,0)),initial.new_empty((initial.numel()-trigger_dim,0))]
-            public_batches=list(data['public'].chunks(a.batch_size))
-            emit('subspace_started', columns=a.subspace_columns, steps_per_column=a.subspace_steps)
-            for col in range(a.subspace_columns):
-                projections=projection(learned)
-                z=initial.new_zeros(2*a.projection_width)
-                for step in range(a.subspace_steps):
-                    x,y=public_batches[(col*a.subspace_steps+step)%len(public_batches)]
-                    x,y=x.to(device),y.to(device)
-                    z,_=gaussian_update(z,projections,x,y,encoder(x),'subspace')
-                for i,part in enumerate((z[:a.projection_width],z[a.projection_width:])):
-                    v=projections[i]@part
-                    norm=v.norm()
-                    if norm < 1e-12:
-                        raise ArithmeticError('learned subspace direction has zero norm')
-                    learned[i]=torch.cat((learned[i],(v/norm).unsqueeze(1)),dim=1)
-                emit('subspace_column_complete',column=col+1,queries=calls['subspace'])
-            if a.random_columns:
-                for i,dim in enumerate((trigger_dim,initial.numel()-trigger_dim)):
-                    extra=random_projection(dim,a.random_columns,learned[i],generator,device)
-                    learned[i]=torch.cat((learned[i],extra),dim=1)
-            torch.save({'basis':learned,'initial_sha256':file_sha256(a.initial_decoder)},root/'basis.pt')
+            if a.basis_file:
+                saved = torch.load(a.basis_file, map_location='cpu', weights_only=True)
+                if saved['initial_sha256'] != file_sha256(a.initial_decoder):
+                    raise ValueError('basis and initial decoder mismatch')
+                learned = [item.to(device=device, dtype=initial.dtype) for item in saved['basis']]
+                if len(learned) != 2 or any(item.ndim != 2 or item.shape[0] != dim or not torch.isfinite(item).all() for item,dim in zip(learned,(trigger_dim,initial.numel()-trigger_dim))) or learned[0].shape[1] != learned[1].shape[1]:
+                    raise ValueError('invalid basis shape or values')
+                emit('subspace_loaded', basis_sha256=file_sha256(a.basis_file), columns=learned[0].shape[1])
+            else:
+                learned=[initial.new_empty((trigger_dim,0)),initial.new_empty((initial.numel()-trigger_dim,0))]
+                public_batches=list(data['public'].chunks(a.batch_size))
+                emit('subspace_started', columns=a.subspace_columns, steps_per_column=a.subspace_steps)
+                for col in range(a.subspace_columns):
+                    projections=projection(learned)
+                    z=initial.new_zeros(2*a.projection_width)
+                    for step in range(a.subspace_steps):
+                        x,y=public_batches[(col*a.subspace_steps+step)%len(public_batches)]
+                        x,y=x.to(device),y.to(device)
+                        z,_=gaussian_update(z,projections,x,y,encoder(x),'subspace')
+                    for i,part in enumerate((z[:a.projection_width],z[a.projection_width:])):
+                        v=projections[i]@part
+                        norm=v.norm()
+                        if norm < 1e-12:
+                            raise ArithmeticError('learned subspace direction has zero norm')
+                        learned[i]=torch.cat((learned[i],(v/norm).unsqueeze(1)),dim=1)
+                    emit('subspace_column_complete',column=col+1,queries=calls['subspace'])
+                if a.random_columns:
+                    for i,dim in enumerate((trigger_dim,initial.numel()-trigger_dim)):
+                        extra=random_projection(dim,a.random_columns,learned[i],generator,device)
+                        learned[i]=torch.cat((learned[i],extra),dim=1)
+                torch.save({'basis':learned,'initial_sha256':file_sha256(a.initial_decoder)},root/'basis.pt')
             z=initial.new_zeros(2*learned[0].shape[1])
+            if a.optimizer == 'adam':
+                z = torch.nn.Parameter(z)
+                optimizer = torch.optim.Adam([z], lr=a.lr)
         weights=initial.clone()
         momentum=torch.zeros_like(weights)
         step=0
@@ -282,6 +298,17 @@ def main():
                     momentum=a.momentum*momentum+estimate
                     weights=weights-lr*(estimate+a.momentum*momentum)
                     value/=a.directions
+                elif a.optimizer == 'adam':
+                    with torch.enable_grad():
+                        optimizer.zero_grad(set_to_none=True)
+                        objective = F.cross_entropy(predict(x,feature,initial+map_latent(z,learned)),y)
+                        objective.backward()
+                        if z.grad is None or not torch.isfinite(z.grad).all():
+                            raise ArithmeticError('invalid subspace gradient')
+                        optimizer.step()
+                    calls['train'] += 1
+                    value = objective.item()
+                    weights = initial+map_latent(z.detach(),learned)
                 else:
                     z,value=gaussian_update(z,learned,x,y,feature,'train')
                     weights=initial+map_latent(z,learned)
@@ -294,12 +321,12 @@ def main():
                     emit('training_progress',epoch=epoch,step=step,owner=owner,samples=count,queries=dict(calls))
             validation=evaluate(weights)
             row={'epoch':epoch,'step':step,'samples':count,'validation':validation,'queries':dict(calls),
-                 'training_perturbed_loss':total/count}
+                 'training_loss':total/count, 'training_loss_kind':'pre_update_ce' if a.optimizer == 'adam' else 'mean_perturbed_ce'}
             rows.append(row)
             save(root/f'epoch-{epoch:04d}.pt',weights,epoch)
             report={'status':'completed' if epoch==a.epochs else 'running','method':a.method,
                     'initial_validation':initial_val,'epochs':rows,'options':vars(a),
-                    'hashes':hashes,'queries':calls,'range_audit':ops.range_report(),
+                    'hashes':hashes,'basis_sha256':file_sha256(a.basis_file) if a.basis_file else (file_sha256(root/'basis.pt') if a.method == 'subspace' else None),'queries':calls,'range_audit':ops.range_report(),
                     'note':'Plaintext adaptation; no MPC or security validation. Frozen decoder BN statistics. MAE features use deterministic full-token inference. Official test has been previously inspected during development.'}
             (root/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
             emit('epoch_complete',**row)
