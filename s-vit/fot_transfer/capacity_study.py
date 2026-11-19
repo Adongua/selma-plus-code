@@ -48,6 +48,7 @@ def main():
     if min(a.epochs,a.batch_size,a.eval_batch_size,a.audit_batches,a.directions,a.log_every)<1 or min(a.val_samples,a.max_batches_per_epoch)<0 or any(not math.isfinite(x) or x<=0 for x in (a.sigma,a.lr,a.epsilon,a.prompt_scale)) or not 0<=a.momentum<1: p.error('invalid arguments')
     if a.method != 'fot' and not a.mae_path: p.error('image methods require --mae-path')
     if a.device == 'cuda' and not torch.cuda.is_available(): p.error('CUDA unavailable')
+    if a.mode=='train' and a.method=='fot' and a.optimizer=='zo' and a.directions!=1: p.error('FoT training supports one direction in this study')
     root = Path(a.output).resolve(); root.mkdir(parents=True, exist_ok=False, mode=0o700)
     torch.set_num_threads(1); torch.manual_seed(a.seed); device = torch.device(a.device)
     archive, split, data = load_data(a.archive,a.splits,include_test=False)
@@ -63,7 +64,6 @@ def main():
     velocity = torch.zeros_like(weights)
     opt = torch.optim.Adam([weights.requires_grad_()],lr=a.lr) if a.optimizer=='adam' and a.mode=='train' else None
     fot_adam = PlainAdam(cfg) if a.method=='fot' and a.optimizer=='zo' and a.directions==1 else None
-    if a.method=='fot' and a.optimizer=='zo' and a.directions!=1: p.error('FoT supports one direction in this study')
     hashes = {'archive_sha256':archive['archive_sha256'],'split_sha256':file_sha256(a.splits),'head_sha256':file_sha256(a.head),'fixed_student_sha256':file_sha256(a.fixed_student),'source_sha256':file_sha256(a.checkpoint)}
     if encoder:
         f = next((x for x in (Path(a.mae_path)/'model.safetensors',Path(a.mae_path)/'pytorch_model.bin') if x.is_file()),None)
