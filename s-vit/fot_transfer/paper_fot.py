@@ -87,6 +87,8 @@ def main():
     p.add_argument('--test-max-samples', type=int, default=0, help='smoke only; 0 evaluates full test split')
     p.add_argument('--optimizer', choices=('zo','adam'), default='zo')
     p.add_argument('--basis-file', help='reuse a learned subspace basis')
+    p.add_argument('--basis-strategy', choices=('paper','trajectory','random'), default='paper')
+    p.add_argument('--trajectory-steps', type=int, default=250)
     p.add_argument('--extend-random-columns', type=int, default=0, help='append orthogonal random columns to a loaded basis')
     p.add_argument('--initial-decoder', help='BlackVIP checkpoint for subspace initialization')
     p.add_argument('--device', choices=('cpu','cuda'), default='cuda')
@@ -111,8 +113,14 @@ def main():
     p.add_argument('--log-every', type=int, default=20)
     p.add_argument('--allow-plaintext-gelu-out-of-range', action='store_true')
     a = p.parse_args()
-    if min(a.epochs,a.batch_size,a.eval_batch_size,a.directions,a.subspace_columns,a.projection_width,a.subspace_steps,a.log_every)<1 or min(a.val_samples,a.max_batches,a.random_columns,a.test_max_samples,a.extend_random_columns)<0 or min(a.sigma,a.lr,a.prompt_scale)<=0 or not 0<=a.momentum<1:
+    if min(a.epochs,a.batch_size,a.eval_batch_size,a.directions,a.subspace_columns,a.projection_width,a.subspace_steps,a.log_every,a.trajectory_steps)<1 or min(a.val_samples,a.max_batches,a.random_columns,a.test_max_samples,a.extend_random_columns)<0 or min(a.sigma,a.lr,a.prompt_scale)<=0 or not 0<=a.momentum<1:
         p.error('invalid configuration')
+    if a.method != 'subspace' and a.basis_strategy != 'paper':
+        p.error('basis strategy applies to subspace method')
+    if a.basis_file and a.basis_strategy != 'paper':
+        p.error('basis-file and basis-strategy cannot be combined')
+    if a.basis_strategy == 'trajectory' and a.trajectory_steps < a.subspace_columns:
+        p.error('trajectory steps must cover requested learned columns')
     if a.basis_file and a.method != 'subspace':
         p.error('basis-file requires subspace method')
     if a.extend_random_columns and not a.basis_file:
@@ -247,6 +255,58 @@ def main():
                         learned[i]=torch.cat((learned[i],extra),dim=1)
                     torch.save({'basis':learned,'initial_sha256':file_sha256(a.initial_decoder)},root/'basis.pt')
                     emit('subspace_extended', columns=learned[0].shape[1])
+            elif a.basis_strategy in ('trajectory', 'random'):
+                dimensions = (trigger_dim, initial.numel()-trigger_dim)
+                if a.basis_strategy == 'trajectory':
+                    public_batches = list(data['public'].chunks(a.batch_size))
+                    trajectory = []
+                    point = initial.clone()
+                    momentum = torch.zeros_like(point)
+                    emit('trajectory_started', steps=a.trajectory_steps)
+                    for t in range(1, a.trajectory_steps+1):
+                        x,y = public_batches[(t-1) % len(public_batches)]
+                        x,y = x.to(device),y.to(device)
+                        feature = encoder(x)
+                        sigma = a.sigma / t**a.gamma
+                        rate = a.lr / (t+a.offset)**a.alpha
+                        estimate = torch.zeros_like(point)
+                        for _ in range(a.directions):
+                            magnitude = (torch.rand(point.shape,generator=generator,dtype=point.dtype)+1)/2
+                            sign = 2*torch.randint(0,2,point.shape,generator=generator).double()-1
+                            u = (magnitude*sign).to(device)
+                            plus = loss(point+sigma*u,x,y,feature,'subspace')
+                            minus = loss(point-sigma*u,x,y,feature,'subspace')
+                            estimate += (plus-minus)/(2*sigma)/u
+                        estimate /= a.directions
+                        momentum = a.momentum*momentum+estimate
+                        update = -rate*(estimate+a.momentum*momentum)
+                        point += update
+                        if not torch.isfinite(point).all():
+                            raise ArithmeticError('nonfinite trajectory parameters')
+                        trajectory.append(update)
+                        if t % a.log_every == 0 or t == a.trajectory_steps:
+                            emit('trajectory_progress', step=t, queries=calls['subspace'])
+                    changes = torch.stack(trajectory)
+                    learned = []
+                    for segment in (changes[:,:trigger_dim], changes[:,trigger_dim:]):
+                        _, singular, vectors = torch.linalg.svd(segment, full_matrices=False)
+                        tolerance = singular[0] * max(segment.shape) * torch.finfo(segment.dtype).eps
+                        if singular[a.subspace_columns-1] <= tolerance:
+                            raise ArithmeticError('trajectory has insufficient numerical rank')
+                        learned.append(vectors[:a.subspace_columns].T.contiguous())
+                else:
+                    learned = [initial.new_empty((dim,0)) for dim in dimensions]
+                    for i,dim in enumerate(dimensions):
+                        learned[i]=random_projection(dim,a.subspace_columns,learned[i],generator,device)
+                if a.random_columns:
+                    for i,dim in enumerate(dimensions):
+                        extra=random_projection(dim,a.random_columns,learned[i],generator,device)
+                        learned[i]=torch.cat((learned[i],extra),dim=1)
+                torch.save({'basis':learned,'initial_sha256':file_sha256(a.initial_decoder),
+                            'basis_strategy':a.basis_strategy, 'queries':calls['subspace']},root/'basis.pt')
+                emit('subspace_ready', strategy=a.basis_strategy, columns=learned[0].shape[1],
+                     queries=calls['subspace'])
+                generator = torch.Generator().manual_seed(a.seed+10537)
             else:
                 learned=[initial.new_empty((trigger_dim,0)),initial.new_empty((initial.numel()-trigger_dim,0))]
                 public_batches=list(data['public'].chunks(a.batch_size))

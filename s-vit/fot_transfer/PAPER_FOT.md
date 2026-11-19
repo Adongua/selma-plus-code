@@ -55,3 +55,7 @@ CUDA_VISIBLE_DEVICES=0 python -m fot_transfer.paper_fot "${common[@]}" \
 ```
 
 训练结束后根据验证 Top-1、再以较低验证 loss 决定 epoch。测试时用同一组 `common` 和选中的路径运行一次 `--phase test --test-checkpoint ...`，并指定新输出目录；subspace 测试无需 `--initial-decoder`。两种方法从同一预训练权重开始时，预训练前向次数要与各自的训练查询相加，才能比较总训练开销。
+
+## 全零阶轨迹子空间
+
+`--basis-strategy trajectory` 从给定初始解码器出发，在公开数据上通过 SPSA-GC 零阶更新生成轨迹，对 trigger 和其他解码器参数的更新分别做 SVD，以主要右奇异向量作为子空间方向。整个轨迹通过双边前向计算，随后回到同一初始解码器，在生成的基底里执行零阶微调。可用 `--basis-strategy random` 生成同维随机正交基作为对照。两种策略使用独立且相同种子的后续优化随机序列，保持其余训练设置一致。轨迹构造耗时和查询应计入总开销；此法目前为明文研究路径。
