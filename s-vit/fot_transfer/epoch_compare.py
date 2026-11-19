@@ -49,6 +49,8 @@ def main():
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--eval-batch-size', type=int, default=16)
     p.add_argument('--log-every', type=int, default=100)
+    p.add_argument('--max-batches-per-epoch', type=int, default=0, help='smoke only; zero uses all batches')
+    p.add_argument('--validation-max-samples', type=int, default=0, help='smoke only; zero uses the full validation set')
     p.add_argument('--seed', type=int, default=20261107)
     p.add_argument('--sigma', type=float, default=.1)
     p.add_argument('--lr', type=float, default=.001)
@@ -58,7 +60,7 @@ def main():
     p.add_argument('--allow-plaintext-gelu-out-of-range', action='store_true')
     p.add_argument('--selected-checkpoint', help='required in test phase, selected using validation')
     a = p.parse_args()
-    if min(a.epochs, a.batch_size, a.eval_batch_size, a.log_every) < 1 or not all(math.isfinite(x) and x > 0 for x in (a.sigma, a.lr, a.epsilon, a.prompt_scale)) or not 0 <= a.momentum < 1: p.error('invalid configuration')
+    if min(a.epochs, a.batch_size, a.eval_batch_size, a.log_every) < 1 or min(a.max_batches_per_epoch, a.validation_max_samples) < 0 or not all(math.isfinite(x) and x > 0 for x in (a.sigma, a.lr, a.epsilon, a.prompt_scale)) or not 0 <= a.momentum < 1: p.error('invalid configuration')
     if a.method == 'image-zo' and not a.mae_path: p.error('image-zo requires --mae-path')
     if a.phase == 'test' and not a.selected_checkpoint: p.error('test phase requires --selected-checkpoint')
     if a.device == 'cuda' and not torch.cuda.is_available(): p.error('CUDA unavailable')
@@ -69,6 +71,9 @@ def main():
     torch.manual_seed(a.seed)
     device = torch.device(a.device)
     archive, split, data = load_data(a.archive, a.splits, include_test=a.phase == 'test')
+    if a.validation_max_samples:
+        if a.validation_max_samples > len(data['val']): raise ValueError('validation sample limit exceeds split')
+        data['val'] = CifarData(archive, 'train', data['val'].indices[:a.validation_max_samples])
     head = load_head(a, split)
     if bool(head['allow_plaintext_gelu_out_of_range']) != a.allow_plaintext_gelu_out_of_range: raise ValueError('head and run GeLU range policies differ')
     spec, params = install_head(*source_model(a), head)
@@ -134,7 +139,8 @@ def main():
     rows = []; step = 0; best = None
     for epoch in range(1, a.epochs+1):
         n = 0; sum_loss = 0.
-        for owner, x, y in epoch_batches(data, epoch, a.batch_size, a.seed):
+        for batch_index, (owner, x, y) in enumerate(epoch_batches(data, epoch, a.batch_size, a.seed)):
+            if a.max_batches_per_epoch and batch_index >= a.max_batches_per_epoch: break
             x, y = x.to(device), y.to(device); step += 1
             feature = encoder(x) if encoder else None
             if a.method in ('fot', 'image-zo'):
