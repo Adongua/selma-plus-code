@@ -105,6 +105,8 @@ def main():
     p.add_argument('--gamma', type=float, default=.1)
     p.add_argument('--offset', type=float, default=1.)
     p.add_argument('--prompt-scale', type=float, default=.1)
+    p.add_argument('--bn-mode', choices=('frozen', 'batch'), default='frozen')
+    p.add_argument('--train-eval-samples', type=int, default=0)
     p.add_argument('--subspace-columns', type=int, default=5)
     p.add_argument('--projection-width', type=int, default=8)
     p.add_argument('--random-columns', type=int, default=2)
@@ -113,7 +115,7 @@ def main():
     p.add_argument('--log-every', type=int, default=20)
     p.add_argument('--allow-plaintext-gelu-out-of-range', action='store_true')
     a = p.parse_args()
-    if min(a.epochs,a.batch_size,a.eval_batch_size,a.directions,a.subspace_columns,a.projection_width,a.subspace_steps,a.log_every,a.trajectory_steps)<1 or min(a.val_samples,a.max_batches,a.random_columns,a.test_max_samples,a.extend_random_columns)<0 or min(a.sigma,a.lr,a.prompt_scale)<=0 or not 0<=a.momentum<1:
+    if min(a.epochs,a.batch_size,a.eval_batch_size,a.directions,a.subspace_columns,a.projection_width,a.subspace_steps,a.log_every,a.trajectory_steps)<1 or min(a.val_samples,a.max_batches,a.random_columns,a.test_max_samples,a.extend_random_columns,a.train_eval_samples)<0 or min(a.sigma,a.lr,a.prompt_scale)<=0 or not 0<=a.momentum<1:
         p.error('invalid configuration')
     if a.method != 'subspace' and a.basis_strategy != 'paper':
         p.error('basis strategy applies to subspace method')
@@ -163,8 +165,12 @@ def main():
     nval = a.val_samples or len(data['val'])
     val = CifarData(archive,'train',balanced_subset(data['val'].indices,archive['train'][1],nval))
 
-    def predict(x, feature, weights):
-        prompt = functional_call(decoder,unpack(decoder,weights),(feature,))
+    def predict(x, feature, weights, training=False, update_buffers=False):
+        decoder.train(training and a.bn_mode == 'batch')
+        buffers = dict(decoder.named_buffers())
+        if not update_buffers:
+            buffers = {name: value.clone() for name, value in buffers.items()}
+        prompt = functional_call(decoder,(unpack(decoder,weights),buffers),(feature,))
         prompt = F.interpolate(prompt,size=(64,64),mode='bicubic',align_corners=False).double()
         mean=x.new_tensor([.480,.448,.397]).reshape(1,3,1,1)
         std=x.new_tensor([.272,.265,.274]).reshape(1,3,1,1)
@@ -186,7 +192,7 @@ def main():
 
     def loss(w,x,y,feature,phase):
         calls[phase]+=1
-        value=F.cross_entropy(predict(x,feature,w),y).item()
+        value=F.cross_entropy(predict(x,feature,w,training=True),y).item()
         if not math.isfinite(value):
             raise ArithmeticError('nonfinite loss')
         return value
@@ -196,6 +202,12 @@ def main():
         torch.save({'format':'paper_fot_v1','method':a.method,'epoch':epoch,
                     'decoder':decoder.state_dict(),'hashes':hashes,'options':vars(a),
                     'queries':dict(calls)},path)
+
+    train_eval = None
+    if a.train_eval_samples:
+        indices = sum((list(data[f'party-{i}'].indices) for i in range(3)), [])
+        indices = balanced_subset(indices, archive['train'][1], min(a.train_eval_samples, len(indices)))
+        train_eval = CifarData(archive, 'train', indices)
 
     def projection(existing):
         return random_projection(trigger_dim,a.projection_width,existing[0],generator,device), random_projection(initial.numel()-trigger_dim,a.projection_width,existing[1],generator,device)
@@ -237,6 +249,7 @@ def main():
     rows=[]
     emit('started',method=a.method,decoder_parameters=initial.numel())
     initial_val=evaluate(initial)
+    initial_train=evaluate(initial, train_eval) if train_eval is not None else None
     emit('validation',epoch=0,**initial_val)
     learned=None
     with torch.no_grad():
@@ -396,6 +409,9 @@ def main():
                     weights=initial+map_latent(z,learned)
                 if not torch.isfinite(weights).all():
                     raise ArithmeticError('nonfinite decoder parameters')
+                if a.bn_mode == 'batch':
+                    with torch.no_grad():
+                        predict(x, feature, weights.detach(), training=True, update_buffers=True)
                 count+=len(y)
                 if value is not None:
                     total+=value*len(y)
@@ -404,12 +420,14 @@ def main():
             validation=evaluate(weights)
             row={'epoch':epoch,'step':step,'samples':count,'validation':validation,'queries':dict(calls),
                  'training_loss':total/count, 'training_loss_kind':'pre_update_ce' if a.optimizer == 'adam' else 'mean_perturbed_ce'}
+            if train_eval is not None:
+                row['training_subset'] = evaluate(weights, train_eval)
             rows.append(row)
             save(root/f'epoch-{epoch:04d}.pt',weights.detach(),epoch)
             report={'status':'completed' if epoch==a.epochs else 'running','method':a.method,
-                    'initial_validation':initial_val,'epochs':rows,'options':vars(a),
+                    'initial_validation':initial_val,'initial_training_subset':initial_train,'epochs':rows,'options':vars(a),
                     'hashes':hashes,'basis_sha256':(file_sha256(root/'basis.pt') if (root/'basis.pt').exists() else file_sha256(a.basis_file)) if a.method == 'subspace' else None,'queries':calls,'range_audit':ops.range_report(),
-                    'note':'Plaintext adaptation; no MPC or security validation. Frozen decoder BN statistics. MAE features use deterministic full-token inference. Official test has been previously inspected during development.'}
+                    'note':'Plaintext adaptation; no MPC or security validation. Decoder BN mode is recorded in options. MAE features use deterministic full-token inference. Official test has been previously inspected during development.'}
             (root/'report.json').write_text(json.dumps(report,indent=2,allow_nan=False)+'\n')
             emit('epoch_complete',**row)
     emit('complete',report=str(root/'report.json'))
