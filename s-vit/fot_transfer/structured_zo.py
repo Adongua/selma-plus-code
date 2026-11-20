@@ -41,10 +41,11 @@ def main():
     p.add_argument('--max-batches-per-epoch', type=int, default=0)
     p.add_argument('--seed', type=int, default=20261107)
     p.add_argument('--log-every', type=int, default=100)
+    p.add_argument('--eval-every-steps', type=int, default=0, help='0 disables intermediate validation')
     p.add_argument('--device', choices=('cpu', 'cuda'), default='cuda')
     p.add_argument('--allow-plaintext-gelu-out-of-range', action='store_true')
     a = p.parse_args()
-    if min(a.rank, a.directions, a.block_size, a.epochs, a.batch_size, a.eval_batch_size, a.log_every) < 1 or min(a.validation_max_samples, a.max_batches_per_epoch) < 0 or not all(math.isfinite(v) and v > 0 for v in (a.lr, a.sigma)):
+    if min(a.rank, a.directions, a.block_size, a.epochs, a.batch_size, a.eval_batch_size, a.log_every) < 1 or min(a.validation_max_samples, a.max_batches_per_epoch, a.eval_every_steps) < 0 or not all(math.isfinite(v) and v > 0 for v in (a.lr, a.sigma)):
         p.error('invalid configuration')
     if a.device == 'cuda' and not torch.cuda.is_available():
         p.error('CUDA unavailable')
@@ -107,6 +108,8 @@ def main():
     with torch.no_grad():
         initial = evaluate(theta)
         rows = []
+        observations = []
+        factor_stats = {}
         step = 0
         for epoch in range(1, a.epochs + 1):
             total_loss = samples = 0
@@ -115,6 +118,7 @@ def main():
                     break
                 x, y = x.to(device), y.to(device)
                 start, end = blocks[step % len(blocks)]
+                factor = 'grid' if a.method == 'grid' else ('U' if start < split_at else 'V')
                 estimate = torch.zeros(end - start, dtype=theta.dtype, device=device)
                 loss_sum = rms_sum = 0.
                 for _ in range(a.directions):
@@ -141,12 +145,28 @@ def main():
                 theta[start:end] -= a.lr * mh / (vh.sqrt() + .01)
                 if not torch.isfinite(theta).all():
                     raise ArithmeticError('nonfinite parameters')
+                stat = factor_stats.setdefault(factor, {'steps': 0, 'perturbation_rms_sum': 0., 'perturbation_rms_max': 0., 'coefficient_max': 0.})
+                stat['steps'] += 1
+                stat['perturbation_rms_sum'] += rms_sum / a.directions
+                stat['perturbation_rms_max'] = max(stat['perturbation_rms_max'], rms_sum / a.directions)
+                stat['coefficient_max'] = max(stat['coefficient_max'], estimate.abs().max().item())
                 samples += len(y)
                 total_loss += loss_sum / a.directions * len(y)
                 if step % a.log_every == 0:
                     emit('training_progress', epoch=epoch, step=step, owner=owner, samples=samples,
-                         queries=queries, perturbed_loss=loss_sum / a.directions,
+                         queries=queries, factor=factor, block_start=start, block_end=end, perturbed_loss=loss_sum / a.directions,
                          perturbation_prompt_rms=rms_sum / a.directions, coefficient_max=estimate.abs().max().item())
+                if a.eval_every_steps and step % a.eval_every_steps == 0:
+                    validation = evaluate(theta)
+                    observation = {'epoch': epoch, 'step': step, 'queries': queries, 'validation': validation,
+                                   'prompt_rms': make_prompt(theta, a.method, a.rank, grid, dim).square().mean().sqrt().item()}
+                    observations.append(observation)
+                    torch.save({'format': 'structured_zo_v1', 'theta': theta.cpu(), 'options': vars(a), 'hashes': hashes, 'epoch': epoch, 'step': step}, root / f'step-{step:06d}.pt')
+                    partial = {'status': 'running', 'initial_validation': initial, 'epochs': rows, 'observations': observations,
+                               'options': vars(a), 'hashes': hashes, 'trainable_parameters': len(theta),
+                               'factor_stats': factor_stats, 'range_audit': ops.range_report()}
+                    (root / 'report.json').write_text(json.dumps(partial, indent=2, allow_nan=False) + '\n')
+                    emit('step_validation_complete', **observation)
             validation = evaluate(theta)
             row = {'epoch': epoch, 'step': step, 'samples': samples, 'queries': queries,
                    'training_perturbed_loss': total_loss / samples, 'validation': validation,
@@ -154,7 +174,7 @@ def main():
             rows.append(row)
             torch.save({'format': 'structured_zo_v1', 'theta': theta.cpu(), 'options': vars(a), 'hashes': hashes, 'epoch': epoch}, root / f'epoch-{epoch:04d}.pt')
             report = {'status': 'completed' if epoch == a.epochs else 'running', 'initial_validation': initial,
-                      'epochs': rows, 'options': vars(a), 'hashes': hashes, 'trainable_parameters': len(theta),
+                      'epochs': rows, 'observations': observations, 'factor_stats': factor_stats, 'options': vars(a), 'hashes': hashes, 'trainable_parameters': len(theta),
                       'range_audit': ops.range_report(), 'note': 'Plaintext research experiment, no MPC or security validation. Queries exclude validation.'}
             (root / 'report.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
             emit('epoch_complete', **row)
