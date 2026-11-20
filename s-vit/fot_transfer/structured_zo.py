@@ -33,6 +33,8 @@ def main():
     p.add_argument('--directions', type=int, default=1)
     p.add_argument('--block-size', type=int, default=192)
     p.add_argument('--sigma', type=float, default=.01)
+    p.add_argument('--sigma-u', type=float, help='override perturbation scale for low-rank U')
+    p.add_argument('--sigma-v', type=float, help='override perturbation scale for low-rank V')
     p.add_argument('--lr', type=float, default=.001)
     p.add_argument('--epochs', type=int, default=1)
     p.add_argument('--batch-size', type=int, default=8)
@@ -49,6 +51,10 @@ def main():
         p.error('invalid configuration')
     if a.device == 'cuda' and not torch.cuda.is_available():
         p.error('CUDA unavailable')
+    if any(value is not None and (not math.isfinite(value) or value <= 0) for value in (a.sigma_u, a.sigma_v)):
+        p.error('factor perturbation scales must be finite and positive')
+    if a.method != 'lowrank' and (a.sigma_u is not None or a.sigma_v is not None):
+        p.error('factor perturbation scales require lowrank')
     root = Path(a.output).resolve()
     if root.exists():
         p.error('output already exists')
@@ -119,17 +125,19 @@ def main():
                 x, y = x.to(device), y.to(device)
                 start, end = blocks[step % len(blocks)]
                 factor = 'grid' if a.method == 'grid' else ('U' if start < split_at else 'V')
+                sigma = {'U': a.sigma_u, 'V': a.sigma_v}.get(factor) or a.sigma
                 estimate = torch.zeros(end - start, dtype=theta.dtype, device=device)
-                loss_sum = rms_sum = 0.
+                loss_sum = rms_sum = difference_sum = 0.
                 for _ in range(a.directions):
                     u = (2 * torch.randint(0, 2, (end - start,), generator=generator) - 1).to(device=device, dtype=theta.dtype)
                     delta = torch.zeros_like(theta)
-                    delta[start:end] = a.sigma * u
+                    delta[start:end] = sigma * u
                     plus, minus = theta + delta, theta - delta
                     lp = F.cross_entropy(predict(x, plus), y).item()
                     lm = F.cross_entropy(predict(x, minus), y).item()
                     queries += 2
-                    estimate += (lp - lm) / (2 * a.sigma) * u
+                    estimate += (lp - lm) / (2 * sigma) * u
+                    difference_sum += abs(lp - lm)
                     loss_sum += (lp + lm) / 2
                     rms_sum += ((make_prompt(plus, a.method, a.rank, grid, dim) - make_prompt(minus, a.method, a.rank, grid, dim)) / 2).square().mean().sqrt().item()
                 estimate /= a.directions
@@ -145,16 +153,19 @@ def main():
                 theta[start:end] -= a.lr * mh / (vh.sqrt() + .01)
                 if not torch.isfinite(theta).all():
                     raise ArithmeticError('nonfinite parameters')
-                stat = factor_stats.setdefault(factor, {'steps': 0, 'perturbation_rms_sum': 0., 'perturbation_rms_max': 0., 'coefficient_max': 0.})
+                stat = factor_stats.setdefault(factor, {'steps': 0, 'perturbation_rms_sum': 0., 'perturbation_rms_max': 0., 'loss_difference_abs_sum': 0., 'loss_difference_abs_max': 0., 'coefficient_max': 0.})
                 stat['steps'] += 1
                 stat['perturbation_rms_sum'] += rms_sum / a.directions
                 stat['perturbation_rms_max'] = max(stat['perturbation_rms_max'], rms_sum / a.directions)
+                stat['loss_difference_abs_sum'] += difference_sum / a.directions
+                stat['loss_difference_abs_max'] = max(stat['loss_difference_abs_max'], difference_sum / a.directions)
                 stat['coefficient_max'] = max(stat['coefficient_max'], estimate.abs().max().item())
                 samples += len(y)
                 total_loss += loss_sum / a.directions * len(y)
                 if step % a.log_every == 0:
                     emit('training_progress', epoch=epoch, step=step, owner=owner, samples=samples,
-                         queries=queries, factor=factor, block_start=start, block_end=end, perturbed_loss=loss_sum / a.directions,
+                         queries=queries, factor=factor, block_start=start, block_end=end, sigma=sigma,
+                         loss_difference_abs=difference_sum / a.directions, perturbed_loss=loss_sum / a.directions,
                          perturbation_prompt_rms=rms_sum / a.directions, coefficient_max=estimate.abs().max().item())
                 if a.eval_every_steps and step % a.eval_every_steps == 0:
                     validation = evaluate(theta)
