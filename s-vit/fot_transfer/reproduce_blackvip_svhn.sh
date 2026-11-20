@@ -14,11 +14,13 @@ esac
 export PYTHONPATH="$upstream${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 expected=66606fbc57dd9b8bfbe4d7296d0fd5662d6e83d2
-actual=$(git -C "$upstream" rev-parse HEAD)
+actual=$(cat "$upstream/UPSTREAM_REVISION" 2>/dev/null || true)
 if [[ "$actual" != "$expected" ]]; then
-  echo "Expected upstream revision $expected, found $actual" >&2
+  echo "Expected upstream provenance $expected, found $actual" >&2
   exit 1
 fi
+echo "BlackVIP upstream provenance: $actual"
+echo "Project revision: $(git -C "$code_root" rev-parse HEAD)"
 
 if [[ "$stage" == prepare ]]; then
   mkdir -p "$data_root"

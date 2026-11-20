@@ -4,12 +4,10 @@
 
 ## 环境和代码
 
-服务器项目根目录内另行克隆上游仓库。已有该版本的本地副本也可通过 BLACKVIP_DIR 指定。下面的环境采用作者的 Python、PyTorch、torchvision 和 Transformers 版本。安装 safetensors 以读取项目已有 MAE 文件。my_dassl 通过 torch.utils.tensorboard 写入日志，使用兼容 Python 3.8 的稳定版 TensorBoard 代替其安装清单中的 tb-nightly。
+作者仓库源码已纳入项目的 BlackVIP 目录，来源版本记录在 BlackVIP/UPSTREAM_REVISION。已有独立副本也可通过 BLACKVIP_DIR 指定，并需要提供同名来源版本文件。UPSTREAM_REVISION 用于记录来源，运行日志中的项目 Git 提交号用于确定实际运行版本。下面的环境采用作者的 Python、PyTorch、torchvision 和 Transformers 版本。安装 safetensors 以读取项目已有 MAE 文件。my_dassl 通过 torch.utils.tensorboard 写入日志，使用兼容 Python 3.8 的稳定版 TensorBoard 代替其安装清单中的 tb-nightly。
 
 ```bash
 cd "$HOME/home/selma-plus-code"
-git clone https://github.com/changdaeoh/BlackVIP.git BlackVIP
-git -C BlackVIP checkout --detach 66606fbc57dd9b8bfbe4d7296d0fd5662d6e83d2
 conda create -y -n blackvip-original python=3.8
 conda activate blackvip-original
 conda install -y pytorch=1.12.1 torchvision=0.13.1 cudatoolkit=11.6 -c pytorch -c conda-forge
