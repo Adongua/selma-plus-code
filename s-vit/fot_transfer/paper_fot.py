@@ -39,6 +39,10 @@ class Decoder(nn.Module):
 
 
 class MaeEncoder(LocalEncoder):
+    def __init__(self, *args, feature_mode='post_norm', **kwargs):
+        super().__init__(*args, **kwargs)
+        self.feature_mode = feature_mode
+
     def __call__(self, images):
         with torch.no_grad():
             mean = images.new_tensor([.480,.448,.397]).view(1,3,1,1)
@@ -48,7 +52,9 @@ class MaeEncoder(LocalEncoder):
             pixels = (pixels-pixels.new_tensor([.485,.456,.406]).view(1,3,1,1))/pixels.new_tensor([.229,.224,.225]).view(1,3,1,1)
             n = (self.model.config.image_size // self.model.config.patch_size)**2
             noise = torch.arange(n, device=images.device, dtype=pixels.dtype).expand(len(images),-1)
-            return self.model(pixel_values=pixels, noise=noise).last_hidden_state[:,0].double()
+            output = self.model(pixel_values=pixels, noise=noise, output_hidden_states=self.feature_mode == 'pre_norm')
+            features = output.hidden_states[-1] if self.feature_mode == 'pre_norm' else output.last_hidden_state
+            return features[:,0].double()
 
 
 def pack(module):
@@ -106,6 +112,7 @@ def main():
     p.add_argument('--offset', type=float, default=1.)
     p.add_argument('--prompt-scale', type=float, default=.1)
     p.add_argument('--bn-mode', choices=('frozen', 'batch'), default='frozen')
+    p.add_argument('--mae-feature', choices=('post_norm', 'pre_norm'), default='post_norm')
     p.add_argument('--train-eval-samples', type=int, default=0)
     p.add_argument('--subspace-columns', type=int, default=5)
     p.add_argument('--projection-width', type=int, default=8)
@@ -143,7 +150,7 @@ def main():
     spec, params = install_head(*source_model(a),head)
     params = {k:v.to(device) for k,v in params.items()}
     ops = AccuracyPlainOps(params,a.allow_plaintext_gelu_out_of_range)
-    encoder = MaeEncoder('mae',32,device,a.mae_path,seed=a.seed+44)
+    encoder = MaeEncoder('mae',32,device,a.mae_path,seed=a.seed+44,feature_mode=a.mae_feature)
     decoder = Decoder().to(device=device,dtype=torch.float64).eval()
     names = ['archive','splits','checkpoint','fixed_student','head']
     hashes = {name:file_sha256(getattr(a,name)) for name in names}
@@ -234,6 +241,8 @@ def main():
             raise ValueError('test checkpoint provenance mismatch')
         if selected['options']['prompt_scale'] != a.prompt_scale:
             raise ValueError('test checkpoint prompt scale mismatch')
+        if selected['options'].get('mae_feature', 'post_norm') != a.mae_feature:
+            raise ValueError('test checkpoint MAE feature mode mismatch')
         decoder.load_state_dict(selected['decoder'],strict=True)
         test_data = data['test']
         if a.test_max_samples:
