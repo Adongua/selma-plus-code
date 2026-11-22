@@ -56,9 +56,11 @@ def main():
     parser.add_argument('--lr', type=float, default=.01)
     parser.add_argument('--seed', type=int, default=20261107)
     parser.add_argument('--log-every', type=int, default=100)
+    parser.add_argument('--eval-every-steps', type=int, default=0)
+    parser.add_argument('--train-eval-samples', type=int, default=0)
     parser.add_argument('--allow-plaintext-gelu-out-of-range', action='store_true')
     args = parser.parse_args()
-    if min(args.epochs, args.batch_size, args.eval_batch_size, args.rank, args.directions, args.step_interval, args.log_every) < 1 or min(args.sigma, args.lr) <= 0 or min(args.max_batches_per_epoch, args.validation_max_samples) < 0:
+    if min(args.epochs, args.batch_size, args.eval_batch_size, args.rank, args.directions, args.step_interval, args.log_every) < 1 or min(args.sigma, args.lr) <= 0 or min(args.max_batches_per_epoch, args.validation_max_samples, args.eval_every_steps, args.train_eval_samples) < 0:
         parser.error('invalid training configuration')
     root = Path(args.output).resolve()
     if root.exists():
@@ -87,10 +89,20 @@ def main():
     optimizer = LowDimOptimizer(model, options)
     root.mkdir(parents=True)
 
-    def evaluate():
+    train_subset = []
+    if args.train_eval_samples:
+        for _, x, y in epoch_batches(data, 1, args.batch_size, args.seed):
+            remaining = args.train_eval_samples - sum(len(labels) for _, labels in train_subset)
+            train_subset.append((x[:remaining], y[:remaining]))
+            if remaining <= len(y):
+                break
+        if sum(len(y) for _, y in train_subset) != args.train_eval_samples:
+            parser.error('training sample limit exceeds split')
+
+    def evaluate(batches):
         count = correct = loss = 0
         with torch.inference_mode():
-            for x, y in data['val'].chunks(args.eval_batch_size):
+            for x, y in batches:
                 x, y = x.to(device), y.to(device)
                 logits = model(x, None)
                 loss += F.cross_entropy(logits, y, reduction='sum').item()
@@ -98,9 +110,23 @@ def main():
                 count += len(y)
         return {'samples': count, 'loss': loss / count, 'top1': correct / count}
 
-    initial = evaluate()
-    emit('training_started', initial=initial, trainable_parameters=sum(p.numel() for p in model.parameters()))
-    records, step = [], 0
+    def validation():
+        return evaluate(data['val'].chunks(args.eval_batch_size))
+
+    initial = validation()
+    initial_training = evaluate(train_subset) if train_subset else None
+    emit('training_started', initial=initial, initial_training_subset=initial_training, trainable_parameters=sum(p.numel() for p in model.parameters()))
+    records, observations, step = [], [], 0
+
+    def write_report(status):
+        report = {'status': status, 'initial_validation': initial, 'initial_training_subset': initial_training,
+                  'epochs': records, 'observations': observations, 'options': vars(args), 'range_audit': model.audit,
+                  'trainable_parameters': sum(p.numel() for p in model.parameters())}
+        (root / 'report.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
+
+    def save_checkpoint(path, epoch):
+        torch.save({'names': model.names, 'parameters': [p.detach().cpu() for p in model.values],
+                    'options': vars(args), 'epoch': epoch, 'step': step}, root / path)
     for epoch in range(1, args.epochs + 1):
         samples = loss_sum = 0
         for batch, (owner, x, y) in enumerate(epoch_batches(data, epoch, args.batch_size, args.seed)):
@@ -117,16 +143,21 @@ def main():
             if step % args.log_every == 0:
                 emit('training_progress', epoch=epoch, step=step, owner=owner, samples=samples,
                      queries=step * (1 + args.directions), running_loss=loss_sum / samples)
-        validation = evaluate()
+            if args.eval_every_steps and step % args.eval_every_steps == 0:
+                observation = {'epoch': epoch, 'step': step, 'queries': step * (1 + args.directions),
+                               'training_subset': evaluate(train_subset) if train_subset else None,
+                               'validation': validation()}
+                observations.append(observation)
+                save_checkpoint(f'step-{step:06d}.pt', epoch)
+                write_report('running')
+                emit('step_evaluation', **observation)
+        val = validation()
         row = {'epoch': epoch, 'step': step, 'samples': samples, 'queries': step * (1 + args.directions),
-               'training_loss': loss_sum / samples, 'validation': validation}
+               'training_loss': loss_sum / samples, 'training_subset': evaluate(train_subset) if train_subset else None,
+               'validation': val}
         records.append(row)
-        torch.save({'names': model.names, 'parameters': [p.detach().cpu() for p in model.values],
-                    'options': vars(args), 'epoch': epoch}, root / f'epoch-{epoch:04d}.pt')
-        report = {'status': 'completed' if epoch == args.epochs else 'running', 'initial_validation': initial,
-                  'epochs': records, 'options': vars(args), 'range_audit': model.audit,
-                  'trainable_parameters': sum(p.numel() for p in model.parameters())}
-        (root / 'report.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n')
+        save_checkpoint(f'epoch-{epoch:04d}.pt', epoch)
+        write_report('completed' if epoch == args.epochs else 'running')
         emit('epoch_complete', **row)
 
 
