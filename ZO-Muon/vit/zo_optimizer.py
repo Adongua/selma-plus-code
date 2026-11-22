@@ -8,9 +8,6 @@ import numpy as np
 from datetime import timedelta
 
 import torch
-from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
-from utils.data_utils import get_loader
 
 class MeZOOptimizer(object):
     """
@@ -1014,9 +1011,7 @@ class LowDimOptimizer(object):
                         wrong_rank_shape = True
 
                 # Resample P if interval met, not initialized, or shape mismatch
-                resample = (self.step_curr % args.step_interval == 0) or \
-                           (name not in self.P_matrices) or \
-                           wrong_rank_shape
+                resample = (name not in self.P_matrices) or wrong_rank_shape
 
                 if resample:
                     P = self._sample_orthogonal_P(m, args.rank_r, param.data.device, param.data.dtype)
@@ -1063,6 +1058,16 @@ class LowDimOptimizer(object):
         args = self.args
 
         self.step_curr += 1
+
+        # Sample projections once per optimization step, outside the seeded
+        # perturbation calls. All directions and their inverses must use the
+        # same projection and consume identical random numbers.
+        if self.step_curr == 1 or self.step_curr % args.step_interval == 0:
+            for name, param in self.named_parameters_to_optim:
+                if param.data.ndim >= 2:
+                    self.P_matrices[name] = self._sample_orthogonal_P(
+                        param.shape[0], args.rank_r, param.device, param.dtype
+                    )
 
         base_seed = np.random.randint(1000000000)
         self.zo_random_seed = base_seed 
